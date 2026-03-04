@@ -18,6 +18,12 @@ expect_used = "deny"
 unwrap_used = "deny"
 
 [workspace.dependencies]
+alacritty_terminal = { git = "https://github.com/zed-industries/alacritty", rev = "9d9640d4" }
 anyhow = "1"
+fuser = "0.17.0"
+gix = "0.80.0"
 gpui = "0.2.2"
+libssh-rs = "0.3.6"
+octocrab = "0.49.5"
+portable-pty = "0.9.0"
 thiserror = "2"

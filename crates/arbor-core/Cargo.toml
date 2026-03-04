@@ -6,6 +6,8 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+gix = { workspace = true }
+octocrab = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

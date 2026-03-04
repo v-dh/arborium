@@ -1,0 +1,790 @@
+use {
+    alacritty_terminal::{
+        Term,
+        event::VoidListener,
+        grid::Dimensions,
+        index::{Column, Line, Point},
+        term::{
+            Config,
+            cell::{Cell, Flags},
+            color::Colors,
+        },
+        vte::ansi::{Color, NamedColor, Processor, StdSyncHandler},
+    },
+    portable_pty::{Child, ChildKiller, CommandBuilder, PtySize, native_pty_system},
+    std::{
+        env,
+        ffi::OsStr,
+        io::{Read, Write},
+        path::Path,
+        process::{Command, Stdio},
+        sync::{Arc, Mutex},
+        thread,
+    },
+};
+
+const TERMINAL_ROWS: u16 = 56;
+const TERMINAL_COLS: u16 = 180;
+const TERMINAL_SCROLLBACK: usize = 8_000;
+
+const TERMINAL_DEFAULT_FG: u32 = 0xc8ccd4;
+const TERMINAL_DEFAULT_BG: u32 = 0x282c34;
+const TERMINAL_CURSOR: u32 = 0x93d3c3;
+const TERMINAL_ANSI_16: [u32; 16] = [
+    0x1d1f23, 0xbe5046, 0x98c379, 0xd19a66, 0x61afef, 0xc678dd, 0x56b6c2, 0xdcdfe4, 0x5c6370,
+    0xe06c75, 0xa5d6a7, 0xe5c07b, 0x7aa2f7, 0xd7a9e3, 0x7fd1da, 0xf5f6f7,
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalBackendKind {
+    Embedded,
+    Alacritty,
+    Ghostty,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TerminalBackendDescriptor {
+    pub kind: TerminalBackendKind,
+    pub label: &'static str,
+}
+
+#[derive(Debug, Clone)]
+pub struct TerminalRunResult {
+    pub command: String,
+    pub output: String,
+    pub success: bool,
+    pub code: Option<i32>,
+}
+
+pub enum TerminalLaunch {
+    Embedded(EmbeddedTerminal),
+    External(TerminalRunResult),
+}
+
+#[derive(Clone)]
+pub struct EmbeddedTerminal {
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    emulator: Arc<Mutex<TerminalEmulator>>,
+    exit_code: Arc<Mutex<Option<i32>>>,
+    killer: Arc<Mutex<Option<Box<dyn ChildKiller + Send + Sync>>>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EmbeddedSnapshot {
+    pub output: String,
+    pub styled_lines: Vec<TerminalStyledLine>,
+    pub exit_code: Option<i32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StyledColor {
+    fg: u32,
+    bg: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalStyledLine {
+    pub runs: Vec<TerminalStyledRun>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalStyledRun {
+    pub text: String,
+    pub fg: u32,
+}
+
+struct TerminalDimensions {
+    rows: usize,
+    cols: usize,
+}
+
+impl Dimensions for TerminalDimensions {
+    fn total_lines(&self) -> usize {
+        self.rows
+    }
+
+    fn screen_lines(&self) -> usize {
+        self.rows
+    }
+
+    fn columns(&self) -> usize {
+        self.cols
+    }
+}
+
+struct TerminalEmulator {
+    term: Term<VoidListener>,
+    processor: Processor<StdSyncHandler>,
+}
+
+impl TerminalEmulator {
+    fn new() -> Self {
+        let dimensions = TerminalDimensions {
+            rows: usize::from(TERMINAL_ROWS),
+            cols: usize::from(TERMINAL_COLS),
+        };
+        let config = Config {
+            scrolling_history: TERMINAL_SCROLLBACK,
+            ..Config::default()
+        };
+
+        Self {
+            term: Term::new(config, &dimensions, VoidListener),
+            processor: Processor::<StdSyncHandler>::new(),
+        }
+    }
+
+    fn process(&mut self, bytes: &[u8]) {
+        self.processor.advance(&mut self.term, bytes);
+    }
+}
+
+pub const BACKEND_DESCRIPTORS: [TerminalBackendDescriptor; 3] = [
+    TerminalBackendDescriptor {
+        kind: TerminalBackendKind::Embedded,
+        label: "Embedded",
+    },
+    TerminalBackendDescriptor {
+        kind: TerminalBackendKind::Alacritty,
+        label: "Alacritty",
+    },
+    TerminalBackendDescriptor {
+        kind: TerminalBackendKind::Ghostty,
+        label: "Ghostty",
+    },
+];
+
+pub fn descriptor_for_kind(kind: TerminalBackendKind) -> TerminalBackendDescriptor {
+    let mut descriptor = BACKEND_DESCRIPTORS[0];
+
+    for candidate in BACKEND_DESCRIPTORS {
+        if candidate.kind == kind {
+            descriptor = candidate;
+            break;
+        }
+    }
+
+    descriptor
+}
+
+pub fn launch_backend(kind: TerminalBackendKind, cwd: &Path) -> Result<TerminalLaunch, String> {
+    match kind {
+        TerminalBackendKind::Embedded => EmbeddedTerminal::spawn(cwd).map(TerminalLaunch::Embedded),
+        TerminalBackendKind::Alacritty => launch_alacritty(cwd).map(TerminalLaunch::External),
+        TerminalBackendKind::Ghostty => launch_ghostty(cwd).map(TerminalLaunch::External),
+    }
+}
+
+impl EmbeddedTerminal {
+    pub fn spawn(cwd: &Path) -> Result<Self, String> {
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows: TERMINAL_ROWS,
+                cols: TERMINAL_COLS,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|error| format!("failed to create PTY: {error}"))?;
+
+        let mut command = CommandBuilder::new(default_shell());
+        command.arg("-l");
+        command.cwd(path_as_os_str(cwd));
+        command.env("TERM", "xterm-256color");
+
+        let child = pair
+            .slave
+            .spawn_command(command)
+            .map_err(|error| format!("failed to spawn shell in PTY: {error}"))?;
+        let killer = child.clone_killer();
+
+        let reader = pair
+            .master
+            .try_clone_reader()
+            .map_err(|error| format!("failed to clone PTY reader: {error}"))?;
+        let writer = pair
+            .master
+            .take_writer()
+            .map_err(|error| format!("failed to open PTY writer: {error}"))?;
+
+        let emulator = Arc::new(Mutex::new(TerminalEmulator::new()));
+        let exit_code = Arc::new(Mutex::new(None));
+        let killer = Arc::new(Mutex::new(Some(killer)));
+
+        spawn_reader_thread(reader, emulator.clone());
+        spawn_wait_thread(child, emulator.clone(), exit_code.clone(), killer.clone());
+
+        Ok(Self {
+            writer: Arc::new(Mutex::new(writer)),
+            emulator,
+            exit_code,
+            killer,
+        })
+    }
+
+    pub fn write_input(&self, bytes: &[u8]) -> Result<(), String> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|_| "failed to acquire PTY writer lock".to_owned())?;
+        writer
+            .write_all(bytes)
+            .map_err(|error| format!("failed to write to PTY: {error}"))?;
+        writer
+            .flush()
+            .map_err(|error| format!("failed to flush PTY writer: {error}"))
+    }
+
+    pub fn snapshot(&self) -> EmbeddedSnapshot {
+        let (output, styled_lines) = match self.emulator.lock() {
+            Ok(emulator) => (
+                snapshot_output(&emulator.term),
+                collect_styled_lines(&emulator.term),
+            ),
+            Err(poisoned) => {
+                let emulator = poisoned.into_inner();
+                (
+                    snapshot_output(&emulator.term),
+                    collect_styled_lines(&emulator.term),
+                )
+            },
+        };
+        let exit_code = match self.exit_code.lock() {
+            Ok(code) => *code,
+            Err(poisoned) => *poisoned.into_inner(),
+        };
+
+        EmbeddedSnapshot {
+            output,
+            styled_lines,
+            exit_code,
+        }
+    }
+}
+
+impl Drop for EmbeddedTerminal {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.killer) != 1 {
+            return;
+        }
+
+        let mut killer_guard = match self.killer.lock() {
+            Ok(lock) => lock,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        if let Some(killer) = killer_guard.as_mut() {
+            let _ = killer.kill();
+        }
+    }
+}
+
+fn spawn_reader_thread(mut reader: Box<dyn Read + Send>, emulator: Arc<Mutex<TerminalEmulator>>) {
+    thread::spawn(move || {
+        let mut buffer = [0_u8; 4096];
+
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => process_terminal_bytes(&emulator, &buffer[..read]),
+                Err(error) => {
+                    process_terminal_bytes(
+                        &emulator,
+                        format!("\r\n[terminal reader error: {error}]\r\n").as_bytes(),
+                    );
+                    break;
+                },
+            }
+        }
+    });
+}
+
+fn spawn_wait_thread(
+    child: Box<dyn Child + Send + Sync>,
+    emulator: Arc<Mutex<TerminalEmulator>>,
+    exit_code: Arc<Mutex<Option<i32>>>,
+    killer: Arc<Mutex<Option<Box<dyn ChildKiller + Send + Sync>>>>,
+) {
+    thread::spawn(move || {
+        let mut child = child;
+        let status = child.wait();
+
+        let (final_code, exit_message) = match status {
+            Ok(status) => {
+                let code = i32::try_from(status.exit_code()).unwrap_or(i32::MAX);
+                let message = format!("\n\n[session exited with code {code}]\n");
+                (Some(code), message)
+            },
+            Err(error) => (
+                Some(1),
+                format!("\n\n[session failed to wait for process exit: {error}]\n"),
+            ),
+        };
+
+        {
+            let mut exit_guard = match exit_code.lock() {
+                Ok(lock) => lock,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            *exit_guard = final_code;
+        }
+
+        {
+            let mut killer_guard = match killer.lock() {
+                Ok(lock) => lock,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            *killer_guard = None;
+        }
+
+        process_terminal_bytes(&emulator, exit_message.as_bytes());
+    });
+}
+
+fn process_terminal_bytes(emulator: &Arc<Mutex<TerminalEmulator>>, bytes: &[u8]) {
+    let mut guard = match emulator.lock() {
+        Ok(lock) => lock,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.process(bytes);
+}
+
+fn snapshot_output(term: &Term<VoidListener>) -> String {
+    let start = Point::new(term.topmost_line(), Column(0));
+    let end = Point::new(term.bottommost_line(), term.last_column());
+    term.bounds_to_string(start, end)
+}
+
+fn collect_styled_lines(term: &Term<VoidListener>) -> Vec<TerminalStyledLine> {
+    let grid = term.grid();
+    let colors = term.colors();
+    let top_line = grid.topmost_line().0;
+    let bottom_line = grid.bottommost_line().0;
+    let columns = grid.columns();
+
+    let mut lines = Vec::new();
+
+    for line_index in top_line..=bottom_line {
+        let row = &grid[Line(line_index)];
+        let mut runs: Vec<TerminalStyledRun> = Vec::new();
+        let mut current_style: Option<StyledColor> = None;
+        let mut current_text = String::new();
+
+        for column_index in 0..columns {
+            let cell = &row[Column(column_index)];
+            if cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                continue;
+            }
+
+            let style = resolve_cell_color(cell, colors);
+            let text = cell_text(cell);
+
+            if current_style != Some(style) {
+                if let Some(previous_style) = current_style.take()
+                    && !current_text.is_empty()
+                {
+                    runs.push(TerminalStyledRun {
+                        text: std::mem::take(&mut current_text),
+                        fg: previous_style.fg,
+                    });
+                }
+                current_style = Some(style);
+            }
+
+            current_text.push_str(&text);
+        }
+
+        if let Some(style) = current_style
+            && !current_text.is_empty()
+        {
+            runs.push(TerminalStyledRun {
+                text: current_text,
+                fg: style.fg,
+            });
+        }
+
+        trim_trailing_whitespace_runs(&mut runs);
+        lines.push(TerminalStyledLine { runs });
+    }
+
+    while lines.last().is_some_and(|line| line.runs.is_empty()) {
+        lines.pop();
+    }
+
+    if lines.is_empty() {
+        lines.push(TerminalStyledLine { runs: Vec::new() });
+    }
+
+    lines
+}
+
+fn cell_text(cell: &Cell) -> String {
+    let mut text = String::new();
+    text.push(cell.c);
+    if let Some(extra) = cell.zerowidth() {
+        for character in extra {
+            text.push(*character);
+        }
+    }
+    text
+}
+
+fn resolve_cell_color(cell: &Cell, colors: &Colors) -> StyledColor {
+    let mut fg = color_to_rgb(cell.fg, colors, TERMINAL_DEFAULT_FG);
+    let mut bg = color_to_rgb(cell.bg, colors, TERMINAL_DEFAULT_BG);
+
+    if cell.flags.contains(Flags::INVERSE) {
+        std::mem::swap(&mut fg, &mut bg);
+    }
+
+    if cell.flags.contains(Flags::DIM) {
+        fg = scale_color(fg, 0.62);
+    } else if cell.flags.contains(Flags::BOLD) {
+        fg = scale_color(fg, 1.12);
+    }
+
+    StyledColor { fg, bg }
+}
+
+fn color_to_rgb(color: Color, colors: &Colors, default: u32) -> u32 {
+    match color {
+        Color::Spec(rgb) => (u32::from(rgb.r) << 16) | (u32::from(rgb.g) << 8) | u32::from(rgb.b),
+        Color::Indexed(index) => colors[usize::from(index)]
+            .map(rgb_to_u32)
+            .unwrap_or_else(|| ansi_256_to_rgb(index)),
+        Color::Named(named) => {
+            let index = named as usize;
+            colors[index]
+                .map(rgb_to_u32)
+                .unwrap_or_else(|| named_color_to_rgb(named, default))
+        },
+    }
+}
+
+fn rgb_to_u32(rgb: alacritty_terminal::vte::ansi::Rgb) -> u32 {
+    (u32::from(rgb.r) << 16) | (u32::from(rgb.g) << 8) | u32::from(rgb.b)
+}
+
+fn named_color_to_rgb(color: NamedColor, default: u32) -> u32 {
+    match color {
+        NamedColor::Black => TERMINAL_ANSI_16[0],
+        NamedColor::Red => TERMINAL_ANSI_16[1],
+        NamedColor::Green => TERMINAL_ANSI_16[2],
+        NamedColor::Yellow => TERMINAL_ANSI_16[3],
+        NamedColor::Blue => TERMINAL_ANSI_16[4],
+        NamedColor::Magenta => TERMINAL_ANSI_16[5],
+        NamedColor::Cyan => TERMINAL_ANSI_16[6],
+        NamedColor::White => TERMINAL_ANSI_16[7],
+        NamedColor::BrightBlack => TERMINAL_ANSI_16[8],
+        NamedColor::BrightRed => TERMINAL_ANSI_16[9],
+        NamedColor::BrightGreen => TERMINAL_ANSI_16[10],
+        NamedColor::BrightYellow => TERMINAL_ANSI_16[11],
+        NamedColor::BrightBlue => TERMINAL_ANSI_16[12],
+        NamedColor::BrightMagenta => TERMINAL_ANSI_16[13],
+        NamedColor::BrightCyan => TERMINAL_ANSI_16[14],
+        NamedColor::BrightWhite => TERMINAL_ANSI_16[15],
+        NamedColor::Foreground => default,
+        NamedColor::Background => TERMINAL_DEFAULT_BG,
+        NamedColor::Cursor => TERMINAL_CURSOR,
+        NamedColor::DimBlack => scale_color(TERMINAL_ANSI_16[0], 0.72),
+        NamedColor::DimRed => scale_color(TERMINAL_ANSI_16[1], 0.72),
+        NamedColor::DimGreen => scale_color(TERMINAL_ANSI_16[2], 0.72),
+        NamedColor::DimYellow => scale_color(TERMINAL_ANSI_16[3], 0.72),
+        NamedColor::DimBlue => scale_color(TERMINAL_ANSI_16[4], 0.72),
+        NamedColor::DimMagenta => scale_color(TERMINAL_ANSI_16[5], 0.72),
+        NamedColor::DimCyan => scale_color(TERMINAL_ANSI_16[6], 0.72),
+        NamedColor::DimWhite => scale_color(TERMINAL_ANSI_16[7], 0.72),
+        NamedColor::BrightForeground => scale_color(default, 1.12),
+        NamedColor::DimForeground => scale_color(default, 0.72),
+    }
+}
+
+fn trim_trailing_whitespace_runs(runs: &mut Vec<TerminalStyledRun>) {
+    while let Some(last_run) = runs.last_mut() {
+        let trimmed = last_run.text.trim_end_matches(' ').to_owned();
+        if trimmed.is_empty() {
+            runs.pop();
+            continue;
+        }
+        if trimmed.len() != last_run.text.len() {
+            last_run.text = trimmed;
+        }
+        break;
+    }
+}
+
+fn scale_color(rgb: u32, factor: f32) -> u32 {
+    let red = ((rgb >> 16) & 0xff) as f32;
+    let green = ((rgb >> 8) & 0xff) as f32;
+    let blue = (rgb & 0xff) as f32;
+
+    let scaled_red = (red * factor).round().clamp(0.0, 255.0) as u32;
+    let scaled_green = (green * factor).round().clamp(0.0, 255.0) as u32;
+    let scaled_blue = (blue * factor).round().clamp(0.0, 255.0) as u32;
+
+    (scaled_red << 16) | (scaled_green << 8) | scaled_blue
+}
+
+fn ansi_256_to_rgb(index: u8) -> u32 {
+    if usize::from(index) < TERMINAL_ANSI_16.len() {
+        return TERMINAL_ANSI_16[usize::from(index)];
+    }
+
+    if (16..=231).contains(&index) {
+        let index = index - 16;
+        let red = index / 36;
+        let green = (index % 36) / 6;
+        let blue = index % 6;
+        let channel = |value: u8| -> u8 {
+            if value == 0 {
+                0
+            } else {
+                value.saturating_mul(40).saturating_add(55)
+            }
+        };
+
+        let red = channel(red);
+        let green = channel(green);
+        let blue = channel(blue);
+        return (u32::from(red) << 16) | (u32::from(green) << 8) | u32::from(blue);
+    }
+
+    let gray = 8_u8.saturating_add(index.saturating_sub(232).saturating_mul(10));
+    (u32::from(gray) << 16) | (u32::from(gray) << 8) | u32::from(gray)
+}
+
+fn default_shell() -> String {
+    env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_owned())
+}
+
+fn path_as_os_str(path: &Path) -> &OsStr {
+    path.as_os_str()
+}
+
+fn launch_alacritty(cwd: &Path) -> Result<TerminalRunResult, String> {
+    let shell = default_shell();
+    let script = "printf 'Arbor external terminal session\\n'; exec $SHELL -l";
+    let cwd_display = cwd.display().to_string();
+
+    let direct_args = vec![
+        "--working-directory".to_owned(),
+        cwd_display.clone(),
+        "-e".to_owned(),
+        shell.clone(),
+        "-lc".to_owned(),
+        script.to_owned(),
+    ];
+
+    let launched_command = match run_detached("alacritty", &direct_args, cwd) {
+        Ok(()) => format!("alacritty {}", render_args(&direct_args)),
+        Err(direct_error) => {
+            #[cfg(target_os = "macos")]
+            {
+                let app_args = vec![
+                    "-na".to_owned(),
+                    "Alacritty.app".to_owned(),
+                    "--args".to_owned(),
+                    "--working-directory".to_owned(),
+                    cwd_display,
+                    "-e".to_owned(),
+                    shell,
+                    "-lc".to_owned(),
+                    script.to_owned(),
+                ];
+
+                match run_detached("open", &app_args, cwd) {
+                    Ok(()) => format!("open {}", render_args(&app_args)),
+                    Err(bundle_error) => {
+                        return Err(format!(
+                            "unable to launch Alacritty directly ({direct_error}) or via app bundle ({bundle_error})",
+                        ));
+                    },
+                }
+            }
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                return Err(format!("unable to launch Alacritty: {direct_error}"));
+            }
+        },
+    };
+
+    Ok(external_launch_result("Alacritty", launched_command))
+}
+
+fn launch_ghostty(cwd: &Path) -> Result<TerminalRunResult, String> {
+    let shell = default_shell();
+    let script = "printf 'Arbor external terminal session\\n'; exec $SHELL -l";
+    let cwd_flag = format!("--working-directory={}", cwd.display());
+
+    #[cfg(target_os = "macos")]
+    {
+        let app_args = vec![
+            "-na".to_owned(),
+            "Ghostty.app".to_owned(),
+            "--args".to_owned(),
+            cwd_flag,
+            "-e".to_owned(),
+            shell,
+            "-lc".to_owned(),
+            script.to_owned(),
+        ];
+
+        run_detached("open", &app_args, cwd).map_err(|error| {
+            format!(
+                "unable to launch Ghostty via app bundle. Install Ghostty.app in /Applications or adjust PATH: {error}",
+            )
+        })?;
+
+        Ok(external_launch_result(
+            "Ghostty",
+            format!("open {}", render_args(&app_args)),
+        ))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let args = vec![
+            cwd_flag,
+            "-e".to_owned(),
+            shell,
+            "-lc".to_owned(),
+            script.to_owned(),
+        ];
+        run_detached("ghostty", &args, cwd)
+            .map_err(|error| format!("unable to launch Ghostty: {error}"))?;
+
+        Ok(external_launch_result(
+            "Ghostty",
+            format!("ghostty {}", render_args(&args)),
+        ))
+    }
+}
+
+fn run_detached(program: &str, args: &[String], cwd: &Path) -> Result<(), String> {
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    command.spawn().map(|_| ()).map_err(|error| {
+        format!(
+            "failed to spawn `{program}` with args [{}]: {error}",
+            render_args(args),
+        )
+    })
+}
+
+fn render_args(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| shell_escape(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_escape(arg: &str) -> String {
+    if arg.is_empty() {
+        return "''".to_owned();
+    }
+
+    let needs_quotes = arg
+        .chars()
+        .any(|ch| ch.is_whitespace() || ch == '\'' || ch == '"');
+    if !needs_quotes {
+        return arg.to_owned();
+    }
+
+    let escaped = arg.replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
+fn external_launch_result(backend_label: &str, command: String) -> TerminalRunResult {
+    TerminalRunResult {
+        command,
+        output: format!(
+            "{backend_label} opened in an external window.\nUse that window for interactive work.",
+        ),
+        success: true,
+        code: Some(0),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn styled_lines_include_scrollback_content() {
+        let mut emulator = TerminalEmulator::new();
+
+        for line_index in 0..120 {
+            let line = format!("line-{line_index:03}\r\n");
+            emulator.process(line.as_bytes());
+        }
+
+        let styled_lines = collect_styled_lines(&emulator.term);
+        assert!(
+            styled_lines.len() > 60,
+            "expected many lines from scrollback, got {}",
+            styled_lines.len()
+        );
+
+        let first = styled_line_to_string(styled_lines.first());
+        let last = styled_line_to_string(styled_lines.last());
+
+        assert!(
+            first.contains("line-000"),
+            "expected first scrollback line to be present, got `{first}`"
+        );
+        assert!(
+            last.contains("line-119"),
+            "expected final line to be present, got `{last}`"
+        );
+    }
+
+    #[test]
+    fn plain_snapshot_output_includes_scrollback_content() {
+        let mut emulator = TerminalEmulator::new();
+
+        for line_index in 0..220 {
+            let line = format!("output-{line_index:03}\r\n");
+            emulator.process(line.as_bytes());
+        }
+
+        let snapshot = snapshot_output(&emulator.term);
+        assert!(
+            snapshot.contains("output-000"),
+            "expected oldest visible scrollback in snapshot output"
+        );
+        assert!(
+            snapshot.contains("output-219"),
+            "expected latest output in snapshot output"
+        );
+
+        let snapshot_line_count = snapshot.lines().count();
+        assert!(
+            snapshot_line_count > usize::from(TERMINAL_ROWS),
+            "expected snapshot line count ({snapshot_line_count}) to exceed viewport rows ({TERMINAL_ROWS})",
+        );
+    }
+
+    fn styled_line_to_string(line: Option<&TerminalStyledLine>) -> String {
+        line.map(|line| {
+            line.runs
+                .iter()
+                .map(|run| run.text.as_str())
+                .collect::<String>()
+        })
+        .unwrap_or_default()
+    }
+}

@@ -6,6 +6,7 @@ use {
         path::{Path, PathBuf},
         time::SystemTime,
     },
+    toml_edit::DocumentMut,
 };
 
 const CONFIG_RELATIVE_PATH: &str = ".config/arbor/config.toml";
@@ -121,4 +122,69 @@ fn default_config_path() -> PathBuf {
         Ok(home) => PathBuf::from(home).join(CONFIG_RELATIVE_PATH),
         Err(_) => PathBuf::from(CONFIG_RELATIVE_PATH),
     }
+}
+
+pub fn append_remote_host(host: &RemoteHostConfig) -> Result<(), String> {
+    let path = config_path();
+    let content = fs::read_to_string(&path)
+        .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    let mut doc: DocumentMut = content
+        .parse()
+        .map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
+
+    let arr = doc
+        .entry("remote_hosts")
+        .or_insert_with(|| toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new()))
+        .as_array_of_tables_mut()
+        .ok_or_else(|| "remote_hosts is not an array of tables".to_owned())?;
+
+    let mut table = toml_edit::Table::new();
+    table.insert("name", toml_edit::value(&host.name));
+    table.insert("hostname", toml_edit::value(&host.hostname));
+    table.insert("user", toml_edit::value(&host.user));
+    if host.port != 22 {
+        table.insert("port", toml_edit::value(i64::from(host.port)));
+    }
+    if let Some(ref identity_file) = host.identity_file {
+        table.insert("identity_file", toml_edit::value(identity_file));
+    }
+    if host.remote_base_path != "~/arbor-outposts" {
+        table.insert("remote_base_path", toml_edit::value(&host.remote_base_path));
+    }
+    if let Some(daemon_port) = host.daemon_port {
+        table.insert("daemon_port", toml_edit::value(i64::from(daemon_port)));
+    }
+
+    arr.push(table);
+
+    fs::write(&path, doc.to_string())
+        .map_err(|e| format!("failed to write {}: {e}", path.display()))
+}
+
+pub fn remove_remote_host(name: &str) -> Result<(), String> {
+    let path = config_path();
+    let content = fs::read_to_string(&path)
+        .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    let mut doc: DocumentMut = content
+        .parse()
+        .map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
+
+    if let Some(arr) = doc.get_mut("remote_hosts").and_then(|v| v.as_array_of_tables_mut()) {
+        let mut index_to_remove = None;
+        for (i, table) in arr.iter().enumerate() {
+            if table.get("name").and_then(|v| v.as_str()) == Some(name) {
+                index_to_remove = Some(i);
+                break;
+            }
+        }
+        if let Some(idx) = index_to_remove {
+            arr.remove(idx);
+        }
+        if arr.is_empty() {
+            doc.remove("remote_hosts");
+        }
+    }
+
+    fs::write(&path, doc.to_string())
+        .map_err(|e| format!("failed to write {}: {e}", path.display()))
 }

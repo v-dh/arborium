@@ -23,6 +23,7 @@ ropey = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 syntect = { workspace = true }
+toml_edit = { workspace = true }
 
 [lints]
 workspace = true

@@ -68,10 +68,30 @@ impl RemoteProvisioner for SshProvisioner<'_> {
     }
 }
 
+fn ensure_agent_has_keys(host: &RemoteHost) {
+    // Check if agent already has identities.
+    if let Ok(output) = Command::new("ssh-add").arg("-l").output() {
+        if output.status.success() {
+            return;
+        }
+    }
+
+    // Agent is empty — load the host's configured identity file if set.
+    if let Some(ref identity_file) = host.identity_file {
+        let _ = Command::new("ssh-add").arg(identity_file).output();
+        return;
+    }
+
+    // No explicit identity: try loading default keys.
+    let _ = Command::new("ssh-add").output();
+}
+
 fn run_ssh_command_with_agent(
     host: &RemoteHost,
     command: &str,
 ) -> Result<RemoteCommandOutput, RemoteError> {
+    ensure_agent_has_keys(host);
+
     let mut cmd = Command::new("ssh");
     cmd.arg("-A")
         .arg("-o").arg("BatchMode=yes")

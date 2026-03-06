@@ -120,6 +120,7 @@ fn terminal_mono_font(cx: &App) -> gpui::Font {
 
 actions!(arbor, [
     RequestQuit,
+    NewWindow,
     SpawnTerminal,
     CloseActiveTerminal,
     RefreshWorktrees,
@@ -7001,9 +7002,43 @@ fn request_quit(_: &RequestQuit, cx: &mut App) {
     );
 }
 
+fn open_arbor_window(cx: &mut App) {
+    let bounds = Bounds::centered(None, size(px(1460.), px(900.)), cx);
+    if let Err(error) = cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            window_min_size: Some(size(px(1180.), px(760.))),
+            app_id: Some("so.pen.arbor".to_owned()),
+            titlebar: Some(TitlebarOptions {
+                title: Some("Arbor".into()),
+                appears_transparent: true,
+                traffic_light_position: Some(point(px(9.), px(9.))),
+            }),
+            window_decorations: Some(WindowDecorations::Client),
+            ..Default::default()
+        },
+        |_, cx| {
+            cx.new(|cx| {
+                ArborWindow::load_with_daemon_store::<daemon::JsonDaemonSessionStore>(
+                    ui_state_store::UiState::default(),
+                    cx,
+                )
+            })
+        },
+    ) {
+        eprintln!("failed to open Arbor window: {error:#}");
+    }
+}
+
+fn new_window(_: &NewWindow, cx: &mut App) {
+    open_arbor_window(cx);
+}
+
 fn install_app_menu_and_keys(cx: &mut App) {
     cx.on_action(request_quit);
+    cx.on_action(new_window);
     cx.bind_keys([
+        KeyBinding::new("cmd-n", NewWindow, None),
         KeyBinding::new("cmd-q", RequestQuit, None),
         KeyBinding::new("cmd-t", SpawnTerminal, None),
         KeyBinding::new("cmd-w", CloseActiveTerminal, None),
@@ -7033,6 +7068,8 @@ fn install_app_menu_and_keys(cx: &mut App) {
         Menu {
             name: "File".into(),
             items: vec![
+                MenuItem::action("New Window", NewWindow),
+                MenuItem::separator(),
                 MenuItem::action("Add Repository...", OpenAddRepository),
                 MenuItem::separator(),
                 MenuItem::action("New Terminal Tab", SpawnTerminal),

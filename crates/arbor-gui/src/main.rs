@@ -2023,15 +2023,11 @@ impl ArborWindow {
             let _ = this.update(cx, |this, cx| {
                 let mut changed = false;
                 for (path, task) in results {
-                    if let Some(task) = task {
-                        if let Some(wt) = this
-                            .worktrees
-                            .iter_mut()
-                            .find(|wt| wt.path == path)
-                        {
-                            wt.agent_task = Some(task);
-                            changed = true;
-                        }
+                    if let Some(task) = task
+                        && let Some(wt) = this.worktrees.iter_mut().find(|wt| wt.path == path)
+                    {
+                        wt.agent_task = Some(task);
+                        changed = true;
                     }
                 }
                 if changed {

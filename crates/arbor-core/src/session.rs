@@ -17,7 +17,15 @@ pub fn extract_agent_task(worktree_path: &Path) -> Option<String> {
 /// replace `/` and `.` with `-`.
 fn claude_project_key(worktree_path: &Path) -> String {
     let s = worktree_path.to_string_lossy();
-    s.replace('/', "-").replace('.', "-")
+    s.chars()
+        .map(|c| {
+            if c == '/' || c == '.' {
+                '-'
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 /// Look up the most recent `.jsonl` in `~/.claude/projects/{key}/` and extract
@@ -35,12 +43,7 @@ fn extract_claude_task(worktree_path: &Path) -> Option<String> {
     let mut jsonl_files: Vec<_> = fs::read_dir(&project_dir)
         .ok()?
         .filter_map(|entry| entry.ok())
-        .filter(|entry| {
-            entry
-                .path()
-                .extension()
-                .is_some_and(|ext| ext == "jsonl")
-        })
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "jsonl"))
         .collect();
 
     jsonl_files.sort_by(|a, b| {
@@ -66,10 +69,7 @@ fn extract_claude_user_prompt(path: &Path) -> Option<String> {
         }
         let value: serde_json::Value = serde_json::from_str(&line).ok()?;
         if value.get("type").and_then(|v| v.as_str()) == Some("user") {
-            if let Some(content) = value
-                .pointer("/message/content")
-                .and_then(|v| v.as_str())
-            {
+            if let Some(content) = value.pointer("/message/content").and_then(|v| v.as_str()) {
                 return Some(truncate_prompt(content));
             }
             // Content might be an array of blocks.
@@ -104,15 +104,11 @@ fn extract_codex_task(worktree_path: &Path) -> Option<String> {
         let mut files: Vec<_> = fs::read_dir(&day_dir)
             .ok()?
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.path()
-                    .extension()
-                    .is_some_and(|ext| ext == "jsonl")
-            })
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
             .collect();
 
         // Sort newest first by filename (contains timestamp).
-        files.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+        files.sort_by_key(|e| std::cmp::Reverse(e.file_name()));
 
         for entry in files {
             if let Some(prompt) =
@@ -203,10 +199,10 @@ fn extract_codex_user_prompt_if_matching(path: &Path, worktree_str: &str) -> Opt
                 .pointer("/payload/type")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            if payload_type == "user_message" {
-                if let Some(msg) = value.pointer("/payload/message").and_then(|v| v.as_str()) {
-                    return Some(truncate_prompt(msg));
-                }
+            if payload_type == "user_message"
+                && let Some(msg) = value.pointer("/payload/message").and_then(|v| v.as_str())
+            {
+                return Some(truncate_prompt(msg));
             }
         }
     }
@@ -233,6 +229,7 @@ fn home_dir() -> Option<PathBuf> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

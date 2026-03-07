@@ -10091,6 +10091,7 @@ impl ArborWindow {
                                             this.bg(rgb(theme.accent))
                                                 .child(
                                                     div()
+                                                        .font_family(FONT_MONO)
                                                         .text_size(px(10.))
                                                         .text_color(rgb(theme.sidebar_bg))
                                                         .child("\u{f00c}"),
@@ -10142,7 +10143,7 @@ impl ArborWindow {
                                         this.opacity(0.5).cursor_default()
                                     })
                                     .when(!delete_disabled, |this| {
-                                        this.hover(|s| s.bg(rgb(0xeb6f92)).text_color(rgb(theme.sidebar_bg)))
+                                        this.hover(|s| s.bg(rgb(0xeb6f92)).text_color(rgb(theme.app_bg)))
                                     })
                                     .child(delete_label)
                                     .when(!delete_disabled, |this| {

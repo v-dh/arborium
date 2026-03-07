@@ -8,8 +8,10 @@ fn lists_real_git_worktrees() {
     let repo_path = temp_dir.path().join("repo");
     let feature_path = temp_dir.path().join("feature-worktree");
 
-    // Initialize a git repo with an initial commit using git2.
-    let repo = git2::Repository::init(&repo_path).expect("repo should be initialized");
+    // Initialize a git repo with "main" as default branch.
+    let mut opts = git2::RepositoryInitOptions::new();
+    opts.initial_head("main");
+    let repo = git2::Repository::init_opts(&repo_path, &opts).expect("repo should be initialized");
     setup_git2_config(&repo);
 
     fs::write(repo_path.join("README.md"), "# Arbor\n").expect("test file should be written");
@@ -24,10 +26,10 @@ fn lists_real_git_worktrees() {
         .branch("feature", &head_commit, false)
         .expect("branch should be created");
 
-    let mut opts = git2::WorktreeAddOptions::new();
+    let mut wt_opts = git2::WorktreeAddOptions::new();
     let branch_ref = branch.into_reference();
-    opts.reference(Some(&branch_ref));
-    repo.worktree("feature-worktree", &feature_path, Some(&opts))
+    wt_opts.reference(Some(&branch_ref));
+    repo.worktree("feature-worktree", &feature_path, Some(&wt_opts))
         .expect("worktree should be added");
 
     let worktrees = worktree::list(&repo_path).expect("worktree list should succeed");

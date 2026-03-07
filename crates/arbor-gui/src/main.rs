@@ -1,5 +1,6 @@
 mod app_config;
 mod log_layer;
+mod notifications;
 mod repository_store;
 mod simple_http_client;
 mod terminal_backend;
@@ -573,6 +574,8 @@ struct ArborWindow {
     git_action_in_flight: Option<GitActionKind>,
     last_persisted_ui_state: ui_state_store::UiState,
     last_ui_state_error: Option<String>,
+    notifications_enabled: bool,
+    window_is_active: bool,
     notice: Option<String>,
     right_pane_tab: RightPaneTab,
     file_tree_entries: Vec<FileTreeEntry>,
@@ -665,6 +668,8 @@ impl ArborWindow {
                     git_action_in_flight: None,
                     last_persisted_ui_state: startup_ui_state,
                     last_ui_state_error: None,
+                    notifications_enabled: true,
+                    window_is_active: true,
                     notice: Some(format!("failed to read current directory: {error}")),
                     right_pane_tab: RightPaneTab::Changes,
                     file_tree_entries: Vec::new(),
@@ -739,6 +744,8 @@ impl ArborWindow {
                     git_action_in_flight: None,
                     last_persisted_ui_state: startup_ui_state,
                     last_ui_state_error: None,
+                    notifications_enabled: true,
+                    window_is_active: true,
                     notice: Some(format!("failed to resolve git repository root: {error}")),
                     right_pane_tab: RightPaneTab::Changes,
                     file_tree_entries: Vec::new(),
@@ -871,6 +878,7 @@ impl ArborWindow {
                 ThemeKind::One
             },
         };
+        let notifications_enabled = loaded_config.config.notifications.unwrap_or(true);
 
         let mut app = Self {
             repository_store,
@@ -928,6 +936,8 @@ impl ArborWindow {
             worktree_nav_forward: Vec::new(),
             last_persisted_ui_state: startup_ui_state,
             last_ui_state_error: None,
+            notifications_enabled,
+            window_is_active: true,
             notice: (!notice_parts.is_empty()).then_some(notice_parts.join(" | ")),
             right_pane_tab: RightPaneTab::Changes,
             file_tree_entries: Vec::new(),
@@ -1150,6 +1160,8 @@ impl ArborWindow {
             changed = true;
         }
 
+        self.notifications_enabled = loaded.config.notifications.unwrap_or(true);
+
         if !notices.is_empty() {
             self.notice = Some(notices.join(" | "));
             changed = true;
@@ -1334,6 +1346,12 @@ impl ArborWindow {
             .map(|worktree| worktree.path.clone())
     }
 
+    fn maybe_notify(&self, title: &str, body: &str) {
+        if self.notifications_enabled && !self.window_is_active {
+            notifications::send(title, body);
+        }
+    }
+
     fn sync_running_terminals(&mut self, cx: &mut Context<Self>) {
         let mut changed = false;
         let follow_output = terminal_scroll_is_near_bottom(&self.terminal_scroll_handle);
@@ -1342,6 +1360,7 @@ impl ArborWindow {
             terminal_grid_size_from_scroll_handle(&self.terminal_scroll_handle, cx);
         let daemon = self.terminal_daemon.clone();
         let mut sessions_to_close = Vec::new();
+        let mut pending_notifications: Vec<(String, String)> = Vec::new();
 
         for index in 0..self.terminals.len() {
             let Some(runtime) = self
@@ -1390,11 +1409,19 @@ impl ArborWindow {
                         session.exit_code = Some(exit_code);
                         session.updated_at_unix_ms = current_unix_timestamp_millis();
                         if exit_code == 0 {
+                            pending_notifications.push((
+                                "Terminal completed".to_owned(),
+                                format!("`{}` completed successfully", session.title),
+                            ));
                             sessions_to_close.push(session.id);
                         } else {
                             session.state = TerminalState::Failed;
                             session.runtime = None;
                             changed = true;
+                            pending_notifications.push((
+                                "Terminal failed".to_owned(),
+                                format!("`{}` failed with code {exit_code}", session.title),
+                            ));
                             self.notice = Some(format!(
                                 "terminal tab `{}` exited with code {exit_code}",
                                 session.title,
@@ -1467,10 +1494,18 @@ impl ArborWindow {
 
                             if let Some(exit_code) = snapshot.exit_code {
                                 if exit_code == 0 {
+                                    pending_notifications.push((
+                                        "Terminal completed".to_owned(),
+                                        format!("`{title}` completed successfully"),
+                                    ));
                                     sessions_to_close.push(session.id);
                                 } else if session.state == TerminalState::Failed {
                                     session.runtime = None;
                                     changed = true;
+                                    pending_notifications.push((
+                                        "Terminal failed".to_owned(),
+                                        format!("`{title}` failed with code {exit_code}"),
+                                    ));
                                     self.notice = Some(format!(
                                         "terminal tab `{title}` exited with code {exit_code}",
                                     ));
@@ -1606,11 +1641,19 @@ impl ArborWindow {
                         session.exit_code = Some(exit_code);
                         session.updated_at_unix_ms = current_unix_timestamp_millis();
                         if exit_code == 0 {
+                            pending_notifications.push((
+                                "SSH terminal completed".to_owned(),
+                                format!("`{}` completed successfully", session.title),
+                            ));
                             sessions_to_close.push(session.id);
                         } else {
                             session.state = TerminalState::Failed;
                             session.runtime = None;
                             changed = true;
+                            pending_notifications.push((
+                                "SSH terminal failed".to_owned(),
+                                format!("`{}` failed with code {exit_code}", session.title),
+                            ));
                             self.notice = Some(format!(
                                 "SSH terminal tab `{}` exited with code {exit_code}",
                                 session.title,
@@ -1655,11 +1698,19 @@ impl ArborWindow {
                         session.exit_code = Some(exit_code);
                         session.updated_at_unix_ms = current_unix_timestamp_millis();
                         if exit_code == 0 {
+                            pending_notifications.push((
+                                "Mosh terminal completed".to_owned(),
+                                format!("`{}` completed successfully", session.title),
+                            ));
                             sessions_to_close.push(session.id);
                         } else {
                             session.state = TerminalState::Failed;
                             session.runtime = None;
                             changed = true;
+                            pending_notifications.push((
+                                "Mosh terminal failed".to_owned(),
+                                format!("`{}` failed with code {exit_code}", session.title),
+                            ));
                             self.notice = Some(format!(
                                 "mosh terminal tab `{}` exited with code {exit_code}",
                                 session.title,
@@ -1668,6 +1719,10 @@ impl ArborWindow {
                     }
                 },
             };
+        }
+
+        for (title, body) in pending_notifications {
+            self.maybe_notify(&title, &body);
         }
 
         for session_id in sessions_to_close {
@@ -7511,6 +7566,7 @@ impl RepositorySummary {
 
 impl Render for ArborWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.window_is_active = window.is_window_active();
         if self.focus_terminal_on_next_render && self.active_terminal().is_some() {
             window.focus(&self.terminal_focus);
             self.focus_terminal_on_next_render = false;

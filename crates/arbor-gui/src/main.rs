@@ -77,7 +77,6 @@ const TERMINAL_FONT_SIZE_PX: f32 = 15.0;
 const TERMINAL_SCROLLBAR_WIDTH_PX: f32 = 12.0;
 
 const TITLEBAR_HEIGHT: f32 = 34.;
-const QUIT_ARM_WINDOW: Duration = Duration::from_millis(1200);
 const WORKTREE_AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
 const GITHUB_PR_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const GITHUB_DEVICE_FLOW_POLL_MIN_INTERVAL: Duration = Duration::from_secs(5);
@@ -5664,28 +5663,22 @@ impl ArborWindow {
     }
 
     fn action_request_quit(&mut self, _: &RequestQuit, _: &mut Window, cx: &mut Context<Self>) {
-        let now = Instant::now();
-        if self.quit_overlay_until.is_some_and(|until| now < until) {
-            self.sync_daemon_session_store(cx);
-            cx.quit();
-            return;
-        }
-
-        let deadline = now + QUIT_ARM_WINDOW;
-        self.quit_overlay_until = Some(deadline);
+        self.quit_overlay_until = if self.quit_overlay_until.is_some() {
+            None
+        } else {
+            Some(Instant::now())
+        };
         cx.notify();
+    }
 
-        cx.spawn(async move |this, cx| {
-            cx.background_spawn(async move {
-                std::thread::sleep(QUIT_ARM_WINDOW);
-            })
-            .await;
-            let _ = this.update(cx, |this, cx| {
-                this.quit_overlay_until = None;
-                cx.notify();
-            });
-        })
-        .detach();
+    fn action_confirm_quit(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        self.sync_daemon_session_store(cx);
+        cx.quit();
+    }
+
+    fn action_dismiss_quit(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        self.quit_overlay_until = None;
+        cx.notify();
     }
 
     fn action_immediate_quit(&mut self, _: &ImmediateQuit, _: &mut Window, cx: &mut Context<Self>) {
@@ -12301,32 +12294,94 @@ impl Render for ArborWindow {
                         ),
                 )
             }))
-            .when(
-                self.quit_overlay_until
-                    .is_some_and(|until| Instant::now() < until),
-                |this| {
-                    this.child(
-                        div()
-                            .absolute()
-                            .inset_0()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(
-                                div()
-                                    .px_4()
-                                    .py_2()
-                                    .rounded_md()
-                                    .bg(rgb(theme.chrome_bg))
-                                    .border_1()
-                                    .border_color(rgb(theme.border))
-                                    .text_sm()
-                                    .text_color(rgb(theme.text_primary))
-                                    .child("Hold ⌘Q to quit"),
-                            ),
-                    )
-                },
-            )
+            .when(self.quit_overlay_until.is_some(), |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, cx| {
+                                this.action_dismiss_quit(window, cx);
+                            }),
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .bg(rgb(0x000000))
+                                .opacity(0.5),
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    div()
+                                        .px_6()
+                                        .py_4()
+                                        .rounded_lg()
+                                        .bg(rgb(theme.chrome_bg))
+                                        .border_1()
+                                        .border_color(rgb(theme.border))
+                                        .flex()
+                                        .flex_col()
+                                        .items_center()
+                                        .gap_3()
+                                        .on_mouse_down(MouseButton::Left, |_, _, _| {})
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .text_color(rgb(theme.text_primary))
+                                                .child("Are you sure you want to quit Arbor?"),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .gap_2()
+                                                .child(
+                                                    action_button(
+                                                        theme,
+                                                        "quit-cancel",
+                                                        "Cancel",
+                                                        false,
+                                                        false,
+                                                    )
+                                                    .on_click(cx.listener(
+                                                        |this, _, window, cx| {
+                                                            this.action_dismiss_quit(window, cx);
+                                                        },
+                                                    )),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .id("quit-confirm")
+                                                        .cursor_pointer()
+                                                        .rounded_sm()
+                                                        .border_1()
+                                                        .border_color(rgb(0xc94040))
+                                                        .bg(rgb(0xc94040))
+                                                        .px_2()
+                                                        .py_1()
+                                                        .text_xs()
+                                                        .text_color(rgb(0xffffff))
+                                                        .child("Quit")
+                                                        .on_click(cx.listener(
+                                                            |this, _, window, cx| {
+                                                                this.action_confirm_quit(
+                                                                    window, cx,
+                                                                );
+                                                            },
+                                                        )),
+                                                ),
+                                        ),
+                                ),
+                        ),
+                )
+            })
     }
 }
 

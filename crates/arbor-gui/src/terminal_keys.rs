@@ -61,20 +61,7 @@ pub fn terminal_bytes_from_keystroke(keystroke: &Keystroke) -> Option<Vec<u8>> {
         "pageup" => Some(b"\x1b[5~".to_vec()),
         "pagedown" => Some(b"\x1b[6~".to_vec()),
         "delete" => Some(b"\x1b[3~".to_vec()),
-        _ => {
-            if !keystroke.modifiers.control
-                && !keystroke.modifiers.alt
-                && let Some(key_char) = keystroke.key_char.as_ref()
-            {
-                return Some(key_char.as_bytes().to_vec());
-            }
-
-            if !keystroke.modifiers.control && !keystroke.modifiers.alt && key.len() == 1 {
-                return Some(key.as_bytes().to_vec());
-            }
-
-            None
-        },
+        _ => None,
     }
 }
 
@@ -122,9 +109,9 @@ mod tests {
     }
 
     #[test]
-    fn maps_plain_text_to_input_bytes() {
+    fn plain_text_returns_none_for_ime_path() {
         let plain_a = parse_keystroke("a");
-        assert_eq!(terminal_bytes_from_keystroke(&plain_a), Some(vec![b'a']));
+        assert_eq!(terminal_bytes_from_keystroke(&plain_a), None);
     }
 
     #[test]

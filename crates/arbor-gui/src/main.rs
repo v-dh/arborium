@@ -25,10 +25,11 @@ use {
     },
     gpui::{
         App, Application, Bounds, ClipboardItem, Context, Div, DragMoveEvent, ElementId,
-        FocusHandle, FontFallbacks, FontFeatures, FontWeight, Image, ImageFormat, KeyBinding,
-        KeyDownEvent, Keystroke, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent,
-        MouseUpEvent, PathPromptOptions, ScrollHandle, ScrollStrategy, Stateful, SystemMenuType,
-        TextRun, TitlebarOptions, UniformListScrollHandle, Window, WindowBounds, WindowControlArea,
+        ElementInputHandler, EntityInputHandler, FocusHandle, FontFallbacks, FontFeatures,
+        FontWeight, Image, ImageFormat, KeyBinding, KeyDownEvent, Keystroke, Menu, MenuItem,
+        MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels,
+        ScrollHandle, ScrollStrategy, Stateful, SystemMenuType, TextRun, TitlebarOptions,
+        UTF16Selection, UniformListScrollHandle, Window, WindowBounds, WindowControlArea,
         WindowDecorations, WindowOptions, actions, canvas, div, fill, font, img, point, prelude::*,
         px, rgb, size, uniform_list,
     },
@@ -746,12 +747,12 @@ struct DeleteModal {
 
 struct RepositoryContextMenu {
     repository_index: usize,
-    position: gpui::Point<gpui::Pixels>,
+    position: gpui::Point<Pixels>,
 }
 
 struct WorktreeContextMenu {
     worktree_index: usize,
-    position: gpui::Point<gpui::Pixels>,
+    position: gpui::Point<Pixels>,
 }
 
 struct CreatedWorktree {
@@ -6339,12 +6340,15 @@ impl ArborWindow {
         }
 
         self.clear_terminal_selection_for_session(active_terminal_id);
-        self.track_terminal_command_input(active_terminal_id, &event.keystroke);
 
         let Some(input) = terminal_keys::terminal_bytes_from_keystroke(&event.keystroke) else {
+            // No bytes for this key — let the event propagate to the IME /
+            // InputHandler so composed characters arrive via
+            // `replace_text_in_range`.
             return;
         };
 
+        self.track_terminal_command_input(active_terminal_id, &event.keystroke);
         if let Err(error) = self.write_input_to_terminal(active_terminal_id, &input) {
             self.notice = Some(format!("failed to write to terminal: {error}"));
         }
@@ -8350,6 +8354,27 @@ impl ArborWindow {
             .track_focus(&self.terminal_focus)
             .on_any_mouse_down(cx.listener(Self::focus_terminal_panel))
             .on_key_down(cx.listener(Self::handle_terminal_key_down))
+            .child({
+                let entity = cx.entity().clone();
+                let focus = self.terminal_focus.clone();
+                canvas(
+                    move |_, _, _| {},
+                    move |_, _, window, cx| {
+                        window.handle_input(
+                            &focus,
+                            ElementInputHandler::new(
+                                Bounds {
+                                    origin: point(px(0.), px(0.)),
+                                    size: size(px(0.), px(0.)),
+                                },
+                                entity.clone(),
+                            ),
+                            cx,
+                        );
+                    },
+                )
+                .size(px(0.))
+            })
             .child(
                 div()
                     .h(px(32.))
@@ -11299,6 +11324,85 @@ impl RepositorySummary {
             avatar_url,
             github_repo_slug,
         }
+    }
+}
+
+impl EntityInputHandler for ArborWindow {
+    fn text_for_range(
+        &mut self,
+        _range: std::ops::Range<usize>,
+        _adjusted_range: &mut Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        None
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        None
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<std::ops::Range<usize>> {
+        None
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+
+    fn replace_text_in_range(
+        &mut self,
+        _range: Option<std::ops::Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+        let Some(session_id) = self.active_terminal_id_for_selected_worktree() else {
+            return;
+        };
+        self.append_pasted_text_to_pending_command(session_id, text);
+        if let Err(error) = self.write_input_to_terminal(session_id, text.as_bytes()) {
+            self.notice = Some(format!("failed to write to terminal: {error}"));
+        }
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _range: Option<std::ops::Range<usize>>,
+        _new_text: &str,
+        _new_selected_range: Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: std::ops::Range<usize>,
+        _element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        None
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: gpui::Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
     }
 }
 
@@ -14780,7 +14884,7 @@ fn should_force_powerline(run: &PositionedTerminalRun) -> bool {
             .is_some_and(is_terminal_powerline_character)
 }
 
-fn snap_pixels_floor(value: gpui::Pixels, scale_factor: f32) -> gpui::Pixels {
+fn snap_pixels_floor(value: Pixels, scale_factor: f32) -> Pixels {
     if !(scale_factor.is_finite() && scale_factor > 0.) {
         return value.floor();
     }
@@ -14789,7 +14893,7 @@ fn snap_pixels_floor(value: gpui::Pixels, scale_factor: f32) -> gpui::Pixels {
     px(scaled.floor() / scale_factor)
 }
 
-fn snap_pixels_ceil(value: gpui::Pixels, scale_factor: f32) -> gpui::Pixels {
+fn snap_pixels_ceil(value: Pixels, scale_factor: f32) -> Pixels {
     if !(scale_factor.is_finite() && scale_factor > 0.) {
         return value.ceil();
     }
@@ -14849,9 +14953,9 @@ fn styled_line_to_string(line: &TerminalStyledLine) -> String {
 }
 
 fn terminal_grid_position_from_pointer(
-    position: gpui::Point<gpui::Pixels>,
-    bounds: Bounds<gpui::Pixels>,
-    scroll_offset: gpui::Point<gpui::Pixels>,
+    position: gpui::Point<Pixels>,
+    bounds: Bounds<Pixels>,
+    scroll_offset: gpui::Point<Pixels>,
     line_height: f32,
     cell_width: f32,
     line_count: usize,
@@ -15240,7 +15344,7 @@ fn install_app_menu_and_keys(cx: &mut App) {
 
 fn bounds_from_window_geometry(
     geometry: ui_state_store::WindowGeometry,
-) -> Option<Bounds<gpui::Pixels>> {
+) -> Option<Bounds<Pixels>> {
     if geometry.width == 0 || geometry.height == 0 {
         return None;
     }

@@ -25,7 +25,7 @@ use {
         Algorithm as DiffAlgorithm, Diff as BlobDiff, InternedInput as BlobInternedInput,
     },
     gpui::{
-        App, Application, Bounds, ClipboardItem, Context, Div, DragMoveEvent, ElementId,
+        Action, App, Application, Bounds, ClipboardItem, Context, Div, DragMoveEvent, ElementId,
         ElementInputHandler, EntityInputHandler, FocusHandle, FontFallbacks, FontFeatures,
         FontWeight, Image, ImageFormat, KeyBinding, KeyDownEvent, Keystroke, Menu, MenuItem,
         MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels,
@@ -163,6 +163,27 @@ actions!(arbor, [
     UseAyuDarkTheme,
     UseGruvboxTheme,
     UseDraculaTheme,
+    UseSolarizedLightTheme,
+    UseEverforestTheme,
+    UseCatppuccinTheme,
+    UseCatppuccinLatteTheme,
+    UseEtherealTheme,
+    UseFlexokiLightTheme,
+    UseHackermanTheme,
+    UseKanagawaTheme,
+    UseMatteBlackTheme,
+    UseMiasmaTheme,
+    UseNordTheme,
+    UseOsakaJadeTheme,
+    UseRistrettoTheme,
+    UseRosePineTheme,
+    UseTokyoNightTheme,
+    UseVantablackTheme,
+    UseWhiteTheme,
+    UseRetroboxClassicTheme,
+    UseTokyonightDayTheme,
+    UseTokyonightClassicTheme,
+    UseZellnerTheme,
     UseEmbeddedBackend,
     UseAlacrittyBackend,
     UseGhosttyBackend,
@@ -974,7 +995,7 @@ impl ArborWindow {
                 let outpost_store = Box::new(arbor_core::outpost_store::default_outpost_store());
                 let outposts = load_outpost_summaries(outpost_store.as_ref(), &remote_hosts);
 
-                return Self {
+                let app = Self {
                     repository_store,
                     daemon_session_store,
                     terminal_daemon: None,
@@ -1075,6 +1096,8 @@ impl ArborWindow {
                     agent_ws_connected: false,
                     ime_marked_text: None,
                 };
+                app.sync_theme_menu_selection(cx);
+                return app;
             },
         };
 
@@ -1322,6 +1345,7 @@ impl ArborWindow {
             ime_marked_text: None,
         };
 
+        app.sync_theme_menu_selection(cx);
         app.refresh_worktrees(cx);
         app.refresh_repo_config_if_changed(cx);
         app.restore_terminal_sessions_from_records(initial_daemon_records, attach_daemon_runtime);
@@ -1458,12 +1482,14 @@ impl ArborWindow {
         let loaded = app_config::load_or_create_config();
         let mut notices = loaded.notices;
         let mut changed = false;
+        let mut theme_changed = false;
 
         match parse_theme_kind(loaded.config.theme.as_deref()) {
             Ok(theme_kind) => {
                 if self.theme_kind != theme_kind {
                     self.theme_kind = theme_kind;
                     changed = true;
+                    theme_changed = true;
                 }
             },
             Err(error) => notices.push(error),
@@ -1551,6 +1577,10 @@ impl ArborWindow {
         }
 
         self.notifications_enabled = loaded.config.notifications.unwrap_or(true);
+
+        if theme_changed {
+            self.sync_theme_menu_selection(cx);
+        }
 
         if !notices.is_empty() {
             self.notice = Some(notices.join(" | "));
@@ -4056,6 +4086,7 @@ impl ArborWindow {
         }
 
         self.theme_kind = theme_kind;
+        self.sync_theme_menu_selection(cx);
         self.theme_toast = Some(format!("Theme switched to {}", theme_kind.label()));
         self.theme_toast_generation = self.theme_toast_generation.saturating_add(1);
         let generation = self.theme_toast_generation;
@@ -4074,6 +4105,10 @@ impl ArborWindow {
             });
         })
         .detach();
+    }
+
+    fn sync_theme_menu_selection(&self, cx: &mut Context<Self>) {
+        cx.set_menus(build_app_menus(self.theme_kind));
     }
 
     fn open_create_modal(
@@ -5569,6 +5604,190 @@ impl ArborWindow {
         cx: &mut Context<Self>,
     ) {
         self.switch_theme(ThemeKind::Dracula, cx);
+    }
+
+    fn action_use_solarized_light_theme(
+        &mut self,
+        _: &UseSolarizedLightTheme,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.switch_theme(ThemeKind::SolarizedLight, cx);
+    }
+
+    fn action_use_everforest_theme(
+        &mut self,
+        _: &UseEverforestTheme,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.switch_theme(ThemeKind::Everforest, cx);
+    }
+
+    fn action_use_catppuccin_theme(
+        &mut self,
+        _: &UseCatppuccinTheme,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.switch_theme(ThemeKind::Catppuccin, cx);
+    }
+
+    fn action_use_catppuccin_latte_theme(
+        &mut self,
+        _: &UseCatppuccinLatteTheme,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.switch_theme(ThemeKind::CatppuccinLatte, cx);
+    }
+
+    fn action_use_ethereal_theme(
+        &mut self,
+        _: &UseEtherealTheme,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.switch_theme(ThemeKind::Ethereal, cx);
+    }
+
+    fn action_use_flexoki_light_theme(
+        &mut self,
+        _: &UseFlexokiLightTheme,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.switch_theme(ThemeKind::FlexokiLight, cx);
+    }
+
+    fn action_use_hackerman_theme(
+        &mut self,
+        _: &UseHackermanTheme,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.switch_theme(ThemeKind::Hackerman, cx);
+    }
+
+    fn action_use_kanagawa_theme(
+        &mut self,
+        _: &UseKanagawaTheme,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.switch_theme(ThemeKind::Kanagawa, cx);
+    }
+
+    fn action_use_matte_black_theme(
+        &mut self,
+        _: &UseMatteBlackTheme,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.switch_theme(ThemeKind::MatteBlack, cx);
+    }
+
+    fn action_use_miasma_theme(
+        &mut self,
+        _: &UseMiasmaTheme,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.switch_theme(ThemeKind::Miasma, cx);
+    }
+
+    fn action_use_nord_theme(&mut self, _: &UseNordTheme, _: &mut Window, cx: &mut Context<Self>) {
+        self.switch_theme(ThemeKind::Nord, cx);
+    }
+
+    fn action_use_osaka_jade_theme(
+        &mut self,
+        _: &UseOsakaJadeTheme,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.switch_theme(ThemeKind::OsakaJade, cx);
+    }
+
+    fn action_use_ristretto_theme(
+        &mut self,
+        _: &UseRistrettoTheme,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.switch_theme(ThemeKind::Ristretto, cx);
+    }
+
+    fn action_use_rose_pine_theme(
+        &mut self,
+        _: &UseRosePineTheme,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.switch_theme(ThemeKind::RosePine, cx);
+    }
+
+    fn action_use_tokyo_night_theme(
+        &mut self,
+        _: &UseTokyoNightTheme,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.switch_theme(ThemeKind::TokyoNight, cx);
+    }
+
+    fn action_use_vantablack_theme(
+        &mut self,
+        _: &UseVantablackTheme,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.switch_theme(ThemeKind::Vantablack, cx);
+    }
+
+    fn action_use_white_theme(
+        &mut self,
+        _: &UseWhiteTheme,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.switch_theme(ThemeKind::White, cx);
+    }
+
+    fn action_use_retrobox_classic_theme(
+        &mut self,
+        _: &UseRetroboxClassicTheme,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.switch_theme(ThemeKind::RetroboxClassic, cx);
+    }
+
+    fn action_use_tokyonight_day_theme(
+        &mut self,
+        _: &UseTokyonightDayTheme,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.switch_theme(ThemeKind::TokyoNightDay, cx);
+    }
+
+    fn action_use_tokyonight_classic_theme(
+        &mut self,
+        _: &UseTokyonightClassicTheme,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.switch_theme(ThemeKind::TokyoNightClassic, cx);
+    }
+
+    fn action_use_zellner_theme(
+        &mut self,
+        _: &UseZellnerTheme,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.switch_theme(ThemeKind::Zellner, cx);
     }
 
     fn action_use_embedded_backend(
@@ -9794,6 +10013,11 @@ impl ArborWindow {
                     ))
                     .child(status_text(theme, "•"))
                     .child(status_text(theme, format!("terminals {terminal_count}")))
+                    .child(status_text(theme, "•"))
+                    .child(status_text(
+                        theme,
+                        format!("theme {}", self.theme_kind.label()),
+                    ))
                     .child(
                         if self.worktree_stats_loading || self.worktree_prs_loading {
                             let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -12231,6 +12455,27 @@ impl Render for ArborWindow {
             .on_action(cx.listener(Self::action_use_ayu_dark_theme))
             .on_action(cx.listener(Self::action_use_gruvbox_theme))
             .on_action(cx.listener(Self::action_use_dracula_theme))
+            .on_action(cx.listener(Self::action_use_solarized_light_theme))
+            .on_action(cx.listener(Self::action_use_everforest_theme))
+            .on_action(cx.listener(Self::action_use_catppuccin_theme))
+            .on_action(cx.listener(Self::action_use_catppuccin_latte_theme))
+            .on_action(cx.listener(Self::action_use_ethereal_theme))
+            .on_action(cx.listener(Self::action_use_flexoki_light_theme))
+            .on_action(cx.listener(Self::action_use_hackerman_theme))
+            .on_action(cx.listener(Self::action_use_kanagawa_theme))
+            .on_action(cx.listener(Self::action_use_matte_black_theme))
+            .on_action(cx.listener(Self::action_use_miasma_theme))
+            .on_action(cx.listener(Self::action_use_nord_theme))
+            .on_action(cx.listener(Self::action_use_osaka_jade_theme))
+            .on_action(cx.listener(Self::action_use_ristretto_theme))
+            .on_action(cx.listener(Self::action_use_rose_pine_theme))
+            .on_action(cx.listener(Self::action_use_tokyo_night_theme))
+            .on_action(cx.listener(Self::action_use_vantablack_theme))
+            .on_action(cx.listener(Self::action_use_white_theme))
+            .on_action(cx.listener(Self::action_use_retrobox_classic_theme))
+            .on_action(cx.listener(Self::action_use_tokyonight_day_theme))
+            .on_action(cx.listener(Self::action_use_tokyonight_classic_theme))
+            .on_action(cx.listener(Self::action_use_zellner_theme))
             .on_action(cx.listener(Self::action_use_embedded_backend))
             .on_action(cx.listener(Self::action_use_alacritty_backend))
             .on_action(cx.listener(Self::action_use_ghostty_backend))
@@ -16392,8 +16637,29 @@ fn parse_theme_kind(theme: Option<&str>) -> Result<ThemeKind, String> {
         "ayu-dark" | "ayu" => Ok(ThemeKind::Ayu),
         "gruvbox-dark" | "gruvbox" => Ok(ThemeKind::Gruvbox),
         "dracula" => Ok(ThemeKind::Dracula),
+        "solarized-light" | "solarized" => Ok(ThemeKind::SolarizedLight),
+        "everforest-dark" | "everforest" => Ok(ThemeKind::Everforest),
+        "catppuccin" => Ok(ThemeKind::Catppuccin),
+        "catppuccin-latte" => Ok(ThemeKind::CatppuccinLatte),
+        "ethereal" => Ok(ThemeKind::Ethereal),
+        "flexoki-light" | "flexoki" => Ok(ThemeKind::FlexokiLight),
+        "hackerman" => Ok(ThemeKind::Hackerman),
+        "kanagawa" => Ok(ThemeKind::Kanagawa),
+        "matte-black" | "matteblack" => Ok(ThemeKind::MatteBlack),
+        "miasma" => Ok(ThemeKind::Miasma),
+        "nord" => Ok(ThemeKind::Nord),
+        "osaka-jade" | "osakajade" => Ok(ThemeKind::OsakaJade),
+        "ristretto" => Ok(ThemeKind::Ristretto),
+        "rose-pine" | "rosepine" => Ok(ThemeKind::RosePine),
+        "tokyo-night" | "tokyonight" => Ok(ThemeKind::TokyoNight),
+        "vantablack" => Ok(ThemeKind::Vantablack),
+        "white" => Ok(ThemeKind::White),
+        "retrobox-classic" | "retrobox" => Ok(ThemeKind::RetroboxClassic),
+        "tokyonight-day" | "tokionight-day" => Ok(ThemeKind::TokyoNightDay),
+        "tokyonight-classic" | "tokionight-classic" => Ok(ThemeKind::TokyoNightClassic),
+        "zellner" => Ok(ThemeKind::Zellner),
         _ => Err(format!(
-            "invalid theme `{value}` in config, expected one-dark/ayu-dark/gruvbox-dark/dracula"
+            "invalid theme `{value}` in config, expected one-dark/ayu-dark/gruvbox-dark/dracula/solarized-light/everforest-dark/catppuccin/catppuccin-latte/ethereal/flexoki-light/hackerman/kanagawa/matte-black/miasma/nord/osaka-jade/ristretto/rose-pine/tokyo-night/vantablack/white/retrobox-classic/tokyonight-day/tokyonight-classic/zellner"
         )),
     }
 }
@@ -16450,7 +16716,11 @@ fn install_app_menu_and_keys(cx: &mut App) {
         KeyBinding::new("cmd-]", NavigateWorktreeForward, None),
         KeyBinding::new("cmd-shift-l", ViewLogs, None),
     ]);
-    cx.set_menus(vec![
+    cx.set_menus(build_app_menus(ThemeKind::One));
+}
+
+fn build_app_menus(selected_theme: ThemeKind) -> Vec<Menu> {
+    vec![
         Menu {
             name: "Arbor".into(),
             items: vec![
@@ -16488,12 +16758,7 @@ fn install_app_menu_and_keys(cx: &mut App) {
         },
         Menu {
             name: "Theme".into(),
-            items: vec![
-                MenuItem::action("Use One Dark", UseOneDarkTheme),
-                MenuItem::action("Use Ayu Dark", UseAyuDarkTheme),
-                MenuItem::action("Use Gruvbox Dark", UseGruvboxTheme),
-                MenuItem::action("Use Dracula", UseDraculaTheme),
-            ],
+            items: theme_menu_items(selected_theme),
         },
         Menu {
             name: "View".into(),
@@ -16518,7 +16783,137 @@ fn install_app_menu_and_keys(cx: &mut App) {
                 MenuItem::action("Refresh Changes", RefreshChanges),
             ],
         },
-    ]);
+    ]
+}
+
+fn theme_menu_items(selected_theme: ThemeKind) -> Vec<MenuItem> {
+    vec![
+        theme_menu_item(
+            "One Dark",
+            selected_theme == ThemeKind::One,
+            UseOneDarkTheme,
+        ),
+        theme_menu_item(
+            "Ayu Dark",
+            selected_theme == ThemeKind::Ayu,
+            UseAyuDarkTheme,
+        ),
+        theme_menu_item(
+            "Gruvbox Dark",
+            selected_theme == ThemeKind::Gruvbox,
+            UseGruvboxTheme,
+        ),
+        theme_menu_item(
+            "Dracula",
+            selected_theme == ThemeKind::Dracula,
+            UseDraculaTheme,
+        ),
+        theme_menu_item(
+            "Solarized Light",
+            selected_theme == ThemeKind::SolarizedLight,
+            UseSolarizedLightTheme,
+        ),
+        theme_menu_item(
+            "Everforest",
+            selected_theme == ThemeKind::Everforest,
+            UseEverforestTheme,
+        ),
+        theme_menu_item(
+            "Catppuccin",
+            selected_theme == ThemeKind::Catppuccin,
+            UseCatppuccinTheme,
+        ),
+        theme_menu_item(
+            "Catppuccin Latte",
+            selected_theme == ThemeKind::CatppuccinLatte,
+            UseCatppuccinLatteTheme,
+        ),
+        theme_menu_item(
+            "Ethereal",
+            selected_theme == ThemeKind::Ethereal,
+            UseEtherealTheme,
+        ),
+        theme_menu_item(
+            "Flexoki Light",
+            selected_theme == ThemeKind::FlexokiLight,
+            UseFlexokiLightTheme,
+        ),
+        theme_menu_item(
+            "Hackerman",
+            selected_theme == ThemeKind::Hackerman,
+            UseHackermanTheme,
+        ),
+        theme_menu_item(
+            "Kanagawa",
+            selected_theme == ThemeKind::Kanagawa,
+            UseKanagawaTheme,
+        ),
+        theme_menu_item(
+            "Matte Black",
+            selected_theme == ThemeKind::MatteBlack,
+            UseMatteBlackTheme,
+        ),
+        theme_menu_item(
+            "Miasma",
+            selected_theme == ThemeKind::Miasma,
+            UseMiasmaTheme,
+        ),
+        theme_menu_item("Nord", selected_theme == ThemeKind::Nord, UseNordTheme),
+        theme_menu_item(
+            "Osaka Jade",
+            selected_theme == ThemeKind::OsakaJade,
+            UseOsakaJadeTheme,
+        ),
+        theme_menu_item(
+            "Ristretto",
+            selected_theme == ThemeKind::Ristretto,
+            UseRistrettoTheme,
+        ),
+        theme_menu_item(
+            "Rose Pine",
+            selected_theme == ThemeKind::RosePine,
+            UseRosePineTheme,
+        ),
+        theme_menu_item(
+            "Tokyo Night",
+            selected_theme == ThemeKind::TokyoNight,
+            UseTokyoNightTheme,
+        ),
+        theme_menu_item(
+            "Vantablack",
+            selected_theme == ThemeKind::Vantablack,
+            UseVantablackTheme,
+        ),
+        theme_menu_item("White", selected_theme == ThemeKind::White, UseWhiteTheme),
+        theme_menu_item(
+            "Retrobox Classic",
+            selected_theme == ThemeKind::RetroboxClassic,
+            UseRetroboxClassicTheme,
+        ),
+        theme_menu_item(
+            "TokyoNight Day",
+            selected_theme == ThemeKind::TokyoNightDay,
+            UseTokyonightDayTheme,
+        ),
+        theme_menu_item(
+            "TokyoNight Classic",
+            selected_theme == ThemeKind::TokyoNightClassic,
+            UseTokyonightClassicTheme,
+        ),
+        theme_menu_item(
+            "Zellner",
+            selected_theme == ThemeKind::Zellner,
+            UseZellnerTheme,
+        ),
+    ]
+}
+
+fn theme_menu_item(label: &str, selected: bool, action: impl Action) -> MenuItem {
+    if selected {
+        MenuItem::action(format!("{label} ✓"), action)
+    } else {
+        MenuItem::action(label.to_owned(), action)
+    }
 }
 
 fn bounds_from_window_geometry(geometry: ui_state_store::WindowGeometry) -> Option<Bounds<Pixels>> {
@@ -16800,6 +17195,122 @@ mod tests {
     #[test]
     fn auto_follow_is_disabled_without_new_output() {
         assert!(!crate::should_auto_follow_terminal_output(false, false));
+    }
+
+    #[test]
+    fn parse_theme_kind_supports_solarized_light_aliases() {
+        assert_eq!(
+            crate::parse_theme_kind(Some("solarized-light")).ok(),
+            Some(ThemeKind::SolarizedLight)
+        );
+        assert_eq!(
+            crate::parse_theme_kind(Some("solarized")).ok(),
+            Some(ThemeKind::SolarizedLight)
+        );
+    }
+
+    #[test]
+    fn parse_theme_kind_supports_everforest_aliases() {
+        assert_eq!(
+            crate::parse_theme_kind(Some("everforest-dark")).ok(),
+            Some(ThemeKind::Everforest)
+        );
+        assert_eq!(
+            crate::parse_theme_kind(Some("everforest")).ok(),
+            Some(ThemeKind::Everforest)
+        );
+    }
+
+    #[test]
+    fn parse_theme_kind_supports_omarchy_and_custom_aliases() {
+        assert_eq!(
+            crate::parse_theme_kind(Some("catppuccin")).ok(),
+            Some(ThemeKind::Catppuccin)
+        );
+        assert_eq!(
+            crate::parse_theme_kind(Some("catppuccin-latte")).ok(),
+            Some(ThemeKind::CatppuccinLatte)
+        );
+        assert_eq!(
+            crate::parse_theme_kind(Some("ethereal")).ok(),
+            Some(ThemeKind::Ethereal)
+        );
+        assert_eq!(
+            crate::parse_theme_kind(Some("flexoki-light")).ok(),
+            Some(ThemeKind::FlexokiLight)
+        );
+        assert_eq!(
+            crate::parse_theme_kind(Some("hackerman")).ok(),
+            Some(ThemeKind::Hackerman)
+        );
+        assert_eq!(
+            crate::parse_theme_kind(Some("kanagawa")).ok(),
+            Some(ThemeKind::Kanagawa)
+        );
+        assert_eq!(
+            crate::parse_theme_kind(Some("matte-black")).ok(),
+            Some(ThemeKind::MatteBlack)
+        );
+        assert_eq!(
+            crate::parse_theme_kind(Some("miasma")).ok(),
+            Some(ThemeKind::Miasma)
+        );
+        assert_eq!(
+            crate::parse_theme_kind(Some("nord")).ok(),
+            Some(ThemeKind::Nord)
+        );
+        assert_eq!(
+            crate::parse_theme_kind(Some("osaka-jade")).ok(),
+            Some(ThemeKind::OsakaJade)
+        );
+        assert_eq!(
+            crate::parse_theme_kind(Some("ristretto")).ok(),
+            Some(ThemeKind::Ristretto)
+        );
+        assert_eq!(
+            crate::parse_theme_kind(Some("rose-pine")).ok(),
+            Some(ThemeKind::RosePine)
+        );
+        assert_eq!(
+            crate::parse_theme_kind(Some("tokyo-night")).ok(),
+            Some(ThemeKind::TokyoNight)
+        );
+        assert_eq!(
+            crate::parse_theme_kind(Some("vantablack")).ok(),
+            Some(ThemeKind::Vantablack)
+        );
+        assert_eq!(
+            crate::parse_theme_kind(Some("white")).ok(),
+            Some(ThemeKind::White)
+        );
+        assert_eq!(
+            crate::parse_theme_kind(Some("retrobox-classic")).ok(),
+            Some(ThemeKind::RetroboxClassic)
+        );
+        assert_eq!(
+            crate::parse_theme_kind(Some("retrobox")).ok(),
+            Some(ThemeKind::RetroboxClassic)
+        );
+        assert_eq!(
+            crate::parse_theme_kind(Some("tokyonight-day")).ok(),
+            Some(ThemeKind::TokyoNightDay)
+        );
+        assert_eq!(
+            crate::parse_theme_kind(Some("tokionight-day")).ok(),
+            Some(ThemeKind::TokyoNightDay)
+        );
+        assert_eq!(
+            crate::parse_theme_kind(Some("tokyonight-classic")).ok(),
+            Some(ThemeKind::TokyoNightClassic)
+        );
+        assert_eq!(
+            crate::parse_theme_kind(Some("tokionight-classic")).ok(),
+            Some(ThemeKind::TokyoNightClassic)
+        );
+        assert_eq!(
+            crate::parse_theme_kind(Some("zellner")).ok(),
+            Some(ThemeKind::Zellner)
+        );
     }
 
     #[test]

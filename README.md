@@ -52,7 +52,7 @@ Arbor is a desktop Git worktree manager built with Rust and [GPUI](https://gpui.
 ### UI
 - Three-pane layout: repository sidebar, terminal center, changes/file tree right
 - Resizable panes with drag handles and collapsible sidebar
-- Three themes: One Dark, Ayu Dark, Gruvbox Dark
+- Twenty-five themes, including Omarchy defaults: Tokyo Night, Catppuccin, Ethereal, Everforest, Gruvbox, Miasma, Hackerman, Osaka Jade, Kanagawa, Nord, Matte Black, Vantablack, Ristretto, Flexoki Light, Rose Pine, Catppuccin Latte, White
 - Desktop notifications for terminal events
 - Keyboard-driven modal dialogs
 

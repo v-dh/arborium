@@ -21,6 +21,7 @@ const IO_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone)]
 pub struct HttpTerminalDaemon {
     endpoint: HttpEndpoint,
+    auth_token: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -33,6 +34,14 @@ impl HttpTerminalDaemonError {
         Self {
             message: message.into(),
         }
+    }
+
+    pub fn is_unauthorized(&self) -> bool {
+        self.message.contains("status 401")
+    }
+
+    pub fn is_forbidden(&self) -> bool {
+        self.message.contains("status 403")
     }
 }
 
@@ -100,7 +109,14 @@ struct TerminalSignalRequest {
 impl HttpTerminalDaemon {
     pub fn new(base_url: &str) -> Result<Self, HttpTerminalDaemonError> {
         let endpoint = HttpEndpoint::parse(base_url)?;
-        Ok(Self { endpoint })
+        Ok(Self {
+            endpoint,
+            auth_token: None,
+        })
+    }
+
+    pub fn set_auth_token(&mut self, token: Option<String>) {
+        self.auth_token = token;
     }
 
     pub fn base_url(&self) -> String {
@@ -250,6 +266,9 @@ impl HttpTerminalDaemon {
             "{method} {request_path} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\nAccept: application/json\r\n"
         );
 
+        if let Some(ref token) = self.auth_token {
+            headers.push_str(&format!("Authorization: Bearer {token}\r\n"));
+        }
         if !body.is_empty() {
             headers.push_str("Content-Type: application/json\r\n");
             headers.push_str(&format!("Content-Length: {}\r\n", body.len()));

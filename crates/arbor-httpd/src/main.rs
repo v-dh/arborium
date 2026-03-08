@@ -1,3 +1,4 @@
+mod mdns;
 mod process_manager;
 mod repository_store;
 mod terminal_daemon;
@@ -298,7 +299,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-    println!("arbor-httpd listening on http://{}", listener.local_addr()?);
+    let local_addr = listener.local_addr()?;
+    println!("arbor-httpd listening on http://{local_addr}");
+
+    // Announce on the local network via mDNS — hold handle to keep registration alive
+    let _mdns = match mdns::register_service(local_addr.port(), false, false) {
+        Ok(registration) => {
+            println!(
+                "  mDNS: announcing _arbor._tcp on port {}",
+                local_addr.port()
+            );
+            Some(registration)
+        },
+        Err(e) => {
+            eprintln!("  mDNS: failed to register ({e}), LAN discovery disabled");
+            None
+        },
+    };
+
     axum::serve(listener, app).await?;
 
     Ok(())

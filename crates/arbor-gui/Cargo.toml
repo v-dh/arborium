@@ -30,6 +30,7 @@ gix-diff = { workspace = true, features = ["blob-experimental"] }
 gpui = { workspace = true }
 gpui_http_client = { workspace = true }
 imara-diff = { workspace = true }
+mdns-sd = { workspace = true }
 notify-rust = { workspace = true }
 octocrab = { workspace = true }
 portable-pty = { workspace = true }

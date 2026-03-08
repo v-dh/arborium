@@ -1,6 +1,7 @@
 mod app_config;
 mod github_auth_store;
 mod log_layer;
+mod mdns_browser;
 mod notifications;
 mod repository_store;
 mod simple_http_client;
@@ -169,8 +170,17 @@ actions!(arbor, [
     NavigateWorktreeForward,
     CollapseAllRepositories,
     ViewLogs,
-    OpenThemePicker
+    OpenThemePicker,
+    OpenSettings,
+    OpenManageHosts,
+    ConnectToHost
 ]);
+
+#[derive(Clone, PartialEq, Debug, gpui::Action)]
+#[action(namespace = arbor, no_json)]
+pub struct ConnectToLanDaemon {
+    pub index: usize,
+}
 
 #[derive(Debug, Clone)]
 struct WorktreeSummary {
@@ -463,6 +473,41 @@ impl AgentPresetKind {
 struct AgentPreset {
     kind: AgentPresetKind,
     command: String,
+}
+
+#[derive(Debug, Clone)]
+struct SettingsModal {
+    active_field: SettingsField,
+    daemon_url: String,
+    preferred_editor: String,
+    notifications: bool,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsField {
+    DaemonUrl,
+    PreferredEditor,
+}
+
+impl SettingsField {
+    fn cycle(self, reverse: bool) -> Self {
+        match (self, reverse) {
+            (SettingsField::DaemonUrl, false) => SettingsField::PreferredEditor,
+            (SettingsField::DaemonUrl, true) => SettingsField::PreferredEditor,
+            (SettingsField::PreferredEditor, false) => SettingsField::DaemonUrl,
+            (SettingsField::PreferredEditor, true) => SettingsField::DaemonUrl,
+        }
+    }
+}
+
+enum SettingsModalInputEvent {
+    SetActiveField(SettingsField),
+    CycleField(bool),
+    Backspace,
+    Append(String),
+    ToggleNotifications,
+    ClearError,
 }
 
 #[derive(Debug, Clone)]
@@ -771,6 +816,17 @@ struct DeleteModal {
     error: Option<String>,
 }
 
+struct DaemonAuthModal {
+    daemon_url: String,
+    token: String,
+    error: Option<String>,
+}
+
+struct ConnectToHostModal {
+    address: String,
+    error: Option<String>,
+}
+
 struct RepositoryContextMenu {
     repository_index: usize,
     position: gpui::Point<Pixels>,
@@ -854,6 +910,11 @@ struct ArborWindow {
     manage_repo_presets_modal: Option<ManageRepoPresetsModal>,
     show_about: bool,
     show_theme_picker: bool,
+    settings_modal: Option<SettingsModal>,
+    daemon_auth_modal: Option<DaemonAuthModal>,
+    connect_to_host_modal: Option<ConnectToHostModal>,
+    daemon_auth_tokens: HashMap<String, String>,
+    connected_daemon_label: Option<String>,
     pending_diff_scroll_to_file: Option<PathBuf>,
     focus_terminal_on_next_render: bool,
     git_action_in_flight: Option<GitActionKind>,
@@ -879,6 +940,9 @@ struct ArborWindow {
     repository_context_menu: Option<RepositoryContextMenu>,
     worktree_context_menu: Option<WorktreeContextMenu>,
     outpost_context_menu: Option<OutpostContextMenu>,
+    discovered_daemons: Vec<mdns_browser::DiscoveredDaemon>,
+    mdns_browser: Option<mdns_browser::MdnsBrowser>,
+    active_discovered_daemon: Option<usize>,
     worktree_nav_back: Vec<usize>,
     worktree_nav_forward: Vec<usize>,
     log_buffer: log_layer::LogBuffer,
@@ -1059,6 +1123,11 @@ impl ArborWindow {
                     manage_repo_presets_modal: None,
                     show_about: false,
                     show_theme_picker: false,
+                    settings_modal: None,
+                    daemon_auth_modal: None,
+                    connect_to_host_modal: None,
+                    daemon_auth_tokens: HashMap::new(),
+                    connected_daemon_label: None,
                     pending_diff_scroll_to_file: None,
                     focus_terminal_on_next_render: true,
                     git_action_in_flight: None,
@@ -1084,6 +1153,9 @@ impl ArborWindow {
                     repository_context_menu: None,
                     worktree_context_menu: None,
                     outpost_context_menu: None,
+                    discovered_daemons: Vec::new(),
+                    mdns_browser: None,
+                    active_discovered_daemon: None,
                     worktree_nav_back: Vec::new(),
                     worktree_nav_forward: Vec::new(),
                     log_buffer: log_buffer.clone(),
@@ -1314,6 +1386,11 @@ impl ArborWindow {
             manage_repo_presets_modal: None,
             show_about: false,
             show_theme_picker: false,
+            settings_modal: None,
+            daemon_auth_modal: None,
+            connect_to_host_modal: None,
+            daemon_auth_tokens: HashMap::new(),
+            connected_daemon_label: None,
             pending_diff_scroll_to_file: None,
             focus_terminal_on_next_render: true,
             git_action_in_flight: None,
@@ -1326,6 +1403,9 @@ impl ArborWindow {
             repository_context_menu: None,
             worktree_context_menu: None,
             outpost_context_menu: None,
+            discovered_daemons: Vec::new(),
+            mdns_browser: None,
+            active_discovered_daemon: None,
             worktree_nav_back: Vec::new(),
             worktree_nav_forward: Vec::new(),
             last_persisted_ui_state: startup_ui_state,
@@ -1368,6 +1448,7 @@ impl ArborWindow {
         app.start_github_pr_auto_refresh(cx);
         app.start_config_auto_refresh(cx);
         app.start_agent_activity_ws(cx);
+        app.start_mdns_browser(cx);
         app.ensure_claude_code_hooks(cx);
         app
     }
@@ -1474,6 +1555,76 @@ impl ArborWindow {
                 let updated = this.update(cx, |this, cx| {
                     this.refresh_config_if_changed(cx);
                     this.refresh_repo_config_if_changed(cx);
+                });
+                if updated.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn start_mdns_browser(&mut self, cx: &mut Context<Self>) {
+        match mdns_browser::start_browsing() {
+            Ok(browser) => {
+                self.mdns_browser = Some(browser);
+                tracing::info!("mDNS: browsing for _arbor._tcp services on the LAN");
+            },
+            Err(e) => {
+                tracing::warn!("mDNS browsing unavailable: {e}");
+                return;
+            },
+        }
+
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_spawn(async move {
+                    std::thread::sleep(Duration::from_secs(2));
+                })
+                .await;
+
+                let updated = this.update(cx, |this, cx| {
+                    if let Some(browser) = &this.mdns_browser {
+                        let events = browser.poll_updates();
+                        let mut changed = false;
+                        for event in events {
+                            match event {
+                                mdns_browser::MdnsEvent::Added(daemon) => {
+                                    // Update existing or insert new
+                                    if let Some(existing) = this
+                                        .discovered_daemons
+                                        .iter_mut()
+                                        .find(|d| d.instance_name == daemon.instance_name)
+                                    {
+                                        if existing != &daemon {
+                                            *existing = daemon;
+                                            changed = true;
+                                        }
+                                    } else {
+                                        this.discovered_daemons.push(daemon);
+                                        changed = true;
+                                    }
+                                },
+                                mdns_browser::MdnsEvent::Removed(name) => {
+                                    let before = this.discovered_daemons.len();
+                                    this.discovered_daemons.retain(|d| d.instance_name != name);
+                                    if this.discovered_daemons.len() != before {
+                                        changed = true;
+                                        // Clear selection if removed
+                                        if let Some(idx) = this.active_discovered_daemon
+                                            && idx >= this.discovered_daemons.len()
+                                        {
+                                            this.active_discovered_daemon = None;
+                                        }
+                                    }
+                                },
+                            }
+                        }
+                        if changed {
+                            cx.set_menus(build_app_menus(&this.discovered_daemons));
+                            cx.notify();
+                        }
+                    }
                 });
                 if updated.is_err() {
                     break;
@@ -3866,6 +4017,102 @@ impl ArborWindow {
         cx.notify();
     }
 
+    fn connect_to_discovered_daemon(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(daemon) = self.discovered_daemons.get(index) else {
+            return;
+        };
+        let url = daemon.base_url();
+        let label = daemon.display_name().to_owned();
+        self.connect_to_daemon_url(&url, Some(label), cx);
+        self.active_discovered_daemon = Some(index);
+    }
+
+    fn connect_to_daemon_url(&mut self, url: &str, label: Option<String>, cx: &mut Context<Self>) {
+        tracing::info!(url = %url, "connecting to daemon");
+        self.daemon_base_url = url.to_owned();
+        let mut client = match HttpTerminalDaemon::new(url) {
+            Ok(c) => c,
+            Err(error) => {
+                self.notice = Some(format!("failed to connect to {url}: {error}"));
+                self.terminal_daemon = None;
+                self.connected_daemon_label = None;
+                cx.notify();
+                return;
+            },
+        };
+        // Apply saved auth token for this URL if we have one
+        if let Some(token) = self.daemon_auth_tokens.get(url) {
+            client.set_auth_token(Some(token.clone()));
+        }
+        // Try to connect and list sessions
+        match client.list_sessions() {
+            Ok(records) => {
+                self.terminal_daemon = Some(client);
+                self.connected_daemon_label = label;
+                self.restore_terminal_sessions_from_records(records, true);
+                self.refresh_worktrees(cx);
+            },
+            Err(error) => {
+                if error.is_unauthorized() || error.is_forbidden() {
+                    // Show auth modal
+                    self.daemon_auth_modal = Some(DaemonAuthModal {
+                        daemon_url: url.to_owned(),
+                        token: String::new(),
+                        error: None,
+                    });
+                    self.terminal_daemon = Some(client);
+                    self.connected_daemon_label = label;
+                } else {
+                    self.notice = Some(format!("failed to connect to {url}: {error}"));
+                    self.terminal_daemon = None;
+                    self.connected_daemon_label = None;
+                }
+            },
+        }
+        cx.notify();
+    }
+
+    fn submit_daemon_auth(&mut self, cx: &mut Context<Self>) {
+        let Some(modal) = self.daemon_auth_modal.take() else {
+            return;
+        };
+        let token = modal.token.trim().to_owned();
+        if token.is_empty() {
+            self.daemon_auth_modal = Some(DaemonAuthModal {
+                error: Some("Token cannot be empty".to_owned()),
+                ..modal
+            });
+            cx.notify();
+            return;
+        }
+        let url = modal.daemon_url.clone();
+        if let Some(client) = self.terminal_daemon.as_mut() {
+            client.set_auth_token(Some(token.clone()));
+        }
+        // Verify the token works
+        if let Some(client) = self.terminal_daemon.as_ref() {
+            match client.list_sessions() {
+                Ok(records) => {
+                    self.daemon_auth_tokens.insert(url, token);
+                    self.restore_terminal_sessions_from_records(records, true);
+                    self.refresh_worktrees(cx);
+                },
+                Err(error) => {
+                    if error.is_unauthorized() || error.is_forbidden() {
+                        self.daemon_auth_modal = Some(DaemonAuthModal {
+                            daemon_url: modal.daemon_url,
+                            token: modal.token,
+                            error: Some("Invalid token".to_owned()),
+                        });
+                    } else {
+                        self.notice = Some(format!("connection failed: {error}"));
+                    }
+                },
+            }
+        }
+        cx.notify();
+    }
+
     fn reload_changed_files(&mut self) -> bool {
         let previous_files = self.changed_files.clone();
         let previous_notice = self.notice.clone();
@@ -5464,6 +5711,57 @@ impl ArborWindow {
             return;
         }
 
+        if self.settings_modal.is_some() {
+            if event.keystroke.modifiers.platform {
+                return;
+            }
+
+            match event.keystroke.key.as_str() {
+                "escape" => {
+                    self.close_settings_modal(cx);
+                    cx.stop_propagation();
+                    return;
+                },
+                "tab" => {
+                    self.update_settings_modal_input(
+                        SettingsModalInputEvent::CycleField(event.keystroke.modifiers.shift),
+                        cx,
+                    );
+                    cx.stop_propagation();
+                    return;
+                },
+                "enter" | "return" => {
+                    self.submit_settings_modal(cx);
+                    cx.stop_propagation();
+                    return;
+                },
+                "backspace" => {
+                    self.update_settings_modal_input(SettingsModalInputEvent::Backspace, cx);
+                    cx.stop_propagation();
+                    return;
+                },
+                "space" | " " => {
+                    cx.stop_propagation();
+                    return;
+                },
+                _ => {},
+            }
+
+            if event.keystroke.modifiers.control || event.keystroke.modifiers.alt {
+                return;
+            }
+
+            if let Some(key_char) = event.keystroke.key_char.as_ref() {
+                self.update_settings_modal_input(SettingsModalInputEvent::ClearError, cx);
+                self.update_settings_modal_input(
+                    SettingsModalInputEvent::Append(key_char.to_owned()),
+                    cx,
+                );
+                cx.stop_propagation();
+            }
+            return;
+        }
+
         if self.github_auth_modal.is_some() {
             if event.keystroke.modifiers.platform {
                 return;
@@ -5997,6 +6295,175 @@ impl ArborWindow {
         cx: &mut Context<Self>,
     ) {
         self.show_theme_picker = true;
+        cx.notify();
+    }
+
+    fn action_open_settings(&mut self, _: &OpenSettings, _: &mut Window, cx: &mut Context<Self>) {
+        self.open_settings_modal(cx);
+    }
+
+    fn action_open_manage_hosts(
+        &mut self,
+        _: &OpenManageHosts,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_manage_hosts_modal(cx);
+    }
+
+    fn action_connect_to_lan_daemon(
+        &mut self,
+        action: &ConnectToLanDaemon,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.connect_to_discovered_daemon(action.index, cx);
+    }
+
+    fn action_connect_to_host(
+        &mut self,
+        _: &ConnectToHost,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.connect_to_host_modal = Some(ConnectToHostModal {
+            address: String::new(),
+            error: None,
+        });
+        cx.notify();
+    }
+
+    fn submit_connect_to_host(&mut self, cx: &mut Context<Self>) {
+        let Some(modal) = self.connect_to_host_modal.take() else {
+            return;
+        };
+        let addr = modal.address.trim().to_owned();
+        if addr.is_empty() {
+            self.connect_to_host_modal = Some(ConnectToHostModal {
+                error: Some("Address cannot be empty".to_owned()),
+                ..modal
+            });
+            cx.notify();
+            return;
+        }
+        // Normalize: add http:// if no scheme, add port if missing
+        let url = if addr.starts_with("http://") || addr.starts_with("https://") {
+            addr.clone()
+        } else if addr.contains(':') {
+            format!("http://{addr}")
+        } else {
+            format!("http://{addr}:8787")
+        };
+        let label = addr.clone();
+        self.connect_to_daemon_url(&url, Some(label), cx);
+    }
+
+    fn open_settings_modal(&mut self, cx: &mut Context<Self>) {
+        let loaded = app_config::load_or_create_config();
+        self.settings_modal = Some(SettingsModal {
+            active_field: SettingsField::DaemonUrl,
+            daemon_url: self.daemon_base_url.clone(),
+            preferred_editor: loaded.config.preferred_editor.unwrap_or_default(),
+            notifications: self.notifications_enabled,
+            error: None,
+        });
+        cx.notify();
+    }
+
+    fn close_settings_modal(&mut self, cx: &mut Context<Self>) {
+        self.settings_modal = None;
+        cx.notify();
+    }
+
+    fn update_settings_modal_input(
+        &mut self,
+        input: SettingsModalInputEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut modal) = self.settings_modal.clone() else {
+            return;
+        };
+
+        match input {
+            SettingsModalInputEvent::SetActiveField(field) => {
+                modal.active_field = field;
+            },
+            SettingsModalInputEvent::CycleField(reverse) => {
+                modal.active_field = modal.active_field.cycle(reverse);
+            },
+            SettingsModalInputEvent::Backspace => match modal.active_field {
+                SettingsField::DaemonUrl => {
+                    let _ = modal.daemon_url.pop();
+                },
+                SettingsField::PreferredEditor => {
+                    let _ = modal.preferred_editor.pop();
+                },
+            },
+            SettingsModalInputEvent::Append(text) => match modal.active_field {
+                SettingsField::DaemonUrl => {
+                    modal.daemon_url.push_str(&text);
+                },
+                SettingsField::PreferredEditor => {
+                    modal.preferred_editor.push_str(&text);
+                },
+            },
+            SettingsModalInputEvent::ToggleNotifications => {
+                modal.notifications = !modal.notifications;
+            },
+            SettingsModalInputEvent::ClearError => {
+                modal.error = None;
+            },
+        }
+
+        self.settings_modal = Some(modal);
+        cx.notify();
+    }
+
+    fn submit_settings_modal(&mut self, cx: &mut Context<Self>) {
+        let Some(modal) = self.settings_modal.clone() else {
+            return;
+        };
+
+        let daemon_url = modal.daemon_url.trim();
+        let preferred_editor = modal.preferred_editor.trim();
+        let notifications_str = if modal.notifications {
+            "true"
+        } else {
+            "false"
+        };
+        let theme_slug = self.theme_kind.slug();
+
+        if let Err(error) = app_config::save_scalar_settings(&[
+            (
+                "daemon_url",
+                if daemon_url.is_empty() {
+                    None
+                } else {
+                    Some(daemon_url)
+                },
+            ),
+            (
+                "preferred_editor",
+                if preferred_editor.is_empty() {
+                    None
+                } else {
+                    Some(preferred_editor)
+                },
+            ),
+            ("notifications", Some(notifications_str)),
+            ("theme", Some(theme_slug)),
+        ]) {
+            if let Some(modal_state) = self.settings_modal.as_mut() {
+                modal_state.error = Some(error);
+            }
+            cx.notify();
+            return;
+        }
+
+        self.config_last_modified = None;
+        self.refresh_config_if_changed(cx);
+        self.settings_modal = None;
+        self.notice = Some("Settings saved".to_owned());
         cx.notify();
     }
 
@@ -7653,6 +8120,32 @@ impl ArborWindow {
                     )
                     .child(
                         div()
+                            .id("open-settings")
+                            .cursor_pointer()
+                            .text_color(rgb(theme.text_muted))
+                            .h(px(22.))
+                            .px(px(6.))
+                            .flex()
+                            .items_center()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(rgb(theme.border))
+                            .hover(|s| {
+                                s.bg(rgb(theme.panel_bg))
+                                    .text_color(rgb(theme.text_primary))
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.open_settings_modal(cx);
+                            }))
+                            .child(
+                                div()
+                                    .font_family(FONT_MONO)
+                                    .text_size(px(26.))
+                                    .child("\u{f013}"),
+                            ),
+                    )
+                    .child(
+                        div()
                             .id("report-issue")
                             .cursor_pointer()
                             .text_color(rgb(theme.text_muted))
@@ -8875,6 +9368,143 @@ impl ArborWindow {
                         },
                     )),
             )
+            // ── LAN Daemons section ──────────────────────────────────────
+            .when(!self.discovered_daemons.is_empty(), |pane| {
+                let daemons = self.discovered_daemons.clone();
+                let active_idx = self.active_discovered_daemon;
+                pane.child(div().h(px(1.)).bg(rgb(theme.border)))
+                    .child(
+                        div()
+                            .px_2()
+                            .pt_2()
+                            .pb_1()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .font_family(FONT_MONO)
+                                            .text_size(px(12.))
+                                            .text_color(rgb(theme.text_muted))
+                                            .child("\u{f012}"), // signal/wifi icon
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(rgb(theme.text_muted))
+                                            .child("LAN Daemons"),
+                                    ),
+                            )
+                            .children(daemons.into_iter().enumerate().map(
+                                |(daemon_index, daemon)| {
+                                    let is_active = active_idx == Some(daemon_index);
+                                    let display_name =
+                                        daemon.display_name().to_owned();
+                                    let addr = daemon
+                                        .addresses
+                                        .first()
+                                        .cloned()
+                                        .unwrap_or_else(|| daemon.host.clone());
+                                    let subtitle = format!(
+                                        "{addr}:{} {}",
+                                        daemon.port,
+                                        if daemon.tls { "(TLS)" } else { "(HTTP)" }
+                                    );
+                                    div()
+                                        .id(("lan-daemon-row", daemon_index))
+                                        .cursor_pointer()
+                                        .flex()
+                                        .items_center()
+                                        .on_click(cx.listener(
+                                            move |this, _, _, cx| {
+                                                this.connect_to_discovered_daemon(
+                                                    daemon_index,
+                                                    cx,
+                                                );
+                                            },
+                                        ))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .rounded_sm()
+                                                .border_1()
+                                                .border_color(rgb(if is_active {
+                                                    theme.accent
+                                                } else {
+                                                    theme.border
+                                                }))
+                                                .bg(rgb(if is_active {
+                                                    theme.panel_active_bg
+                                                } else {
+                                                    theme.panel_bg
+                                                }))
+                                                .px_2()
+                                                .py_1()
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap(px(4.))
+                                                // Status dot
+                                                .child(
+                                                    div()
+                                                        .flex_none()
+                                                        .w(px(18.))
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .text_size(px(18.))
+                                                        .text_color(rgb(theme.accent))
+                                                        .child("\u{f233}"), // server icon
+                                                )
+                                                // Two-line text
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .min_w_0()
+                                                        .flex()
+                                                        .flex_col()
+                                                        .gap(px(1.))
+                                                        .child(
+                                                            div()
+                                                                .min_w_0()
+                                                                .overflow_hidden()
+                                                                .whitespace_nowrap()
+                                                                .text_ellipsis()
+                                                                .text_xs()
+                                                                .font_weight(
+                                                                    FontWeight::SEMIBOLD,
+                                                                )
+                                                                .text_color(rgb(
+                                                                    theme.text_primary,
+                                                                ))
+                                                                .child(display_name),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .min_w_0()
+                                                                .overflow_hidden()
+                                                                .whitespace_nowrap()
+                                                                .text_ellipsis()
+                                                                .text_xs()
+                                                                .text_color(rgb(
+                                                                    theme.text_disabled,
+                                                                ))
+                                                                .child(subtitle),
+                                                        ),
+                                                ),
+                                        )
+                                },
+                            )),
+                    )
+            })
+            // ── Bottom bar ───────────────────────────────────────────────
             .child(div().h(px(1.)).bg(rgb(theme.border)))
             .child(
                 div()
@@ -9892,7 +10522,6 @@ impl ArborWindow {
                             ChangeKind::Conflict => 0xf38ba8,
                             ChangeKind::IntentToAdd => 0x94e2d5,
                         };
-                        let show_line_stats = change.additions > 0 || change.deletions > 0;
                         let display_path = truncate_middle_path_for_width(
                             change.path.as_path(),
                             self.right_pane_width,
@@ -12110,6 +12739,566 @@ impl ArborWindow {
             )
     }
 
+    fn render_daemon_auth_modal(&mut self, cx: &mut Context<Self>) -> Div {
+        let Some(ref modal) = self.daemon_auth_modal else {
+            return div();
+        };
+        let theme = self.theme();
+        let token_value = modal.token.clone();
+        let error = modal.error.clone();
+        let daemon_url = modal.daemon_url.clone();
+
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.daemon_auth_modal = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .child(div().absolute().inset_0().bg(rgb(0x000000)).opacity(0.15))
+            .child(
+                div()
+                    .w(px(420.))
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(theme.border))
+                    .bg(rgb(theme.sidebar_bg))
+                    .p_4()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                        if let Some(ref mut modal) = this.daemon_auth_modal {
+                            match &event.keystroke.key {
+                                key if key == "enter" => {
+                                    this.submit_daemon_auth(cx);
+                                },
+                                key if key == "backspace" => {
+                                    modal.token.pop();
+                                    modal.error = None;
+                                    cx.notify();
+                                },
+                                key if key == "escape" => {
+                                    this.daemon_auth_modal = None;
+                                    cx.notify();
+                                },
+                                _ => {
+                                    if let Some(key_char) = event.keystroke.key_char.as_ref() {
+                                        modal.token.push_str(key_char);
+                                        modal.error = None;
+                                        cx.notify();
+                                    }
+                                },
+                            }
+                        }
+                    }))
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(theme.text_primary))
+                            .child("Authentication Required"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(theme.text_muted))
+                            .child(format!("Enter the auth token for {daemon_url}")),
+                    )
+                    .when_some(error, |this, err| {
+                        this.child(div().text_xs().text_color(rgb(0xf38ba8_u32)).child(err))
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(theme.text_muted))
+                                    .child("Auth Token"),
+                            )
+                            .child(
+                                div()
+                                    .id("daemon-auth-token-field")
+                                    .h(px(30.))
+                                    .px_2()
+                                    .flex()
+                                    .items_center()
+                                    .rounded_sm()
+                                    .border_1()
+                                    .border_color(rgb(theme.accent))
+                                    .bg(rgb(theme.panel_bg))
+                                    .text_sm()
+                                    .font_family(FONT_MONO)
+                                    .text_color(rgb(theme.text_primary))
+                                    .child(if token_value.is_empty() {
+                                        div()
+                                            .text_color(rgb(theme.text_disabled))
+                                            .child("paste token here")
+                                            .into_any_element()
+                                    } else {
+                                        div()
+                                            .flex()
+                                            .child("\u{2022}".repeat(token_value.len()))
+                                            .child(
+                                                div()
+                                                    .w(px(1.))
+                                                    .h(px(14.))
+                                                    .bg(rgb(theme.accent))
+                                                    .ml(px(1.)),
+                                            )
+                                            .into_any_element()
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                action_button(theme, "cancel-auth", "Cancel", false, false)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.daemon_auth_modal = None;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                action_button(theme, "submit-auth", "Connect", false, true)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.submit_daemon_auth(cx);
+                                    })),
+                            ),
+                    ),
+            )
+    }
+
+    fn render_connect_to_host_modal(&mut self, cx: &mut Context<Self>) -> Div {
+        let Some(ref modal) = self.connect_to_host_modal else {
+            return div();
+        };
+        let theme = self.theme();
+        let address = modal.address.clone();
+        let error = modal.error.clone();
+
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.connect_to_host_modal = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .child(div().absolute().inset_0().bg(rgb(0x000000)).opacity(0.15))
+            .child(
+                div()
+                    .w(px(420.))
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(theme.border))
+                    .bg(rgb(theme.sidebar_bg))
+                    .p_4()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                        if let Some(ref mut modal) = this.connect_to_host_modal {
+                            match &event.keystroke.key {
+                                key if key == "enter" => {
+                                    this.submit_connect_to_host(cx);
+                                },
+                                key if key == "backspace" => {
+                                    modal.address.pop();
+                                    modal.error = None;
+                                    cx.notify();
+                                },
+                                key if key == "escape" => {
+                                    this.connect_to_host_modal = None;
+                                    cx.notify();
+                                },
+                                _ => {
+                                    if let Some(key_char) = event.keystroke.key_char.as_ref() {
+                                        modal.address.push_str(key_char);
+                                        modal.error = None;
+                                        cx.notify();
+                                    }
+                                },
+                            }
+                        }
+                    }))
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(theme.text_primary))
+                            .child("Connect to Host"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(theme.text_muted))
+                            .child("Enter the address of a remote arbor-httpd instance"),
+                    )
+                    .when_some(error, |this, err| {
+                        this.child(div().text_xs().text_color(rgb(0xf38ba8_u32)).child(err))
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(theme.text_muted))
+                                    .child("Address"),
+                            )
+                            .child(
+                                div()
+                                    .id("connect-host-address-field")
+                                    .h(px(30.))
+                                    .px_2()
+                                    .flex()
+                                    .items_center()
+                                    .rounded_sm()
+                                    .border_1()
+                                    .border_color(rgb(theme.accent))
+                                    .bg(rgb(theme.panel_bg))
+                                    .text_sm()
+                                    .font_family(FONT_MONO)
+                                    .text_color(rgb(theme.text_primary))
+                                    .child(if address.is_empty() {
+                                        div()
+                                            .text_color(rgb(theme.text_disabled))
+                                            .child("192.168.1.42:8787")
+                                            .into_any_element()
+                                    } else {
+                                        div()
+                                            .flex()
+                                            .child(address)
+                                            .child(
+                                                div()
+                                                    .w(px(1.))
+                                                    .h(px(14.))
+                                                    .bg(rgb(theme.accent))
+                                                    .ml(px(1.)),
+                                            )
+                                            .into_any_element()
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                action_button(theme, "cancel-connect", "Cancel", false, false)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.connect_to_host_modal = None;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                action_button(theme, "submit-connect", "Connect", false, true)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.submit_connect_to_host(cx);
+                                    })),
+                            ),
+                    ),
+            )
+    }
+
+    fn render_settings_modal(&mut self, cx: &mut Context<Self>) -> Div {
+        let Some(modal) = self.settings_modal.clone() else {
+            return div();
+        };
+
+        let theme = self.theme();
+        let current_theme_label = self.theme_kind.label();
+
+        let settings_text_field =
+            |field: SettingsField, label: &str, value: &str, active: bool, theme: ThemePalette| {
+                let border_color = if active {
+                    theme.accent
+                } else {
+                    theme.border
+                };
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(theme.text_muted))
+                            .child(label.to_owned()),
+                    )
+                    .child(
+                        div()
+                            .id(ElementId::Name(format!("settings-field-{label}").into()))
+                            .cursor_pointer()
+                            .h(px(30.))
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(rgb(border_color))
+                            .bg(rgb(theme.panel_bg))
+                            .text_sm()
+                            .text_color(rgb(theme.text_primary))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.update_settings_modal_input(
+                                    SettingsModalInputEvent::SetActiveField(field),
+                                    cx,
+                                );
+                            }))
+                            .child(if value.is_empty() {
+                                div()
+                                    .text_color(rgb(theme.text_disabled))
+                                    .child("(not set)")
+                                    .into_any_element()
+                            } else if active {
+                                div()
+                                    .flex()
+                                    .child(value.to_owned())
+                                    .child(
+                                        div().w(px(1.)).h(px(14.)).bg(rgb(theme.accent)).ml(px(1.)),
+                                    )
+                                    .into_any_element()
+                            } else {
+                                div().child(value.to_owned()).into_any_element()
+                            }),
+                    )
+            };
+
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.close_settings_modal(cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, _, _, cx| {
+                    this.close_settings_modal(cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .child(div().absolute().inset_0().bg(rgb(0x000000)).opacity(0.15))
+            .child(
+                div()
+                    .w(px(500.))
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(theme.border))
+                    .bg(rgb(theme.sidebar_bg))
+                    .p_4()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    .on_mouse_down(MouseButton::Right, |_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    // Header
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(theme.text_primary))
+                                    .child("Settings"),
+                            )
+                            .child(
+                                action_button(theme, "close-settings", "Close", false, true)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.close_settings_modal(cx);
+                                    })),
+                            ),
+                    )
+                    // Theme row
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(theme.text_muted))
+                                    .child("Theme"),
+                            )
+                            .child(
+                                div()
+                                    .id("settings-theme-btn")
+                                    .cursor_pointer()
+                                    .h(px(30.))
+                                    .px_2()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .rounded_sm()
+                                    .border_1()
+                                    .border_color(rgb(theme.border))
+                                    .bg(rgb(theme.panel_bg))
+                                    .text_sm()
+                                    .text_color(rgb(theme.text_primary))
+                                    .hover(|s| s.bg(rgb(theme.panel_active_bg)))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.close_settings_modal(cx);
+                                        this.action_open_theme_picker(
+                                            &OpenThemePicker,
+                                            window,
+                                            cx,
+                                        );
+                                    }))
+                                    .child(current_theme_label)
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(theme.text_disabled))
+                                            .child("Click to change"),
+                                    ),
+                            ),
+                    )
+                    // Daemon URL
+                    .child(settings_text_field(
+                        SettingsField::DaemonUrl,
+                        "Daemon URL",
+                        &modal.daemon_url,
+                        modal.active_field == SettingsField::DaemonUrl,
+                        theme,
+                    ))
+                    // Preferred Editor
+                    .child(settings_text_field(
+                        SettingsField::PreferredEditor,
+                        "Preferred Editor",
+                        &modal.preferred_editor,
+                        modal.active_field == SettingsField::PreferredEditor,
+                        theme,
+                    ))
+                    // Notifications toggle
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(theme.text_muted))
+                                    .child("Notifications"),
+                            )
+                            .child(
+                                div()
+                                    .id("settings-notifications-toggle")
+                                    .cursor_pointer()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .border_1()
+                                    .border_color(rgb(theme.border))
+                                    .bg(rgb(if modal.notifications {
+                                        theme.accent
+                                    } else {
+                                        theme.panel_bg
+                                    }))
+                                    .text_xs()
+                                    .text_color(rgb(if modal.notifications {
+                                        theme.app_bg
+                                    } else {
+                                        theme.text_muted
+                                    }))
+                                    .hover(|s| s.opacity(0.85))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.update_settings_modal_input(
+                                            SettingsModalInputEvent::ToggleNotifications,
+                                            cx,
+                                        );
+                                    }))
+                                    .child(if modal.notifications {
+                                        "Enabled"
+                                    } else {
+                                        "Disabled"
+                                    }),
+                            ),
+                    )
+                    // Error
+                    .when_some(modal.error.clone(), |this, error| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(theme.notice_text))
+                                .bg(rgb(theme.notice_bg))
+                                .rounded_sm()
+                                .px_2()
+                                .py_1()
+                                .child(error),
+                        )
+                    })
+                    // Footer buttons
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                action_button(theme, "settings-cancel", "Cancel", false, true)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.close_settings_modal(cx);
+                                    })),
+                            )
+                            .child(
+                                action_button(theme, "settings-save", "Save", true, false)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.submit_settings_modal(cx);
+                                    })),
+                            ),
+                    ),
+            )
+    }
+
     fn render_manage_repo_presets_modal(&mut self, cx: &mut Context<Self>) -> Div {
         let Some(modal) = self.manage_repo_presets_modal.clone() else {
             return div();
@@ -12790,6 +13979,13 @@ impl EntityInputHandler for ArborWindow {
 
 impl Render for ArborWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Update window title to reflect connected daemon
+        let title = match &self.connected_daemon_label {
+            Some(label) => format!("Arbor \u{2014} {label}"),
+            None => "Arbor".to_owned(),
+        };
+        window.set_window_title(&title);
+
         self.window_is_active = window.is_window_active();
         if self.focus_terminal_on_next_render && self.active_terminal().is_some() {
             window.focus(&self.terminal_focus);
@@ -12826,6 +14022,10 @@ impl Render for ArborWindow {
             .on_action(cx.listener(Self::action_view_logs))
             .on_action(cx.listener(Self::action_show_about))
             .on_action(cx.listener(Self::action_open_theme_picker))
+            .on_action(cx.listener(Self::action_open_settings))
+            .on_action(cx.listener(Self::action_open_manage_hosts))
+            .on_action(cx.listener(Self::action_connect_to_lan_daemon))
+            .on_action(cx.listener(Self::action_connect_to_host))
             .on_action(cx.listener(Self::action_request_quit))
             .on_action(cx.listener(Self::action_immediate_quit))
             .child(self.render_top_bar(cx))
@@ -12874,6 +14074,9 @@ impl Render for ArborWindow {
             .child(self.render_manage_repo_presets_modal(cx))
             .child(self.render_about_modal(cx))
             .child(self.render_theme_picker_modal(cx))
+            .child(self.render_settings_modal(cx))
+            .child(self.render_daemon_auth_modal(cx))
+            .child(self.render_connect_to_host_modal(cx))
             .child(div().when_some(self.theme_toast.clone(), |this, toast| {
                 this.child(
                     div()
@@ -17072,16 +18275,36 @@ fn install_app_menu_and_keys(cx: &mut App) {
         KeyBinding::new("cmd-[", NavigateWorktreeBack, None),
         KeyBinding::new("cmd-]", NavigateWorktreeForward, None),
         KeyBinding::new("cmd-shift-l", ViewLogs, None),
+        KeyBinding::new("cmd-,", OpenSettings, None),
     ]);
-    cx.set_menus(build_app_menus());
+    cx.set_menus(build_app_menus(&[]));
 }
 
-fn build_app_menus() -> Vec<Menu> {
+fn build_app_menus(discovered_daemons: &[mdns_browser::DiscoveredDaemon]) -> Vec<Menu> {
+    let mut host_items = vec![
+        MenuItem::action("Connect to Host...", ConnectToHost),
+        MenuItem::action("Manage Hosts...", OpenManageHosts),
+    ];
+
+    if !discovered_daemons.is_empty() {
+        host_items.push(MenuItem::separator());
+        for (index, daemon) in discovered_daemons.iter().enumerate() {
+            let addr = daemon
+                .addresses
+                .first()
+                .cloned()
+                .unwrap_or_else(|| daemon.host.clone());
+            let label = format!("{} ({addr}:{})", daemon.display_name(), daemon.port);
+            host_items.push(MenuItem::action(label, ConnectToLanDaemon { index }));
+        }
+    }
+
     vec![
         Menu {
             name: "Arbor".into(),
             items: vec![
                 MenuItem::action("About Arbor", ShowAbout),
+                MenuItem::action("Settings...", OpenSettings),
                 MenuItem::separator(),
                 MenuItem::os_submenu("Services", SystemMenuType::Services),
                 MenuItem::separator(),
@@ -17112,6 +18335,10 @@ fn build_app_menus() -> Vec<Menu> {
                 MenuItem::separator(),
                 MenuItem::action("Use Embedded Backend", UseEmbeddedBackend),
             ],
+        },
+        Menu {
+            name: "Hosts".into(),
+            items: host_items,
         },
         Menu {
             name: "View".into(),

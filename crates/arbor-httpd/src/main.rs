@@ -67,7 +67,7 @@ const REPO_CACHE_TTL_SECS: u64 = 600;
 
 #[derive(Clone)]
 struct AppState {
-    repository_store_path: PathBuf,
+    repository_store: Arc<dyn repository_store::RepositoryStore>,
     daemon: Arc<Mutex<LocalTerminalDaemon>>,
     process_manager: Arc<Mutex<ProcessManager>>,
     agent_sessions: Arc<Mutex<HashMap<String, AgentSession>>>,
@@ -237,9 +237,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (agent_broadcast, _) = tokio::sync::broadcast::channel::<AgentWsEvent>(64);
 
     // Initialize process manager — scan repository roots for arbor.toml files
-    let repo_store_path = repository_store::default_repository_store_path();
+    let repository_store = repository_store::default_repository_store();
     let process_manager = {
-        let roots = repository_store::load_repository_roots(&repo_store_path).unwrap_or_default();
+        let roots = repository_store.load_roots().unwrap_or_default();
         let resolved = repository_store::resolve_repository_roots(roots);
         let repo_root = resolved
             .into_iter()
@@ -259,7 +259,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let state = AppState {
-        repository_store_path: repo_store_path,
+        repository_store: repository_store.clone(),
         daemon: Arc::new(Mutex::new(LocalTerminalDaemon::new(daemon_store))),
         process_manager: Arc::new(Mutex::new(process_manager)),
         agent_sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -372,7 +372,9 @@ async fn health() -> Json<HealthResponse> {
 }
 
 async fn list_repositories(State(state): State<AppState>) -> ApiResult<Vec<RepositoryDto>> {
-    let roots = repository_store::load_repository_roots(&state.repository_store_path)
+    let roots = state
+        .repository_store
+        .load_roots()
         .map_err(internal_error)?;
     let resolved = repository_store::resolve_repository_roots(roots);
 
@@ -397,7 +399,9 @@ async fn list_worktrees(
     State(state): State<AppState>,
     Query(query): Query<WorktreeQuery>,
 ) -> ApiResult<Vec<WorktreeDto>> {
-    let roots = repository_store::load_repository_roots(&state.repository_store_path)
+    let roots = state
+        .repository_store
+        .load_roots()
         .map_err(internal_error)?;
     let resolved = repository_store::resolve_repository_roots(roots);
     let filter = query.repo_root.as_deref().map(PathBuf::from);

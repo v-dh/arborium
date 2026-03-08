@@ -1,18 +1,24 @@
 use {
     arbor_core::worktree,
-    serde::Deserialize,
-    std::{
-        collections::HashSet,
-        env, fs,
-        path::{Path, PathBuf},
-    },
+    std::{collections::HashSet, env, fs, path::PathBuf, sync::Arc},
 };
 
 const REPOSITORY_STORE_RELATIVE_PATH: &str = ".arbor/repositories.json";
 
-#[derive(Debug, Deserialize)]
-#[serde(transparent)]
-struct RepositoryRoots(Vec<String>);
+pub trait RepositoryStore: Send + Sync {
+    fn load_roots(&self) -> Result<Vec<PathBuf>, String>;
+}
+
+#[derive(Debug, Clone)]
+pub struct JsonRepositoryStore {
+    path: PathBuf,
+}
+
+impl JsonRepositoryStore {
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
 
 pub fn default_repository_store_path() -> PathBuf {
     match env::var("HOME") {
@@ -21,34 +27,39 @@ pub fn default_repository_store_path() -> PathBuf {
     }
 }
 
-pub fn load_repository_roots(path: &Path) -> Result<Vec<PathBuf>, String> {
-    if !path.exists() {
-        return Ok(Vec::new());
+pub fn default_repository_store() -> Arc<dyn RepositoryStore> {
+    Arc::new(JsonRepositoryStore::new(default_repository_store_path()))
+}
+
+impl RepositoryStore for JsonRepositoryStore {
+    fn load_roots(&self) -> Result<Vec<PathBuf>, String> {
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+
+        let raw = fs::read_to_string(&self.path).map_err(|error| {
+            format!(
+                "failed to read repository store `{}`: {error}",
+                self.path.display()
+            )
+        })?;
+        if raw.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let parsed: Vec<String> = serde_json::from_str(&raw).map_err(|error| {
+            format!(
+                "failed to parse repository store `{}` as JSON array: {error}",
+                self.path.display()
+            )
+        })?;
+
+        Ok(parsed
+            .into_iter()
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from)
+            .collect())
     }
-
-    let raw = fs::read_to_string(path).map_err(|error| {
-        format!(
-            "failed to read repository store `{}`: {error}",
-            path.display()
-        )
-    })?;
-    if raw.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let parsed: RepositoryRoots = serde_json::from_str(&raw).map_err(|error| {
-        format!(
-            "failed to parse repository store `{}` as JSON array: {error}",
-            path.display()
-        )
-    })?;
-
-    Ok(parsed
-        .0
-        .into_iter()
-        .filter(|value| !value.trim().is_empty())
-        .map(PathBuf::from)
-        .collect())
 }
 
 pub fn resolve_repository_roots(roots: Vec<PathBuf>) -> Vec<PathBuf> {
@@ -76,7 +87,7 @@ fn canonicalize_if_possible(path: PathBuf) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use crate::repository_store::load_repository_roots;
+    use crate::repository_store::{JsonRepositoryStore, RepositoryStore};
 
     #[test]
     fn parses_repository_roots_as_json_array() -> Result<(), Box<dyn std::error::Error>> {
@@ -91,7 +102,8 @@ mod tests {
 "#,
         )?;
 
-        let roots = load_repository_roots(&path)?;
+        let store = JsonRepositoryStore::new(path);
+        let roots = store.load_roots()?;
         assert_eq!(roots.len(), 2);
         assert_eq!(roots[0].to_string_lossy(), "/tmp/repo-a");
         Ok(())

@@ -4,6 +4,22 @@ default:
 nightly_toolchain := "nightly-2025-11-30"
 web_ui_dir := "crates/arbor-web-ui/app"
 
+setup-macos:
+    xcodebuild -downloadComponent MetalToolchain
+    brew install --cask font-caskaydia-cove-nerd-font
+
+setup-linux:
+    sudo apt-get update
+    sudo apt-get install -y libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev
+    #!/usr/bin/env bash
+    set -euo pipefail
+    FONT_DIR="${HOME}/.local/share/fonts"
+    mkdir -p "${FONT_DIR}"
+    curl -fLo /tmp/CascadiaCode.tar.xz https://github.com/ryanoasis/nerd-fonts/releases/latest/download/CascadiaCode.tar.xz
+    tar -xf /tmp/CascadiaCode.tar.xz -C "${FONT_DIR}"
+    rm /tmp/CascadiaCode.tar.xz
+    fc-cache -fv
+
 format:
     cargo +{{nightly_toolchain}} fmt --all
 

@@ -82,10 +82,47 @@ Download the latest build from [Releases](https://github.com/penso/arbor/release
 | `arbor-httpd` | Remote HTTP daemon (`arbor-httpd` binary) |
 | `arbor-web-ui` | TypeScript dashboard assets + helper crate |
 
-## Development
+## Building from Source
+
+### Prerequisites
+
+- **Rust nightly** — the project uses `nightly-2025-11-30` (install via [rustup](https://rustup.rs/))
+- **[just](https://github.com/casey/just)** — task runner
+- **[CaskaydiaCove Nerd Font](https://www.nerdfonts.com/)** — icons in the UI use Nerd Font glyphs
+
+#### macOS
+
+```
+just setup-macos
+```
+
+Or manually:
+
+```
+xcode-select --install
+xcodebuild -downloadComponent MetalToolchain
+brew install --cask font-caskaydia-cove-nerd-font
+```
+
+#### Linux (Debian/Ubuntu)
+
+```
+just setup-linux
+```
+
+Or manually:
+
+```
+sudo apt-get install -y libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev
+```
+
+Then install the [CaskaydiaCove Nerd Font](https://www.nerdfonts.com/font-downloads) to `~/.local/share/fonts/`.
+
+### Build & Run
 
 Use `just` as the task runner.
 
+- `just setup-macos` / `just setup-linux` — install dependencies (one-time)
 - `just format`
 - `just format-check`
 - `just lint`

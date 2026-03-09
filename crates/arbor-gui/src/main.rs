@@ -6658,11 +6658,7 @@ impl ArborWindow {
                     if let Some(modal) = self.daemon_auth_modal.as_mut()
                         && let Some(action) = text_edit_action_for_event(event, cx)
                     {
-                        apply_text_edit_action(
-                            &mut modal.token,
-                            &mut modal.token_cursor,
-                            &action,
-                        );
+                        apply_text_edit_action(&mut modal.token, &mut modal.token_cursor, &action);
                         modal.error = None;
                         cx.notify();
                         cx.stop_propagation();

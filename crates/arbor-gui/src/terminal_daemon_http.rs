@@ -564,36 +564,87 @@ impl HttpEndpoint {
 
     fn connect(&self) -> Result<TcpStream, HttpTerminalDaemonError> {
         let address = self.host_header();
-        let mut addrs = address.to_socket_addrs().map_err(|error| {
-            HttpTerminalDaemonError::new(format!(
-                "failed to resolve daemon host `{}`: {error}",
-                self.host
-            ))
-        })?;
-        let Some(socket_addr) = addrs.next() else {
+        tracing::debug!(host = %self.host, port = self.port, %address, "resolving daemon address");
+
+        let addrs: Vec<_> = address
+            .to_socket_addrs()
+            .map_err(|error| {
+                tracing::warn!(host = %self.host, %error, "DNS resolution failed");
+                HttpTerminalDaemonError::new(format!(
+                    "failed to resolve daemon host `{}`: {error}",
+                    self.host
+                ))
+            })?
+            .collect();
+
+        if addrs.is_empty() {
+            tracing::warn!(host = %self.host, "DNS resolution returned no addresses");
             return Err(HttpTerminalDaemonError::new(format!(
                 "daemon host `{}` did not resolve to an address",
                 self.host
             )));
-        };
+        }
 
-        let stream =
-            TcpStream::connect_timeout(&socket_addr, CONNECT_TIMEOUT).map_err(|error| {
-                HttpTerminalDaemonError::new(format!(
-                    "failed to connect to daemon at {}:{}: {error}",
-                    self.host, self.port
-                ))
-            })?;
-        stream.set_read_timeout(Some(IO_TIMEOUT)).map_err(|error| {
-            HttpTerminalDaemonError::new(format!("failed to set read timeout: {error}"))
-        })?;
-        stream
-            .set_write_timeout(Some(IO_TIMEOUT))
-            .map_err(|error| {
-                HttpTerminalDaemonError::new(format!("failed to set write timeout: {error}"))
-            })?;
+        tracing::debug!(
+            host = %self.host,
+            addresses = %addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", "),
+            "resolved {} address(es)",
+            addrs.len()
+        );
 
-        Ok(stream)
+        // Try all resolved addresses (IPv4 and IPv6) — `.local` hostnames
+        // often resolve to IPv6 first, but the daemon may only listen on IPv4.
+        let mut last_error = None;
+        for (i, socket_addr) in addrs.iter().enumerate() {
+            tracing::debug!(
+                addr = %socket_addr,
+                attempt = i + 1,
+                total = addrs.len(),
+                "attempting TCP connection"
+            );
+            match TcpStream::connect_timeout(socket_addr, CONNECT_TIMEOUT) {
+                Ok(stream) => {
+                    tracing::info!(
+                        addr = %socket_addr,
+                        host = %self.host,
+                        "connected to daemon"
+                    );
+                    stream.set_read_timeout(Some(IO_TIMEOUT)).map_err(|error| {
+                        HttpTerminalDaemonError::new(format!("failed to set read timeout: {error}"))
+                    })?;
+                    stream
+                        .set_write_timeout(Some(IO_TIMEOUT))
+                        .map_err(|error| {
+                            HttpTerminalDaemonError::new(format!(
+                                "failed to set write timeout: {error}"
+                            ))
+                        })?;
+                    return Ok(stream);
+                },
+                Err(error) => {
+                    tracing::debug!(
+                        addr = %socket_addr,
+                        %error,
+                        "connection attempt failed, trying next address"
+                    );
+                    last_error = Some(error);
+                },
+            }
+        }
+
+        let err_msg = last_error
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "no addresses resolved".to_owned());
+        tracing::warn!(
+            host = %self.host,
+            port = self.port,
+            error = %err_msg,
+            "all connection attempts failed"
+        );
+        Err(HttpTerminalDaemonError::new(format!(
+            "failed to connect to daemon at {}:{}: {err_msg}",
+            self.host, self.port,
+        )))
     }
 
     fn request_path(&self, path: &str) -> String {

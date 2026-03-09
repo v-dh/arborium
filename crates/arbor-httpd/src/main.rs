@@ -333,19 +333,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     let local_addr = listener.local_addr()?;
-    println!("arbor-httpd listening on http://{local_addr}");
+    tracing::info!("arbor-httpd listening on http://{local_addr}");
 
     // Announce on the local network via mDNS — hold handle to keep registration alive
     let _mdns = match mdns::register_service(local_addr.port(), false, has_auth) {
         Ok(registration) => {
-            println!(
-                "  mDNS: announcing _arbor._tcp on port {}",
-                local_addr.port()
-            );
+            tracing::info!(port = local_addr.port(), "mDNS: announcing _arbor._tcp");
             Some(registration)
         },
         Err(e) => {
-            eprintln!("  mDNS: failed to register ({e}), LAN discovery disabled");
+            tracing::warn!(%e, "mDNS: failed to register, LAN discovery disabled");
             None
         },
     };
@@ -393,27 +390,24 @@ fn configured_bind_addr(
 fn parse_bind_host(raw: &str) -> Option<&'static str> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "localhost" | "local" | "loopback" | "127.0.0.1" => Some("127.0.0.1"),
-        "all" | "all-interfaces" | "public" | "0.0.0.0" => Some("0.0.0.0"),
+        "all" | "all-interfaces" | "public" | "0.0.0.0" | "[::]" => Some("[::]"),
         _ => None,
     }
 }
 
 fn default_bind_addr(auth_token: Option<&str>, port: u16) -> SocketAddr {
-    let host = if auth_token.is_some_and(|token| !token.trim().is_empty()) {
-        "0.0.0.0"
+    if auth_token.is_some_and(|token| !token.trim().is_empty()) {
+        // Bind on IPv6 wildcard — dual-stack, accepts both IPv4 and IPv6.
+        SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port))
     } else {
-        "127.0.0.1"
-    };
-
-    format!("{host}:{port}")
-        .parse()
-        .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], port)))
+        SocketAddr::from(([127, 0, 0, 1], port))
+    }
 }
 
 /// Whether the resolved bind configuration allows remote access.
 fn is_public_bind(auth_token: Option<&str>, configured_bind: Option<&str>) -> bool {
     match configured_bind.and_then(parse_bind_host) {
-        Some("0.0.0.0") => true,
+        Some("[::]") | Some("0.0.0.0") => true,
         Some(_) => false,
         None => auth_token.is_some_and(|t| !t.trim().is_empty()),
     }
@@ -1949,7 +1943,7 @@ mod tests {
     fn default_bind_addr_uses_public_interface_only_when_auth_is_enabled() {
         assert_eq!(
             default_bind_addr(Some("secret-token"), 8787),
-            SocketAddr::from(([0, 0, 0, 0], 8787))
+            SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 8787))
         );
         assert_eq!(
             default_bind_addr(None, 8787),
@@ -1969,7 +1963,7 @@ mod tests {
         );
         assert_eq!(
             configured_bind_addr(Some("all-interfaces"), None, 8787),
-            SocketAddr::from(([0, 0, 0, 0], 8787))
+            SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 8787))
         );
     }
 

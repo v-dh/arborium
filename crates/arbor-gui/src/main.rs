@@ -10502,15 +10502,10 @@ impl ArborWindow {
                                     let is_active = active_idx == Some(daemon_index);
                                     let display_name =
                                         daemon.display_name().to_owned();
-                                    let addr = daemon
-                                        .addresses
-                                        .first()
-                                        .cloned()
-                                        .unwrap_or_else(|| daemon.host.clone());
                                     let subtitle = format!(
-                                        "{addr}:{} {}",
+                                        "{}:{}",
+                                        daemon.display_name(),
                                         daemon.port,
-                                        if daemon.tls { "(TLS)" } else { "(HTTP)" }
                                     );
                                     div()
                                         .id(("lan-daemon-row", daemon_index))
@@ -10570,10 +10565,6 @@ impl ArborWindow {
                                                         .gap(px(1.))
                                                         .child(
                                                             div()
-                                                                .min_w_0()
-                                                                .overflow_hidden()
-                                                                .whitespace_nowrap()
-                                                                .text_ellipsis()
                                                                 .text_xs()
                                                                 .font_weight(
                                                                     FontWeight::SEMIBOLD,
@@ -10585,10 +10576,6 @@ impl ArborWindow {
                                                         )
                                                         .child(
                                                             div()
-                                                                .min_w_0()
-                                                                .overflow_hidden()
-                                                                .whitespace_nowrap()
-                                                                .text_ellipsis()
                                                                 .text_xs()
                                                                 .text_color(rgb(
                                                                     theme.text_disabled,

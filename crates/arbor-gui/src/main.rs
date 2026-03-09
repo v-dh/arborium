@@ -4815,7 +4815,9 @@ impl ArborWindow {
         };
         let title: SharedString = format!("Arbor — {label}").into();
         cx.spawn(async move |_this, cx| {
+            tracing::info!("spawn: about to open new window for LAN daemon");
             let result = cx.update(|cx| {
+                tracing::info!("inside cx.update: opening window");
                 let bounds = Bounds::centered(None, size(px(1460.), px(900.)), cx);
                 cx.open_window(
                     WindowOptions {
@@ -4843,9 +4845,9 @@ impl ArborWindow {
                 )
             });
             match result {
-                Ok(Ok(_)) => {},
+                Ok(Ok(_)) => tracing::info!("new LAN daemon window opened successfully"),
                 Ok(Err(error)) => tracing::error!(%error, "failed to open window for LAN daemon"),
-                Err(error) => tracing::error!(%error, "failed to update app for LAN daemon window"),
+                Err(error) => tracing::error!(%error, "cx.update failed for LAN daemon window"),
             }
         })
         .detach();

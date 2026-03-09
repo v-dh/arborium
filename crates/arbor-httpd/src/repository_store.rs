@@ -1,5 +1,6 @@
 use {
     arbor_core::worktree,
+    serde::Deserialize,
     std::{collections::HashSet, env, fs, path::PathBuf, sync::Arc},
 };
 
@@ -47,18 +48,37 @@ impl RepositoryStore for JsonRepositoryStore {
             return Ok(Vec::new());
         }
 
-        let parsed: Vec<String> = serde_json::from_str(&raw).map_err(|error| {
+        #[derive(Debug, Deserialize)]
+        struct StoredRepositoryEntry {
+            root: PathBuf,
+        }
+
+        #[derive(Debug, Deserialize)]
+        #[serde(untagged)]
+        enum RepositoryStorePayload {
+            Legacy(Vec<String>),
+            Entries(Vec<StoredRepositoryEntry>),
+        }
+
+        let parsed: RepositoryStorePayload = serde_json::from_str(&raw).map_err(|error| {
             format!(
-                "failed to parse repository store `{}` as JSON array: {error}",
+                "failed to parse repository store `{}` as JSON: {error}",
                 self.path.display()
             )
         })?;
 
-        Ok(parsed
-            .into_iter()
-            .filter(|value| !value.trim().is_empty())
-            .map(PathBuf::from)
-            .collect())
+        Ok(match parsed {
+            RepositoryStorePayload::Legacy(roots) => roots
+                .into_iter()
+                .filter(|value| !value.trim().is_empty())
+                .map(PathBuf::from)
+                .collect(),
+            RepositoryStorePayload::Entries(entries) => entries
+                .into_iter()
+                .map(|entry| entry.root)
+                .filter(|root| !root.as_os_str().is_empty())
+                .collect(),
+        })
     }
 }
 
@@ -87,7 +107,10 @@ fn canonicalize_if_possible(path: PathBuf) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use crate::repository_store::{JsonRepositoryStore, RepositoryStore};
+    use {
+        crate::repository_store::{JsonRepositoryStore, RepositoryStore},
+        std::path::PathBuf,
+    };
 
     #[test]
     fn parses_repository_roots_as_json_array() -> Result<(), Box<dyn std::error::Error>> {
@@ -106,6 +129,28 @@ mod tests {
         let roots = store.load_roots()?;
         assert_eq!(roots.len(), 2);
         assert_eq!(roots[0].to_string_lossy(), "/tmp/repo-a");
+        Ok(())
+    }
+
+    #[test]
+    fn parses_structured_repository_entries() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("repositories.json");
+        std::fs::write(
+            &path,
+            r#"[
+  {
+    "root": "/tmp/repo-a",
+    "group_key": "/tmp/repo-a",
+    "kind": "linked_worktree"
+  }
+]
+"#,
+        )?;
+
+        let store = JsonRepositoryStore::new(path);
+        let roots = store.load_roots()?;
+        assert_eq!(roots, vec![PathBuf::from("/tmp/repo-a")]);
         Ok(())
     }
 }

@@ -1,4 +1,5 @@
 use {
+    crate::checkout::CheckoutKind,
     serde::{Deserialize, Serialize},
     std::{
         env, fs,
@@ -15,6 +16,7 @@ pub struct UiState {
     pub right_pane_width: Option<i32>,
     pub window: Option<WindowGeometry>,
     pub left_pane_visible: Option<bool>,
+    pub preferred_checkout_kind: Option<CheckoutKind>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

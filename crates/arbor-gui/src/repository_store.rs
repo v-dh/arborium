@@ -1,14 +1,42 @@
 use {
+    crate::checkout::CheckoutKind,
     arbor_core::worktree,
-    std::{collections::HashSet, env, fs, path::PathBuf},
+    serde::{Deserialize, Serialize},
+    std::{
+        collections::{HashMap, HashSet},
+        env, fs,
+        path::{Path, PathBuf},
+    },
 };
 
 const REPOSITORY_STORE_RELATIVE_PATH: &str = ".arbor/repositories.json";
 
 pub trait RepositoryStore {
-    fn load_roots(&self) -> Result<Vec<PathBuf>, String>;
-    fn save_roots(&self, roots: &[PathBuf]) -> Result<(), String>;
+    fn load_entries(&self) -> Result<Vec<StoredRepositoryEntry>, String>;
+    fn save_entries(&self, entries: &[StoredRepositoryEntry]) -> Result<(), String>;
     fn has_store_file(&self) -> bool;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryCheckoutRoot {
+    pub path: PathBuf,
+    pub kind: CheckoutKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredRepositoryEntry {
+    pub root: PathBuf,
+    #[serde(default)]
+    pub group_key: Option<String>,
+    #[serde(default)]
+    pub kind: CheckoutKind,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RepositoryStorePayload {
+    Legacy(Vec<String>),
+    Entries(Vec<StoredRepositoryEntry>),
 }
 
 pub struct JsonRepositoryStore {
@@ -22,7 +50,7 @@ impl JsonRepositoryStore {
 }
 
 impl RepositoryStore for JsonRepositoryStore {
-    fn load_roots(&self) -> Result<Vec<PathBuf>, String> {
+    fn load_entries(&self) -> Result<Vec<StoredRepositoryEntry>, String> {
         if !self.path.exists() {
             return Ok(Vec::new());
         }
@@ -37,16 +65,31 @@ impl RepositoryStore for JsonRepositoryStore {
             return Ok(Vec::new());
         }
 
-        parse_json_string_array(&raw).map(|roots| roots.into_iter().map(PathBuf::from).collect())
+        let payload: RepositoryStorePayload = serde_json::from_str(&raw).map_err(|error| {
+            format!(
+                "failed to parse repository store `{}`: {error}",
+                self.path.display()
+            )
+        })?;
+
+        Ok(match payload {
+            RepositoryStorePayload::Legacy(roots) => roots
+                .into_iter()
+                .filter(|root| !root.trim().is_empty())
+                .map(|root| StoredRepositoryEntry {
+                    root: PathBuf::from(root),
+                    group_key: None,
+                    kind: CheckoutKind::LinkedWorktree,
+                })
+                .collect(),
+            RepositoryStorePayload::Entries(entries) => entries
+                .into_iter()
+                .filter(|entry| !entry.root.as_os_str().is_empty())
+                .collect(),
+        })
     }
 
-    fn save_roots(&self, roots: &[PathBuf]) -> Result<(), String> {
-        let serialized_roots: Vec<String> = roots
-            .iter()
-            .map(|root| root.display().to_string())
-            .collect();
-        let content = serialize_json_string_array(&serialized_roots);
-
+    fn save_entries(&self, entries: &[StoredRepositoryEntry]) -> Result<(), String> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).map_err(|error| {
                 format!(
@@ -56,7 +99,14 @@ impl RepositoryStore for JsonRepositoryStore {
             })?;
         }
 
-        fs::write(&self.path, content).map_err(|error| {
+        let content = serde_json::to_string_pretty(entries).map_err(|error| {
+            format!(
+                "failed to serialize repository store `{}`: {error}",
+                self.path.display()
+            )
+        })?;
+
+        fs::write(&self.path, format!("{content}\n")).map_err(|error| {
             format!(
                 "failed to write repository store `{}`: {error}",
                 self.path.display()
@@ -80,192 +130,235 @@ fn default_repository_store_path() -> PathBuf {
     }
 }
 
-pub fn resolve_repositories_from_roots(roots: Vec<PathBuf>) -> Vec<crate::RepositorySummary> {
-    let mut repositories = Vec::new();
-    let mut seen_roots = HashSet::new();
+pub fn resolve_repositories_from_entries(
+    entries: Vec<StoredRepositoryEntry>,
+) -> Vec<crate::RepositorySummary> {
+    #[derive(Debug)]
+    struct RepositoryGroupBuilder {
+        representative_root: PathBuf,
+        representative_kind: CheckoutKind,
+        checkout_roots: Vec<RepositoryCheckoutRoot>,
+        seen_roots: HashSet<PathBuf>,
+    }
 
-    for root in roots {
-        if root.as_os_str().is_empty() {
+    let mut repositories: Vec<RepositoryGroupBuilder> = Vec::new();
+    let mut group_order = Vec::new();
+    let mut repository_index_by_group_key = HashMap::<String, usize>::new();
+
+    for entry in entries {
+        let Some(normalized_root) = normalize_checkout_root(entry.root, entry.kind) else {
+            continue;
+        };
+        let group_key = normalize_group_key(entry.group_key, &normalized_root);
+        let next_root = RepositoryCheckoutRoot {
+            path: normalized_root.clone(),
+            kind: entry.kind,
+        };
+
+        if let Some(index) = repository_index_by_group_key.get(&group_key).copied() {
+            let group = &mut repositories[index];
+            if group.seen_roots.insert(normalized_root.clone()) {
+                if should_prefer_checkout_root(
+                    group.representative_kind,
+                    group.representative_root.as_path(),
+                    next_root.kind,
+                    normalized_root.as_path(),
+                ) {
+                    group.representative_root = normalized_root;
+                    group.representative_kind = next_root.kind;
+                }
+                group.checkout_roots.push(next_root);
+            }
             continue;
         }
 
-        let resolved_root = canonicalize_if_possible(root);
-        let resolved_root = match worktree::repo_root(&resolved_root) {
-            Ok(path) => canonicalize_if_possible(path),
-            Err(_) => continue,
-        };
-
-        if seen_roots.insert(resolved_root.clone()) {
-            repositories.push(crate::RepositorySummary::from_root(resolved_root));
-        }
+        repository_index_by_group_key.insert(group_key.clone(), repositories.len());
+        group_order.push(group_key);
+        repositories.push(RepositoryGroupBuilder {
+            representative_root: normalized_root.clone(),
+            representative_kind: next_root.kind,
+            checkout_roots: vec![next_root],
+            seen_roots: HashSet::from([normalized_root]),
+        });
     }
 
-    repositories
+    group_order
+        .into_iter()
+        .map(|group_key| {
+            let index = repository_index_by_group_key[&group_key];
+            let group = &repositories[index];
+            crate::RepositorySummary::from_checkout_roots(
+                group.representative_root.clone(),
+                group_key,
+                group.checkout_roots.clone(),
+            )
+        })
+        .collect()
 }
 
-pub fn repository_roots_from_summaries(repositories: &[crate::RepositorySummary]) -> Vec<PathBuf> {
+pub fn repository_entries_from_summaries(
+    repositories: &[crate::RepositorySummary],
+) -> Vec<StoredRepositoryEntry> {
     repositories
         .iter()
-        .map(|repository| repository.root.clone())
+        .flat_map(|repository| {
+            repository
+                .checkout_roots
+                .iter()
+                .map(|checkout_root| StoredRepositoryEntry {
+                    root: checkout_root.path.clone(),
+                    group_key: Some(repository.group_key.clone()),
+                    kind: checkout_root.kind,
+                })
+        })
         .collect()
+}
+
+pub fn default_group_key_for_root(root: &Path) -> String {
+    canonicalize_if_possible(root.to_path_buf())
+        .display()
+        .to_string()
+}
+
+fn normalize_checkout_root(root: PathBuf, kind: CheckoutKind) -> Option<PathBuf> {
+    if root.as_os_str().is_empty() {
+        return None;
+    }
+
+    let normalized = canonicalize_if_possible(root);
+    match kind {
+        CheckoutKind::LinkedWorktree => worktree::repo_root(&normalized)
+            .ok()
+            .map(canonicalize_if_possible),
+        CheckoutKind::DiscreteClone => Some(normalized),
+    }
+}
+
+fn normalize_group_key(group_key: Option<String>, checkout_root: &Path) -> String {
+    group_key
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default_group_key_for_root(checkout_root))
+}
+
+fn should_prefer_checkout_root(
+    current_kind: CheckoutKind,
+    current_root: &Path,
+    candidate_kind: CheckoutKind,
+    candidate_root: &Path,
+) -> bool {
+    match (current_kind, candidate_kind) {
+        (CheckoutKind::DiscreteClone, CheckoutKind::LinkedWorktree) => true,
+        (CheckoutKind::LinkedWorktree, CheckoutKind::DiscreteClone) => false,
+        _ => current_root > candidate_root,
+    }
 }
 
 fn canonicalize_if_possible(path: PathBuf) -> PathBuf {
     worktree::canonicalize_if_possible(path)
 }
 
-fn serialize_json_string_array(values: &[String]) -> String {
-    let mut output = String::from("[");
-    if values.is_empty() {
-        output.push_str("]\n");
-        return output;
-    }
-
-    output.push('\n');
-    for (index, value) in values.iter().enumerate() {
-        output.push_str("  \"");
-        output.push_str(&escape_json_string(value));
-        output.push('"');
-        if index + 1 != values.len() {
-            output.push(',');
-        }
-        output.push('\n');
-    }
-    output.push_str("]\n");
-    output
-}
-
-fn escape_json_string(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for ch in value.chars() {
-        match ch {
-            '"' => escaped.push_str("\\\""),
-            '\\' => escaped.push_str("\\\\"),
-            '\n' => escaped.push_str("\\n"),
-            '\r' => escaped.push_str("\\r"),
-            '\t' => escaped.push_str("\\t"),
-            '\u{08}' => escaped.push_str("\\b"),
-            '\u{0c}' => escaped.push_str("\\f"),
-            ch if ch.is_control() => {
-                escaped.push_str(&format!("\\u{:04x}", ch as u32));
-            },
-            _ => escaped.push(ch),
-        }
-    }
-    escaped
-}
-
-fn parse_json_string_array(input: &str) -> Result<Vec<String>, String> {
-    let mut index = 0;
-    skip_json_whitespace(input, &mut index);
-    if !consume_json_char(input, &mut index, '[') {
-        return Err("repository store JSON must start with `[`".to_owned());
-    }
-
-    let mut values = Vec::new();
-    loop {
-        skip_json_whitespace(input, &mut index);
-        if consume_json_char(input, &mut index, ']') {
-            break;
-        }
-
-        values.push(parse_json_string(input, &mut index)?);
-        skip_json_whitespace(input, &mut index);
-
-        if consume_json_char(input, &mut index, ',') {
-            continue;
-        }
-        if consume_json_char(input, &mut index, ']') {
-            break;
-        }
-        return Err("expected `,` or `]` in repository store JSON array".to_owned());
-    }
-
-    skip_json_whitespace(input, &mut index);
-    if index != input.len() {
-        return Err("unexpected trailing characters in repository store JSON".to_owned());
-    }
-
-    Ok(values)
-}
-
-fn skip_json_whitespace(input: &str, index: &mut usize) {
-    while let Some(ch) = peek_json_char(input, *index) {
-        if !ch.is_whitespace() {
-            break;
-        }
-        *index += ch.len_utf8();
-    }
-}
-
-fn consume_json_char(input: &str, index: &mut usize, expected: char) -> bool {
-    let Some(ch) = peek_json_char(input, *index) else {
-        return false;
+#[cfg(test)]
+mod tests {
+    use {
+        super::{
+            JsonRepositoryStore, RepositoryStore, StoredRepositoryEntry,
+            default_group_key_for_root, resolve_repositories_from_entries,
+        },
+        crate::checkout::CheckoutKind,
+        std::{
+            path::PathBuf,
+            time::{SystemTime, UNIX_EPOCH},
+        },
     };
-    if ch != expected {
-        return false;
-    }
-    *index += ch.len_utf8();
-    true
-}
 
-fn peek_json_char(input: &str, index: usize) -> Option<char> {
-    input.get(index..)?.chars().next()
-}
-
-fn next_json_char(input: &str, index: &mut usize) -> Option<char> {
-    let ch = peek_json_char(input, *index)?;
-    *index += ch.len_utf8();
-    Some(ch)
-}
-
-fn parse_json_string(input: &str, index: &mut usize) -> Result<String, String> {
-    if !consume_json_char(input, index, '"') {
-        return Err("expected string value in repository store JSON".to_owned());
+    fn temp_store_path(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let dir = std::env::temp_dir().join(format!(
+            "arbor-repository-store-tests-{}-{unique}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join(name)
     }
 
-    let mut value = String::new();
-    loop {
-        let ch = next_json_char(input, index)
-            .ok_or_else(|| "unterminated string in repository store JSON".to_owned())?;
-        match ch {
-            '"' => return Ok(value),
-            '\\' => {
-                let escape = next_json_char(input, index)
-                    .ok_or_else(|| "unterminated escape in repository store JSON".to_owned())?;
-                match escape {
-                    '"' => value.push('"'),
-                    '\\' => value.push('\\'),
-                    '/' => value.push('/'),
-                    'b' => value.push('\u{08}'),
-                    'f' => value.push('\u{0c}'),
-                    'n' => value.push('\n'),
-                    'r' => value.push('\r'),
-                    't' => value.push('\t'),
-                    'u' => value.push(parse_json_unicode_escape(input, index)?),
-                    _ => {
-                        return Err("invalid escape in repository store JSON".to_owned());
-                    },
-                }
+    #[test]
+    fn parses_legacy_repository_root_arrays() -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_store_path("legacy-repositories.json");
+        std::fs::write(
+            &path,
+            r#"[
+  "/tmp/repo-a",
+  "/tmp/repo-b"
+]
+"#,
+        )?;
+
+        let store = JsonRepositoryStore::new(path);
+        let entries = store.load_entries()?;
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].root, PathBuf::from("/tmp/repo-a"));
+        assert_eq!(entries[0].kind, CheckoutKind::LinkedWorktree);
+        Ok(())
+    }
+
+    #[test]
+    fn parses_structured_repository_entries() -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_store_path("structured-repositories.json");
+        std::fs::write(
+            &path,
+            r#"[
+  {
+    "root": "/tmp/repo-a",
+    "group_key": "/tmp/repo-a",
+    "kind": "linked_worktree"
+  },
+  {
+    "root": "/tmp/repo-a-clone",
+    "group_key": "/tmp/repo-a",
+    "kind": "discrete_clone"
+  }
+]
+"#,
+        )?;
+
+        let store = JsonRepositoryStore::new(path);
+        let entries = store.load_entries()?;
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].kind, CheckoutKind::DiscreteClone);
+        assert_eq!(entries[1].group_key.as_deref(), Some("/tmp/repo-a"));
+        Ok(())
+    }
+
+    #[test]
+    fn groups_discrete_clones_under_shared_group_key() -> Result<(), Box<dyn std::error::Error>> {
+        let repo_root = temp_store_path("repo-root");
+        std::fs::create_dir_all(&repo_root)?;
+        let _ = git2::Repository::init(&repo_root)?;
+        let clone_root = temp_store_path("repo-clone");
+        std::fs::create_dir_all(&clone_root)?;
+        let _ = git2::Repository::init(&clone_root)?;
+
+        let repositories = resolve_repositories_from_entries(vec![
+            StoredRepositoryEntry {
+                root: repo_root.clone(),
+                group_key: None,
+                kind: CheckoutKind::LinkedWorktree,
             },
-            _ if ch.is_control() => {
-                return Err("control character in repository store JSON string".to_owned());
+            StoredRepositoryEntry {
+                root: clone_root,
+                group_key: Some(default_group_key_for_root(&repo_root)),
+                kind: CheckoutKind::DiscreteClone,
             },
-            _ => value.push(ch),
-        }
-    }
-}
+        ]);
+        let expected_root = arbor_core::worktree::canonicalize_if_possible(repo_root);
 
-fn parse_json_unicode_escape(input: &str, index: &mut usize) -> Result<char, String> {
-    let mut codepoint = 0u32;
-    for _ in 0..4 {
-        let ch = next_json_char(input, index)
-            .ok_or_else(|| "unterminated unicode escape in repository store JSON".to_owned())?;
-        let digit = ch
-            .to_digit(16)
-            .ok_or_else(|| "invalid unicode escape in repository store JSON".to_owned())?;
-        codepoint = (codepoint << 4) | digit;
+        assert_eq!(repositories.len(), 1);
+        assert_eq!(repositories[0].checkout_roots.len(), 2);
+        assert_eq!(repositories[0].root, expected_root);
+        Ok(())
     }
-    char::from_u32(codepoint)
-        .ok_or_else(|| "invalid unicode codepoint in repository store JSON".to_owned())
 }

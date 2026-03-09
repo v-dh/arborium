@@ -1,4 +1,5 @@
 mod app_config;
+mod checkout;
 mod connection_history;
 mod github_auth_store;
 mod github_service;
@@ -24,6 +25,7 @@ use {
         },
         worktree,
     },
+    checkout::CheckoutKind,
     gix_diff::blob::v2::{
         Algorithm as DiffAlgorithm, Diff as BlobDiff, InternedInput as BlobInternedInput,
     },
@@ -130,6 +132,7 @@ const WORKTREE_HOVER_POPOVER_ZONE_PADDING_PX: f32 = 12.;
 const WORKTREE_HOVER_TRIGGER_ZONE_HEIGHT_PX: f32 = 44.;
 const PRESET_ICON_CLAUDE_PNG: &[u8] = include_bytes!("../../../assets/preset-icons/claude.png");
 const PRESET_ICON_CODEX_SVG: &[u8] = include_bytes!("../../../assets/preset-icons/codex-white.svg");
+const PRESET_ICON_PI_SVG: &[u8] = include_bytes!("../../../assets/preset-icons/pi-white.svg");
 const PRESET_ICON_OPENCODE_SVG: &[u8] =
     include_bytes!("../../../assets/preset-icons/opencode-white.svg");
 const PRESET_ICON_COPILOT_SVG: &[u8] =
@@ -198,6 +201,8 @@ pub struct ConnectToLanDaemon {
 
 #[derive(Debug, Clone)]
 struct WorktreeSummary {
+    group_key: String,
+    checkout_kind: CheckoutKind,
     repo_root: PathBuf,
     path: PathBuf,
     label: String,
@@ -214,7 +219,9 @@ struct WorktreeSummary {
 
 #[derive(Debug, Clone)]
 struct RepositorySummary {
+    group_key: String,
     root: PathBuf,
+    checkout_roots: Vec<repository_store::RepositoryCheckoutRoot>,
     label: String,
     avatar_url: Option<String>,
     github_repo_slug: Option<String>,
@@ -875,17 +882,19 @@ enum RightPaneTab {
 enum AgentPresetKind {
     Codex,
     Claude,
+    Pi,
     OpenCode,
     Copilot,
 }
 
 impl AgentPresetKind {
-    const ORDER: [Self; 4] = [Self::Codex, Self::Claude, Self::OpenCode, Self::Copilot];
+    const ORDER: [Self; 5] = [Self::Codex, Self::Claude, Self::Pi, Self::OpenCode, Self::Copilot];
 
     fn key(self) -> &'static str {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Pi => "pi",
             Self::OpenCode => "opencode",
             Self::Copilot => "copilot",
         }
@@ -895,6 +904,7 @@ impl AgentPresetKind {
         match self {
             Self::Codex => "Codex",
             Self::Claude => "Claude",
+            Self::Pi => "Pi",
             Self::OpenCode => "OpenCode",
             Self::Copilot => "Copilot",
         }
@@ -904,6 +914,7 @@ impl AgentPresetKind {
         match self {
             Self::Codex => "\u{f121}",
             Self::Claude => "C",
+            Self::Pi => "P",
             Self::OpenCode => "\u{f085}",
             Self::Copilot => "\u{f09b}",
         }
@@ -917,6 +928,7 @@ impl AgentPresetKind {
         match key.trim().to_ascii_lowercase().as_str() {
             "codex" => Some(Self::Codex),
             "claude" => Some(Self::Claude),
+            "pi" => Some(Self::Pi),
             "opencode" => Some(Self::OpenCode),
             "copilot" => Some(Self::Copilot),
             _ => None,
@@ -1212,6 +1224,7 @@ struct CreateModal {
     // Worktree fields
     repository_path: String,
     worktree_name: String,
+    checkout_kind: CheckoutKind,
     worktree_active_field: CreateWorktreeField,
     // Outpost fields
     host_index: usize,
@@ -1421,6 +1434,8 @@ struct CreatedWorktree {
     worktree_name: String,
     branch_name: String,
     worktree_path: PathBuf,
+    checkout_kind: CheckoutKind,
+    source_repo_root: PathBuf,
 }
 
 struct ArborWindow {
@@ -1472,6 +1487,7 @@ struct ArborWindow {
     terminal_selection: Option<TerminalSelection>,
     terminal_selection_drag_anchor: Option<TerminalGridPosition>,
     create_modal: Option<CreateModal>,
+    preferred_checkout_kind: CheckoutKind,
     github_auth_modal: Option<GitHubAuthModal>,
     delete_modal: Option<DeleteModal>,
     outposts: Vec<OutpostSummary>,
@@ -1586,8 +1602,8 @@ impl ArborWindow {
                     },
                 };
 
-                let repositories = match repository_store.load_roots() {
-                    Ok(roots) => repository_store::resolve_repositories_from_roots(roots),
+                let repositories = match repository_store.load_entries() {
+                    Ok(entries) => repository_store::resolve_repositories_from_entries(entries),
                     Err(err) => {
                         notice_parts.push(format!("failed to load saved repositories: {err}"));
                         Vec::new()
@@ -1697,6 +1713,9 @@ impl ArborWindow {
                     terminal_selection: None,
                     terminal_selection_drag_anchor: None,
                     create_modal: None,
+                    preferred_checkout_kind: startup_ui_state
+                        .preferred_checkout_kind
+                        .unwrap_or_default(),
                     github_auth_modal: None,
                     delete_modal: None,
                     outposts,
@@ -1852,11 +1871,11 @@ impl ArborWindow {
             };
 
         let repository_store_file_exists = repository_store.has_store_file();
-        let mut loaded_roots_were_empty = false;
-        let mut repositories = match repository_store.load_roots() {
-            Ok(roots) => {
-                loaded_roots_were_empty = roots.is_empty();
-                repository_store::resolve_repositories_from_roots(roots)
+        let mut loaded_entries_were_empty = false;
+        let mut repositories = match repository_store.load_entries() {
+            Ok(entries) => {
+                loaded_entries_were_empty = entries.is_empty();
+                repository_store::resolve_repositories_from_entries(entries)
             },
             Err(error) => {
                 notice_parts.push(format!("failed to load saved repositories: {error}"));
@@ -1868,17 +1887,27 @@ impl ArborWindow {
         if let Some(ref root) = repo_root
             && !repositories
                 .iter()
-                .any(|repository| &repository.root == root)
-            && should_seed_repo_root_from_cwd(repository_store_file_exists, loaded_roots_were_empty)
+                .any(|repository| repository.contains_checkout_root(root))
+            && should_seed_repo_root_from_cwd(
+                repository_store_file_exists,
+                loaded_entries_were_empty,
+            )
         {
-            repositories.push(RepositorySummary::from_root(root.clone()));
+            repositories.push(RepositorySummary::from_checkout_roots(
+                root.clone(),
+                repository_store::default_group_key_for_root(root),
+                vec![repository_store::RepositoryCheckoutRoot {
+                    path: root.clone(),
+                    kind: CheckoutKind::LinkedWorktree,
+                }],
+            ));
             persist_repositories = true;
         }
 
         let active_repository_index = if let Some(ref root) = repo_root {
             repositories
                 .iter()
-                .position(|repository| &repository.root == root)
+                .position(|repository| repository.contains_checkout_root(root))
                 .or(Some(0))
         } else if !repositories.is_empty() {
             Some(0)
@@ -1890,8 +1919,9 @@ impl ArborWindow {
             .cloned();
 
         if persist_repositories {
-            let roots_to_save = repository_store::repository_roots_from_summaries(&repositories);
-            if let Err(error) = repository_store.save_roots(&roots_to_save) {
+            let entries_to_save =
+                repository_store::repository_entries_from_summaries(&repositories);
+            if let Err(error) = repository_store.save_entries(&entries_to_save) {
                 notice_parts.push(format!("failed to save repositories: {error}"));
             }
         }
@@ -1991,6 +2021,7 @@ impl ArborWindow {
             terminal_selection: None,
             terminal_selection_drag_anchor: None,
             create_modal: None,
+            preferred_checkout_kind: startup_ui_state.preferred_checkout_kind.unwrap_or_default(),
             github_auth_modal: None,
             delete_modal: None,
             outposts,
@@ -2077,6 +2108,7 @@ impl ArborWindow {
         app.start_agent_activity_ws(cx);
         app.start_mdns_browser(cx);
         app.ensure_claude_code_hooks(cx);
+        app.ensure_pi_agent_extension(cx);
         app
     }
 
@@ -2754,19 +2786,38 @@ impl ArborWindow {
 
         let mut refresh_errors = Vec::new();
         let mut next_worktrees = Vec::new();
+        let mut seen_worktree_paths = HashSet::new();
 
         for repository in &self.repositories {
-            match worktree::list(&repository.root) {
-                Ok(entries) => {
-                    next_worktrees.extend(
-                        entries
-                            .iter()
-                            .map(|entry| WorktreeSummary::from_worktree(entry, &repository.root)),
-                    );
-                },
-                Err(error) => {
-                    refresh_errors.push(format!("{}: {error}", repository.label));
-                },
+            for checkout_root in &repository.checkout_roots {
+                match worktree::list(&checkout_root.path) {
+                    Ok(entries) => {
+                        for entry in entries {
+                            if !seen_worktree_paths.insert(entry.path.clone()) {
+                                continue;
+                            }
+                            next_worktrees.push(WorktreeSummary::from_worktree(
+                                &entry,
+                                &checkout_root.path,
+                                &repository.group_key,
+                                if checkout_root.kind == CheckoutKind::DiscreteClone
+                                    && entry.path == checkout_root.path
+                                {
+                                    CheckoutKind::DiscreteClone
+                                } else {
+                                    CheckoutKind::LinkedWorktree
+                                },
+                            ));
+                        }
+                    },
+                    Err(error) => {
+                        refresh_errors.push(format!(
+                            "{} ({}): {error}",
+                            repository.label,
+                            checkout_root.path.display()
+                        ));
+                    },
+                }
             }
         }
 
@@ -2806,7 +2857,7 @@ impl ArborWindow {
                         .and_then(|repository| {
                             self.worktrees
                                 .iter()
-                                .position(|worktree| worktree.repo_root == repository.root)
+                                .position(|worktree| worktree.group_key == repository.group_key)
                         })
                 })
             })
@@ -3055,19 +3106,32 @@ impl ArborWindow {
         .detach();
     }
 
+    fn ensure_pi_agent_extension(&self, cx: &mut Context<Self>) {
+        let daemon_base_url = self.daemon_base_url.clone();
+        cx.spawn(async move |_this, cx| {
+            cx.background_spawn(async move {
+                if let Err(error) = install_pi_agent_extension(&daemon_base_url) {
+                    tracing::warn!(%error, "failed to install Pi activity extension");
+                }
+            })
+            .await;
+        })
+        .detach();
+    }
+
     fn refresh_worktree_pull_requests(&mut self, cx: &mut Context<Self>) {
         if self.worktree_prs_loading {
             return;
         }
 
-        let repository_slug_by_root: HashMap<PathBuf, String> = self
+        let repository_slug_by_group_key: HashMap<String, String> = self
             .repositories
             .iter()
             .filter_map(|repository| {
                 repository
                     .github_repo_slug
                     .as_ref()
-                    .map(|slug| (repository.root.clone(), slug.clone()))
+                    .map(|slug| (repository.group_key.clone(), slug.clone()))
             })
             .collect();
 
@@ -3079,7 +3143,9 @@ impl ArborWindow {
                 (
                     worktree.path.clone(),
                     worktree.branch.clone(),
-                    repository_slug_by_root.get(&worktree.repo_root).cloned(),
+                    repository_slug_by_group_key
+                        .get(&worktree.group_key)
+                        .cloned(),
                 )
             })
             .collect();
@@ -3602,10 +3668,82 @@ impl ArborWindow {
             .and_then(|index| self.repositories.get(index))
     }
 
+    fn set_repositories_preserving_state(&mut self, repositories: Vec<RepositorySummary>) {
+        let active_group_key = self
+            .active_repository_index
+            .and_then(|index| self.repositories.get(index))
+            .map(|repository| repository.group_key.clone());
+        let collapsed_group_keys: HashSet<String> = self
+            .collapsed_repositories
+            .iter()
+            .filter_map(|index| self.repositories.get(*index))
+            .map(|repository| repository.group_key.clone())
+            .collect();
+
+        self.repositories = repositories;
+        self.collapsed_repositories = self
+            .repositories
+            .iter()
+            .enumerate()
+            .filter_map(|(index, repository)| {
+                collapsed_group_keys
+                    .contains(&repository.group_key)
+                    .then_some(index)
+            })
+            .collect();
+        self.active_repository_index = active_group_key
+            .as_ref()
+            .and_then(|group_key| {
+                self.repositories
+                    .iter()
+                    .position(|repository| &repository.group_key == group_key)
+            })
+            .or_else(|| (!self.repositories.is_empty()).then_some(0));
+
+        if let Some(repository) = self.selected_repository().cloned() {
+            self.repo_root = repository.root.clone();
+            self.github_repo_slug = repository.github_repo_slug.clone();
+        } else {
+            self.github_repo_slug = None;
+        }
+    }
+
+    fn upsert_repository_checkout_root(
+        &mut self,
+        root: PathBuf,
+        kind: CheckoutKind,
+        group_key: String,
+    ) {
+        let mut entries = repository_store::repository_entries_from_summaries(&self.repositories);
+        entries.push(repository_store::StoredRepositoryEntry {
+            root: root.clone(),
+            group_key: Some(group_key),
+            kind,
+        });
+        let repositories = repository_store::resolve_repositories_from_entries(entries);
+        self.set_repositories_preserving_state(repositories);
+        if let Some(index) = self
+            .repositories
+            .iter()
+            .position(|repository| repository.contains_checkout_root(&root))
+        {
+            self.active_repository_index = Some(index);
+        }
+    }
+
+    fn remove_repository_checkout_root(&mut self, root: &Path) {
+        let entries = repository_store::repository_entries_from_summaries(&self.repositories)
+            .into_iter()
+            .filter(|entry| entry.root != root)
+            .collect();
+        let repositories = repository_store::resolve_repositories_from_entries(entries);
+        self.set_repositories_preserving_state(repositories);
+    }
+
     fn sync_active_repository_from_selected_worktree(&mut self) {
-        let Some(worktree_repo_root) = self
+        let Some(worktree_group_key) = self
             .active_worktree()
-            .map(|worktree| worktree.repo_root.clone())
+            .map(|worktree| worktree.group_key.clone())
         else {
             return;
         };
@@ -3613,7 +3751,7 @@ impl ArborWindow {
         let Some(index) = self
             .repositories
             .iter()
-            .position(|repository| repository.root == worktree_repo_root)
+            .position(|repository| repository.group_key == worktree_group_key)
         else {
             return;
         };
@@ -3630,7 +3768,7 @@ impl ArborWindow {
             return self
                 .repositories
                 .iter()
-                .find(|repository| repository.root == worktree.repo_root)
+                .find(|repository| repository.group_key == worktree.group_key)
                 .map(|repository| repository.label.clone())
                 .unwrap_or_else(|| repository_display_name(&worktree.repo_root));
         }
@@ -3660,7 +3798,7 @@ impl ArborWindow {
         self.active_worktree_index = self
             .worktrees
             .iter()
-            .position(|worktree| worktree.repo_root == repository.root);
+            .position(|worktree| worktree.group_key == repository.group_key);
         self.refresh_worktrees(cx);
         self.refresh_repo_config_if_changed(cx);
         self.focus_terminal_on_next_render = true;
@@ -3668,8 +3806,9 @@ impl ArborWindow {
     }
 
     fn persist_repositories(&mut self, cx: &mut Context<Self>) {
-        let roots_to_save = repository_store::repository_roots_from_summaries(&self.repositories);
-        if let Err(error) = self.repository_store.save_roots(&roots_to_save) {
+        let entries_to_save =
+            repository_store::repository_entries_from_summaries(&self.repositories);
+        if let Err(error) = self.repository_store.save_entries(&entries_to_save) {
             self.notice = Some(format!("failed to save repositories: {error}"));
             cx.notify();
         }
@@ -3695,7 +3834,7 @@ impl ArborWindow {
         if let Some(index) = self
             .repositories
             .iter()
-            .position(|repository| repository.root == repository_root)
+            .position(|repository| repository.contains_checkout_root(&repository_root))
         {
             self.select_repository(index, cx);
             self.notice = Some(format!(
@@ -3706,11 +3845,24 @@ impl ArborWindow {
             return;
         }
 
-        let repository = RepositorySummary::from_root(repository_root.clone());
+        let repository = RepositorySummary::from_checkout_roots(
+            repository_root.clone(),
+            repository_store::default_group_key_for_root(&repository_root),
+            vec![repository_store::RepositoryCheckoutRoot {
+                path: repository_root.clone(),
+                kind: CheckoutKind::LinkedWorktree,
+            }],
+        );
         let repository_label = repository.label.clone();
-        self.repositories.push(repository);
+        let mut next_repositories = self.repositories.clone();
+        next_repositories.push(repository);
+        self.set_repositories_preserving_state(next_repositories);
         self.persist_repositories(cx);
-        let index = self.repositories.len().saturating_sub(1);
+        let index = self
+            .repositories
+            .iter()
+            .position(|entry| entry.contains_checkout_root(&repository_root))
+            .unwrap_or_else(|| self.repositories.len().saturating_sub(1));
         self.select_repository(index, cx);
         self.notice = Some(format!("added repository `{repository_label}`"));
         cx.notify();
@@ -5163,6 +5315,7 @@ impl ArborWindow {
             tab,
             repository_path,
             worktree_name: String::new(),
+            checkout_kind: self.preferred_checkout_kind,
             worktree_active_field: CreateWorktreeField::WorktreeName,
             host_index: 0,
             clone_url,
@@ -5171,6 +5324,24 @@ impl ArborWindow {
             is_creating: false,
             error: None,
         });
+        cx.notify();
+    }
+
+    fn set_create_modal_checkout_kind(
+        &mut self,
+        checkout_kind: CheckoutKind,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(modal) = self.create_modal.as_mut() else {
+            return;
+        };
+        if modal.is_creating || modal.checkout_kind == checkout_kind {
+            return;
+        }
+
+        modal.checkout_kind = checkout_kind;
+        modal.error = None;
+        self.preferred_checkout_kind = checkout_kind;
         cx.notify();
     }
 
@@ -5244,10 +5415,11 @@ impl ArborWindow {
                     self.close_delete_modal(cx);
                     return;
                 };
+                let is_discrete_clone = wt.checkout_kind == CheckoutKind::DiscreteClone;
                 let repo_root = wt.repo_root.clone();
                 let wt_path = wt.path.clone();
                 let branch = modal.branch.clone();
-                let delete_branch = modal.delete_branch;
+                let delete_branch = modal.delete_branch && !is_discrete_clone;
 
                 if let Some(modal) = self.delete_modal.as_mut() {
                     modal.is_deleting = true;
@@ -5256,14 +5428,30 @@ impl ArborWindow {
                 }
 
                 cx.spawn(async move |this, cx| {
-                    // Remove the worktree (force to handle dirty state).
-                    let result = cx
-                        .background_spawn({
+                    let result = if is_discrete_clone {
+                        cx.background_spawn({
+                            let wt_path = wt_path.clone();
+                            async move {
+                                fs::remove_dir_all(&wt_path).map_err(|error| {
+                                    format!(
+                                        "failed to remove discrete clone `{}`: {error}",
+                                        wt_path.display()
+                                    )
+                                })
+                            }
+                        })
+                        .await
+                    } else {
+                        cx.background_spawn({
                             let repo_root = repo_root.clone();
                             let wt_path = wt_path.clone();
-                            async move { worktree::remove(&repo_root, &wt_path, true) }
+                            async move {
+                                worktree::remove(&repo_root, &wt_path, true)
+                                    .map_err(|error| error.to_string())
+                            }
                         })
-                        .await;
+                        .await
+                    };
 
                     if let Err(e) = &result {
                         let err_msg = e.to_string();
@@ -5277,7 +5465,6 @@ impl ArborWindow {
                         return;
                     }
 
-                    // Optionally delete the branch.
                     if delete_branch && !branch.is_empty() {
                         let _ = cx
                             .background_spawn(async move {
@@ -5287,6 +5474,10 @@ impl ArborWindow {
                     }
 
                     let _ = this.update(cx, |this, cx| {
+                        if is_discrete_clone {
+                            this.remove_repository_checkout_root(&wt_path);
+                            this.persist_repositories(cx);
+                        }
                         this.delete_modal = None;
                         this.refresh_worktrees(cx);
                         cx.notify();
@@ -5326,34 +5517,9 @@ impl ArborWindow {
                     return;
                 }
 
-                self.repositories.remove(index);
-
-                // Adjust active_repository_index
-                if self.repositories.is_empty() {
-                    self.active_repository_index = None;
-                } else if self.active_repository_index == Some(index) {
-                    self.active_repository_index = Some(index.min(self.repositories.len() - 1));
-                } else if let Some(active) = self.active_repository_index
-                    && active > index
-                {
-                    self.active_repository_index = Some(active - 1);
-                }
-
-                // Rebuild collapsed_repositories: shift indices above the removed one down by 1
-                let new_collapsed: HashSet<usize> = self
-                    .collapsed_repositories
-                    .iter()
-                    .filter_map(|&i| {
-                        if i == index {
-                            None
-                        } else if i > index {
-                            Some(i - 1)
-                        } else {
-                            Some(i)
-                        }
-                    })
-                    .collect();
-                self.collapsed_repositories = new_collapsed;
+                let mut repositories = self.repositories.clone();
+                repositories.remove(index);
+                self.set_repositories_preserving_state(repositories);
 
                 self.delete_modal = None;
                 self.persist_repositories(cx);
@@ -5419,6 +5585,7 @@ impl ArborWindow {
         modal.error = None;
         let repository_input = modal.repository_path.trim().to_owned();
         let worktree_input = modal.worktree_name.trim().to_owned();
+        let checkout_kind = modal.checkout_kind;
 
         if repository_input.is_empty() {
             modal.error = Some("Repository path is required.".to_owned());
@@ -5438,16 +5605,39 @@ impl ArborWindow {
         cx.spawn(async move |this, cx| {
             let creation = cx
                 .background_spawn(async move {
-                    create_managed_worktree(repository_input, worktree_input)
+                    create_managed_worktree(repository_input, worktree_input, checkout_kind)
                 })
                 .await;
 
             let _ = this.update(cx, |this, cx| {
                 match creation {
                     Ok(created) => {
+                        if created.checkout_kind == CheckoutKind::DiscreteClone {
+                            let group_key = this
+                                .repositories
+                                .iter()
+                                .find(|repository| {
+                                    repository.contains_checkout_root(&created.source_repo_root)
+                                })
+                                .map(|repository| repository.group_key.clone())
+                                .unwrap_or_else(|| {
+                                    repository_store::default_group_key_for_root(
+                                        &created.source_repo_root,
+                                    )
+                                });
+                            this.upsert_repository_checkout_root(
+                                created.worktree_path.clone(),
+                                CheckoutKind::DiscreteClone,
+                                group_key,
+                            );
+                            this.persist_repositories(cx);
+                        }
+
                         this.notice = Some(format!(
-                            "created worktree `{}` on branch `{}`",
-                            created.worktree_name, created.branch_name
+                            "created {} `{}` on branch `{}`",
+                            created.checkout_kind.label().to_ascii_lowercase(),
+                            created.worktree_name,
+                            created.branch_name
                         ));
                         this.create_modal = None;
                         this.refresh_worktrees(cx);
@@ -8369,6 +8559,7 @@ impl ArborWindow {
                 height,
             }),
             left_pane_visible: Some(self.left_pane_visible),
+            preferred_checkout_kind: Some(self.preferred_checkout_kind),
         }
     }
 
@@ -9146,7 +9337,7 @@ impl ArborWindow {
                 let repo_worktrees: Vec<(usize, &WorktreeSummary)> = worktrees
                     .iter()
                     .enumerate()
-                    .filter(|(_, w)| w.repo_root == repository.root)
+                    .filter(|(_, w)| w.group_key == repository.group_key)
                     .collect();
 
                 // Add spacing between repo groups (not before the first)
@@ -9317,7 +9508,9 @@ impl ArborWindow {
                                 .iter()
                                 .cloned()
                                 .enumerate()
-                                .filter(|(_, worktree)| worktree.repo_root == repository.root)
+                                .filter(|(_, worktree)| {
+                                    worktree.group_key == repository.group_key
+                                })
                                 .collect();
                             let repo_agent_dot_color = if is_collapsed {
                                 if repo_worktrees
@@ -9625,7 +9818,11 @@ impl ArborWindow {
                                                             this.select_worktree(index, window, cx)
                                                         }),
                                                     )
-                                                    .when(!is_primary, |this| {
+                                                    .when(
+                                                        !is_primary
+                                                            || worktree.checkout_kind
+                                                                == CheckoutKind::DiscreteClone,
+                                                        |this| {
                                                         this.on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                                                             cx.stop_propagation();
                                                             this.worktree_context_menu = Some(WorktreeContextMenu {
@@ -9634,7 +9831,8 @@ impl ArborWindow {
                                                             });
                                                             cx.notify();
                                                         }))
-                                                    })
+                                                    },
+                                                    )
                                                     .on_hover(cx.listener(move |this, hovered: &bool, window, cx| {
                                                         this.update_worktree_hover_mouse_position(window.mouse_position());
                                                         if *hovered {
@@ -9685,7 +9883,7 @@ impl ArborWindow {
                                                             .justify_center()
                                                             .text_size(px(16.))
                                                             .text_color(rgb(theme.text_muted))
-                                                            .child("\u{e725}"),
+                                                            .child(worktree.checkout_kind.icon()),
                                                     )
                                                     // Two-line text column
                                                     .child(
@@ -9841,7 +10039,7 @@ impl ArborWindow {
                                                                         div()
                                                                             .flex_none()
                                                                             .text_xs()
-                                                                            .text_color(rgb(theme.accent))
+                                                                            .text_color(rgb(pr_badge_color))
                                                                             .child(pr_text),
                                                                     )
                                                                 }
@@ -11431,6 +11629,8 @@ impl ArborWindow {
         let target_path_preview =
             preview_managed_worktree_path(modal.repository_path.trim(), modal.worktree_name.trim())
                 .unwrap_or_else(|_| "-".to_owned());
+        let checkout_kind = modal.checkout_kind;
+        let is_discrete_clone = checkout_kind == CheckoutKind::DiscreteClone;
         let repository_active = modal.worktree_active_field == CreateWorktreeField::RepositoryPath;
         let worktree_active = modal.worktree_active_field == CreateWorktreeField::WorktreeName;
         let worktree_create_disabled = modal.is_creating
@@ -11465,7 +11665,7 @@ impl ArborWindow {
         let submit_label = if modal.is_creating {
             "Creating..."
         } else if is_worktree_tab {
-            "Create Worktree"
+            checkout_kind.action_label()
         } else {
             "Create Outpost"
         };
@@ -11604,6 +11804,89 @@ impl ArborWindow {
                                 .child("Target base: ~/.arbor/worktrees/<repo>/<worktree>/"),
                         )
                         .child(
+                            div()
+                                .id("create-discrete-clone-checkbox")
+                                .cursor_pointer()
+                                .rounded_sm()
+                                .border_1()
+                                .border_color(rgb(if is_discrete_clone {
+                                    theme.accent
+                                } else {
+                                    theme.border
+                                }))
+                                .bg(rgb(theme.panel_bg))
+                                .px_2()
+                                .py_2()
+                                .flex()
+                                .items_start()
+                                .gap_2()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let next_kind = if is_discrete_clone {
+                                        CheckoutKind::LinkedWorktree
+                                    } else {
+                                        CheckoutKind::DiscreteClone
+                                    };
+                                    this.set_create_modal_checkout_kind(next_kind, cx);
+                                }))
+                                .child(
+                                    div()
+                                        .mt(px(1.))
+                                        .w(px(14.))
+                                        .h(px(14.))
+                                        .rounded_sm()
+                                        .border_1()
+                                        .border_color(rgb(if is_discrete_clone {
+                                            theme.accent
+                                        } else {
+                                            theme.border
+                                        }))
+                                        .bg(rgb(if is_discrete_clone {
+                                            theme.accent
+                                        } else {
+                                            theme.panel_bg
+                                        }))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(
+                                            div()
+                                                .font_family(FONT_MONO)
+                                                .text_size(px(9.))
+                                                .text_color(rgb(if is_discrete_clone {
+                                                    theme.sidebar_bg
+                                                } else {
+                                                    theme.panel_bg
+                                                }))
+                                                .child(if is_discrete_clone {
+                                                    "\u{f00c}"
+                                                } else {
+                                                    ""
+                                                }),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(2.))
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(rgb(theme.text_primary))
+                                                .child("Discrete clone"),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(theme.text_muted))
+                                                .child(CheckoutKind::DiscreteClone.description()),
+                                        ),
+                                ),
+                        )
+                        .child(
                             modal_input_field(
                                 theme,
                                 "create-worktree-repo-input",
@@ -11680,6 +11963,16 @@ impl ArborWindow {
                                         .text_color(rgb(theme.text_primary))
                                         .child(target_path_preview),
                                 ),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(theme.text_muted))
+                                .child(if is_discrete_clone {
+                                    "Discrete clones get their own .git directory. Leave this unchecked for faster shared worktrees."
+                                } else {
+                                    "Linked worktrees share objects with the main repository. Enable discrete clone when you need a fully separate checkout."
+                                }),
                         )
                     })
                     // Remote Outpost tab content
@@ -12728,13 +13021,21 @@ impl ArborWindow {
         };
 
         let theme = self.theme();
-        let is_worktree = matches!(modal.target, DeleteTarget::Worktree(_));
+        let delete_worktree = match &modal.target {
+            DeleteTarget::Worktree(index) => self.worktrees.get(*index),
+            _ => None,
+        };
+        let is_worktree = delete_worktree.is_some();
+        let is_discrete_clone = delete_worktree
+            .is_some_and(|worktree| worktree.checkout_kind == CheckoutKind::DiscreteClone);
         let title = match &modal.target {
+            DeleteTarget::Worktree(_) if is_discrete_clone => "Delete Discrete Clone",
             DeleteTarget::Worktree(_) => "Delete Worktree",
             DeleteTarget::Outpost(_) => "Remove Outpost",
             DeleteTarget::Repository(_) => "Remove Repository",
         };
         let label_prefix = match &modal.target {
+            DeleteTarget::Worktree(_) if is_discrete_clone => "Discrete Clone",
             DeleteTarget::Worktree(_) => "Worktree",
             DeleteTarget::Outpost(_) => "Outpost",
             DeleteTarget::Repository(_) => "Repository",
@@ -12837,7 +13138,7 @@ impl ArborWindow {
                         }
                     })
                     // Branch deletion checkbox (worktrees only)
-                    .when(is_worktree && !modal.branch.is_empty(), |this| {
+                    .when(is_worktree && !is_discrete_clone && !modal.branch.is_empty(), |this| {
                         this.child(
                             div()
                                 .id("delete-branch-checkbox")
@@ -15677,11 +15978,17 @@ impl Drop for ArborWindow {
     fn drop(&mut self) {
         self.stop_active_ssh_daemon_tunnel();
         remove_claude_code_hooks();
+        remove_pi_agent_extension();
     }
 }
 
 impl WorktreeSummary {
-    fn from_worktree(entry: &worktree::Worktree, repo_root: &Path) -> Self {
+    fn from_worktree(
+        entry: &worktree::Worktree,
+        repo_root: &Path,
+        group_key: &str,
+        checkout_kind: CheckoutKind,
+    ) -> Self {
         let label = entry
             .path
             .file_name()
@@ -15698,6 +16005,8 @@ impl WorktreeSummary {
         let last_activity_unix_ms = worktree::last_git_activity_ms(&entry.path);
 
         Self {
+            group_key: group_key.to_owned(),
+            checkout_kind,
             repo_root: repo_root.to_path_buf(),
             path: entry.path.clone(),
             label,
@@ -15715,7 +16024,11 @@ impl WorktreeSummary {
 }
 
 impl RepositorySummary {
-    fn from_root(root: PathBuf) -> Self {
+    fn from_checkout_roots(
+        root: PathBuf,
+        group_key: String,
+        checkout_roots: Vec<repository_store::RepositoryCheckoutRoot>,
+    ) -> Self {
         let label = repository_display_name(&root);
         let github_repo_slug = github_repo_slug_for_repo(&root);
         let avatar_url = github_repo_slug
@@ -15723,11 +16036,19 @@ impl RepositorySummary {
             .and_then(|repo_slug| github_avatar_url_for_repo_slug(repo_slug));
 
         Self {
+            group_key,
             root,
+            checkout_roots,
             label,
             avatar_url,
             github_repo_slug,
         }
+    }
+
+    fn contains_checkout_root(&self, root: &Path) -> bool {
+        self.checkout_roots
+            .iter()
+            .any(|checkout_root| checkout_root.path == root)
     }
 }
 
@@ -16286,7 +16607,9 @@ fn worktree_rows_changed(previous: &[WorktreeSummary], next: &[WorktreeSummary])
     }
 
     previous.iter().zip(next.iter()).any(|(left, right)| {
-        left.repo_root != right.repo_root
+        left.group_key != right.group_key
+            || left.checkout_kind != right.checkout_kind
+            || left.repo_root != right.repo_root
             || left.path != right.path
             || left.label != right.label
             || left.branch != right.branch
@@ -19279,6 +19602,7 @@ fn preview_managed_worktree_path(
 fn create_managed_worktree(
     repository_path_input: String,
     worktree_name_input: String,
+    checkout_kind: CheckoutKind,
 ) -> Result<CreatedWorktree, String> {
     let repository_path = expand_home_path(&repository_path_input)?;
     if !repository_path.exists() {
@@ -19319,22 +19643,86 @@ fn create_managed_worktree(
         )
     })?;
 
-    worktree::add(
-        &repository_root,
-        &worktree_path,
-        worktree::AddWorktreeOptions {
-            branch: Some(&branch_name),
-            detach: false,
-            force: false,
+    match checkout_kind {
+        CheckoutKind::LinkedWorktree => worktree::add(
+            &repository_root,
+            &worktree_path,
+            worktree::AddWorktreeOptions {
+                branch: Some(&branch_name),
+                detach: false,
+                force: false,
+            },
+        )
+        .map_err(|error| format!("failed to create worktree: {error}"))?,
+        CheckoutKind::DiscreteClone => {
+            create_discrete_clone(&repository_root, &worktree_path, &branch_name)?
         },
-    )
-    .map_err(|error| format!("failed to create worktree: {error}"))?;
+    }
 
     Ok(CreatedWorktree {
         worktree_name: sanitized_worktree_name,
         branch_name,
         worktree_path,
+        checkout_kind,
+        source_repo_root: repository_root,
     })
+}
+
+fn create_discrete_clone(
+    source_repo_root: &Path,
+    checkout_path: &Path,
+    branch_name: &str,
+) -> Result<(), String> {
+    let clone_source = source_repo_root
+        .to_str()
+        .ok_or_else(|| "repository path contains invalid UTF-8".to_owned())?;
+    let checkout_target = checkout_path
+        .to_str()
+        .ok_or_else(|| "checkout path contains invalid UTF-8".to_owned())?;
+
+    let source_repo = git2::Repository::open(source_repo_root).map_err(|error| {
+        format!(
+            "failed to open source repository `{}`: {error}",
+            source_repo_root.display()
+        )
+    })?;
+    let origin_url = source_repo
+        .find_remote("origin")
+        .ok()
+        .and_then(|remote| remote.url().map(str::to_owned));
+
+    let cloned_repo = git2::Repository::clone(clone_source, checkout_target).map_err(|error| {
+        format!(
+            "failed to clone `{}` into `{}`: {error}",
+            source_repo_root.display(),
+            checkout_path.display()
+        )
+    })?;
+
+    if let Some(origin_url) = origin_url.as_deref() {
+        let _ = cloned_repo.remote_set_url("origin", origin_url);
+    }
+
+    let head_commit = cloned_repo
+        .head()
+        .and_then(|head| head.peel_to_commit())
+        .map_err(|error| format!("failed to resolve cloned HEAD: {error}"))?;
+    cloned_repo
+        .branch(branch_name, &head_commit, false)
+        .map_err(|error| format!("failed to create branch `{branch_name}`: {error}"))?;
+
+    let branch_ref = format!("refs/heads/{branch_name}");
+    cloned_repo
+        .set_head(&branch_ref)
+        .map_err(|error| format!("failed to set HEAD to `{branch_name}`: {error}"))?;
+
+    let mut checkout = git2::build::CheckoutBuilder::new();
+    checkout.force();
+    cloned_repo
+        .checkout_head(Some(&mut checkout))
+        .map_err(|error| format!("failed to check out `{branch_name}`: {error}"))?;
+
+    Ok(())
 }
 
 fn styled_lines_for_session(
@@ -20668,8 +21056,10 @@ mod tests {
             DaemonTerminalRuntime, DaemonTerminalWsState, DiffLineKind, TerminalRuntimeHandle,
             TerminalRuntimeKind, TerminalSession, TerminalState, WorktreeHoverPopover,
             WorktreeSummary, apply_daemon_snapshot, auto_commit_body, auto_commit_subject,
-            build_side_by_side_diff_lines, estimated_worktree_hover_popover_card_height,
-            extract_first_url, resolve_github_access_token_from_sources, styled_lines_for_session,
+            build_side_by_side_diff_lines,
+            checkout::CheckoutKind,
+            estimated_worktree_hover_popover_card_height, extract_first_url,
+            resolve_github_access_token_from_sources, styled_lines_for_session,
             terminal_backend::{
                 TerminalCursor, TerminalModes, TerminalStyledCell, TerminalStyledLine,
                 TerminalStyledRun,
@@ -20735,6 +21125,8 @@ mod tests {
 
     fn sample_worktree_summary() -> WorktreeSummary {
         WorktreeSummary {
+            group_key: "/tmp/repo".to_owned(),
+            checkout_kind: CheckoutKind::LinkedWorktree,
             repo_root: "/tmp/repo".into(),
             path: "/tmp/repo/wt".into(),
             label: "wt".to_owned(),

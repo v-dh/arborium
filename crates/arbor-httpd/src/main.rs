@@ -251,13 +251,16 @@ fn load_daemon_config() -> DaemonConfig {
     match settings {
         Ok(s) => {
             // Try to extract just the [daemon] section
-            s.get::<DaemonConfig>("daemon").unwrap_or_default()
+            let mut config = s.get::<DaemonConfig>("daemon").unwrap_or_default();
+            config.auth_token = normalize_daemon_auth_token(config.auth_token);
+            config
         },
         Err(_) => DaemonConfig::default(),
     }
 }
 
 fn ensure_auth_token(config: &mut DaemonConfig) {
+    config.auth_token = normalize_daemon_auth_token(config.auth_token.take());
     if config.auth_token.is_some() {
         return;
     }
@@ -303,7 +306,6 @@ fn ensure_auth_token(config: &mut DaemonConfig) {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let bind_addr = resolve_bind_addr()?;
     let web_ui_result = ensure_web_ui_assets();
     if let Err(error) = &web_ui_result {
         eprintln!("web-ui build skipped: {error}");
@@ -312,6 +314,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load daemon config and ensure auth token exists
     let mut daemon_config = load_daemon_config();
     ensure_auth_token(&mut daemon_config);
+    let bind_addr = resolve_bind_addr(daemon_config.auth_token.as_deref())?;
     let auth_state = auth::AuthState::new(daemon_config.auth_token);
 
     let daemon_store = JsonDaemonSessionStore::default();
@@ -408,10 +411,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn resolve_bind_addr() -> Result<SocketAddr, Box<dyn std::error::Error>> {
-    let raw = std::env::var("ARBOR_HTTPD_BIND").unwrap_or_else(|_| "0.0.0.0:8787".to_owned());
-    let parsed: SocketAddr = raw.parse()?;
-    Ok(parsed)
+fn resolve_bind_addr(auth_token: Option<&str>) -> Result<SocketAddr, Box<dyn std::error::Error>> {
+    if let Ok(raw) = std::env::var("ARBOR_HTTPD_BIND") {
+        let parsed: SocketAddr = raw.parse()?;
+        return Ok(parsed);
+    }
+
+    let port = match std::env::var("ARBOR_HTTPD_PORT") {
+        Ok(raw) => raw.parse::<u16>()?,
+        Err(_) => 8787,
+    };
+
+    Ok(default_bind_addr(auth_token, port))
+}
+
+fn default_bind_addr(auth_token: Option<&str>, port: u16) -> SocketAddr {
+    let host = if auth_token.is_some_and(|token| !token.trim().is_empty()) {
+        "0.0.0.0"
+    } else {
+        "127.0.0.1"
+    };
+
+    format!("{host}:{port}")
+        .parse()
+        .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], port)))
+}
+
+fn normalize_daemon_auth_token(raw: Option<String>) -> Option<String> {
+    raw.and_then(|token| {
+        let trimmed = token.trim();
+        (!trimmed.is_empty()).then_some(trimmed.to_owned())
+    })
 }
 
 fn router(state: AppState) -> Router {
@@ -1474,6 +1504,22 @@ mod tests {
         assert_eq!(echoed, payload);
 
         kill_session(&state, &session_id).await;
+    }
+
+    #[test]
+    fn default_bind_addr_uses_public_interface_only_when_auth_is_enabled() {
+        assert_eq!(
+            default_bind_addr(Some("secret-token"), 8787),
+            SocketAddr::from(([0, 0, 0, 0], 8787))
+        );
+        assert_eq!(
+            default_bind_addr(None, 8787),
+            SocketAddr::from(([127, 0, 0, 1], 8787))
+        );
+        assert_eq!(
+            default_bind_addr(Some("   "), 8787),
+            SocketAddr::from(([127, 0, 0, 1], 8787))
+        );
     }
 
     fn test_app_state(repo_root: PathBuf) -> AppState {

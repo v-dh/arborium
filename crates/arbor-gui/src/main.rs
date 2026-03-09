@@ -90,8 +90,11 @@ const BUILT_IN_GITHUB_OAUTH_CLIENT_ID: Option<&str> = Some("Ov23liVexfjFZQXcuQib
 const GITHUB_AUTH_COPY_FEEDBACK_DURATION: Duration = Duration::from_millis(1200);
 const CONFIG_AUTO_REFRESH_INTERVAL: Duration = Duration::from_millis(600);
 const TERMINAL_TAB_COMMAND_MAX_CHARS: usize = 14;
+const ACTIVE_DAEMON_TERMINAL_SYNC_INTERVAL: Duration = Duration::from_millis(250);
 const INACTIVE_DAEMON_TERMINAL_SYNC_INTERVAL: Duration = Duration::from_millis(250);
 const IDLE_DAEMON_TERMINAL_SYNC_INTERVAL: Duration = Duration::from_millis(1000);
+const DAEMON_TERMINAL_WS_RECONNECT_BASE_DELAY: Duration = Duration::from_millis(150);
+const DAEMON_TERMINAL_WS_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(2);
 const DEFAULT_DAEMON_BASE_URL: &str = "http://127.0.0.1:8787";
 const DEFAULT_DAEMON_PORT: u16 = 8787;
 const DEFAULT_SSH_PORT: u16 = 22;
@@ -426,6 +429,19 @@ trait EmulatorRuntimeBackend: Clone {
 trait TerminalRuntimeHandle {
     fn kind(&self) -> TerminalRuntimeKind;
     fn sync_interval(&self, is_active: bool, session_state: TerminalState) -> Duration;
+    fn should_sync(
+        &self,
+        session: &TerminalSession,
+        is_active: bool,
+        _target_grid_size: Option<(u16, u16, u16, u16)>,
+        now: Instant,
+    ) -> bool {
+        runtime_sync_interval_elapsed(
+            session.last_runtime_sync_at,
+            self.sync_interval(is_active, session.state),
+            now,
+        )
+    }
     fn write_input(&self, session: &TerminalSession, input: &[u8]) -> Result<(), String>;
     fn sync(
         &self,
@@ -451,14 +467,42 @@ struct EmulatorTerminalRuntime<B> {
     exit_labels: RuntimeExitLabels,
 }
 
-#[derive(Clone)]
 struct DaemonTerminalRuntime {
     daemon: terminal_daemon_http::SharedTerminalDaemonClient,
+    ws_state: Arc<DaemonTerminalWsState>,
+    last_synced_ws_generation: std::sync::atomic::AtomicU64,
     kind: TerminalRuntimeKind,
     resize_error_label: &'static str,
     snapshot_error_label: &'static str,
     exit_labels: Option<RuntimeExitLabels>,
     clear_global_daemon_on_connection_refused: bool,
+}
+
+#[derive(Default)]
+struct DaemonTerminalWsState {
+    event_generation: std::sync::atomic::AtomicU64,
+    closed: std::sync::atomic::AtomicBool,
+}
+
+impl DaemonTerminalWsState {
+    fn note_event(&self) {
+        self.event_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn event_generation(&self) -> u64 {
+        self.event_generation
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn close(&self) {
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 impl EmulatorRuntimeBackend for EmbeddedTerminal {
@@ -642,6 +686,40 @@ impl TerminalRuntimeHandle for DaemonTerminalRuntime {
         daemon_terminal_sync_interval(is_active, session_state)
     }
 
+    fn should_sync(
+        &self,
+        session: &TerminalSession,
+        is_active: bool,
+        target_grid_size: Option<(u16, u16, u16, u16)>,
+        now: Instant,
+    ) -> bool {
+        if is_active
+            && let Some((rows, cols, ..)) = target_grid_size
+            && (cols != session.cols || rows != session.rows)
+        {
+            return true;
+        }
+
+        let current_generation = self.ws_state.event_generation();
+        let last_synced_generation = self
+            .last_synced_ws_generation
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if current_generation > last_synced_generation {
+            return is_active
+                || runtime_sync_interval_elapsed(
+                    session.last_runtime_sync_at,
+                    self.sync_interval(false, session.state),
+                    now,
+                );
+        }
+
+        runtime_sync_interval_elapsed(
+            session.last_runtime_sync_at,
+            self.sync_interval(is_active, session.state),
+            now,
+        )
+    }
+
     fn write_input(&self, session: &TerminalSession, input: &[u8]) -> Result<(), String> {
         if input == [0x03] {
             self.daemon
@@ -667,6 +745,7 @@ impl TerminalRuntimeHandle for DaemonTerminalRuntime {
         target_grid_size: Option<(u16, u16, u16, u16)>,
     ) -> TerminalRuntimeSyncOutcome {
         let mut outcome = TerminalRuntimeSyncOutcome::default();
+        let observed_ws_generation = self.ws_state.event_generation();
 
         if is_active
             && let Some((rows, cols, ..)) = target_grid_size
@@ -693,6 +772,8 @@ impl TerminalRuntimeHandle for DaemonTerminalRuntime {
             max_lines: 220,
         }) {
             Ok(Some(snapshot)) => {
+                self.last_synced_ws_generation
+                    .store(observed_ws_generation, std::sync::atomic::Ordering::Relaxed);
                 let snapshot_state = terminal_state_from_daemon_state(snapshot.state);
                 outcome.changed |= apply_daemon_snapshot(session, &snapshot);
                 if session.state != snapshot_state {
@@ -734,6 +815,8 @@ impl TerminalRuntimeHandle for DaemonTerminalRuntime {
                 }
             },
             Ok(None) => {
+                self.last_synced_ws_generation
+                    .store(observed_ws_generation, std::sync::atomic::Ordering::Relaxed);
                 outcome.close_session = true;
             },
             Err(error) => {
@@ -758,6 +841,8 @@ impl TerminalRuntimeHandle for DaemonTerminalRuntime {
     }
 
     fn close(&self, session: &TerminalSession) -> Result<(), String> {
+        self.ws_state.close();
+
         let result = if session.state == TerminalState::Running {
             self.daemon.kill(KillRequest {
                 session_id: session.daemon_session_id.clone(),
@@ -2450,7 +2535,10 @@ impl ArborWindow {
                     changed = true;
                 }
                 if attach_runtime && let Some(daemon) = self.terminal_daemon.as_ref() {
-                    session.runtime = Some(local_daemon_runtime(daemon.clone()));
+                    session.runtime = Some(local_daemon_runtime(
+                        daemon.clone(),
+                        session.daemon_session_id.clone(),
+                    ));
                     changed = true;
                 }
             } else {
@@ -2477,9 +2565,9 @@ impl ArborWindow {
                     last_runtime_sync_at: None,
                     runtime: attach_runtime
                         .then(|| {
-                            self.terminal_daemon
-                                .as_ref()
-                                .map(|daemon| local_daemon_runtime(daemon.clone()))
+                            self.terminal_daemon.as_ref().map(|daemon| {
+                                local_daemon_runtime(daemon.clone(), record.session_id.clone())
+                            })
                         })
                         .flatten(),
                 });
@@ -2548,21 +2636,14 @@ impl ArborWindow {
 
             let session_id = self.terminals[index].id;
             let is_active = active_terminal_id == Some(session_id);
-            let sync_interval = runtime.sync_interval(is_active, self.terminals[index].state);
-            if sync_interval > Duration::ZERO
-                && self.terminals[index]
-                    .last_runtime_sync_at
-                    .is_some_and(|last_sync| {
-                        now.saturating_duration_since(last_sync) < sync_interval
-                    })
-            {
+            if !runtime.should_sync(&self.terminals[index], is_active, target_grid_size, now) {
                 continue;
             }
-            self.terminals[index].last_runtime_sync_at = Some(now);
             let outcome = {
                 let session = &mut self.terminals[index];
                 runtime.sync(session, is_active, target_grid_size)
             };
+            self.terminals[index].last_runtime_sync_at = Some(now);
 
             changed |= outcome.changed;
 
@@ -2874,20 +2955,46 @@ impl ArborWindow {
 
     fn start_agent_activity_ws(&mut self, cx: &mut Context<Self>) {
         let daemon_base_url = self.daemon_base_url.clone();
+        let daemon = self.terminal_daemon.clone();
         cx.spawn(async move |this, cx| {
-            let ws_url = daemon_base_url
-                .replace("http://", "ws://")
-                .replace("https://", "wss://")
-                + "/api/v1/agent/activity/ws";
-
             let mut backoff_secs = 3u64;
 
             loop {
-                let url = ws_url.clone();
+                let connect_config = daemon
+                    .as_ref()
+                    .and_then(|daemon| {
+                        daemon
+                            .websocket_connect_config("/api/v1/agent/activity/ws")
+                            .ok()
+                    })
+                    .or_else(|| {
+                        daemon_url_is_local(&daemon_base_url).then(|| {
+                            terminal_daemon_http::WebsocketConnectConfig {
+                                url: daemon_base_url
+                                    .replace("http://", "ws://")
+                                    .replace("https://", "wss://")
+                                    + "/api/v1/agent/activity/ws",
+                                auth_token: None,
+                            }
+                        })
+                    });
                 let (tx, rx) = smol::channel::unbounded::<Option<String>>();
 
                 cx.background_spawn(async move {
-                    let Ok((mut ws, _)) = tungstenite::connect(&url) else {
+                    let Some(connect_config) = connect_config else {
+                        let _ = tx.send(None).await;
+                        return;
+                    };
+                    let request = match daemon_websocket_request(&connect_config) {
+                        Ok(request) => request,
+                        Err(error) => {
+                            tracing::debug!(%error, "failed to build agent activity websocket request");
+                            let _ = tx.send(None).await;
+                            return;
+                        },
+                    };
+
+                    let Ok((mut ws, _)) = tungstenite::connect(request) else {
                         let _ = tx.send(None).await;
                         return;
                     };
@@ -7099,7 +7206,10 @@ impl ArborWindow {
                     session.updated_at_unix_ms = daemon_session.updated_at_unix_ms;
                     session.cols = daemon_session.cols.max(2);
                     session.rows = daemon_session.rows.max(1);
-                    session.runtime = Some(local_daemon_runtime(daemon.clone()));
+                    session.runtime = Some(local_daemon_runtime(
+                        daemon.clone(),
+                        daemon_session.session_id.clone(),
+                    ));
                     launched_with_daemon = true;
                 },
                 Err(error) => {
@@ -14711,9 +14821,15 @@ fn local_embedded_runtime(runtime: EmbeddedTerminal) -> SharedTerminalRuntime {
 
 fn local_daemon_runtime(
     daemon: terminal_daemon_http::SharedTerminalDaemonClient,
+    session_id: String,
 ) -> SharedTerminalRuntime {
+    let ws_state = Arc::new(DaemonTerminalWsState::default());
+    spawn_daemon_terminal_ws_watcher(daemon.clone(), session_id.clone(), &ws_state);
+
     Arc::new(DaemonTerminalRuntime {
         daemon,
+        ws_state,
+        last_synced_ws_generation: std::sync::atomic::AtomicU64::new(0),
         kind: TerminalRuntimeKind::Local,
         resize_error_label: "failed to resize terminal",
         snapshot_error_label: "daemon snapshot",
@@ -14824,13 +14940,153 @@ fn track_terminal_command_keystroke(session: &mut TerminalSession, keystroke: &K
 
 fn daemon_terminal_sync_interval(is_active: bool, session_state: TerminalState) -> Duration {
     if is_active {
-        return Duration::ZERO;
+        return ACTIVE_DAEMON_TERMINAL_SYNC_INTERVAL;
     }
 
     match session_state {
         TerminalState::Running => INACTIVE_DAEMON_TERMINAL_SYNC_INTERVAL,
         TerminalState::Completed | TerminalState::Failed => IDLE_DAEMON_TERMINAL_SYNC_INTERVAL,
     }
+}
+
+fn runtime_sync_interval_elapsed(
+    last_runtime_sync_at: Option<Instant>,
+    sync_interval: Duration,
+    now: Instant,
+) -> bool {
+    if sync_interval == Duration::ZERO {
+        return true;
+    }
+
+    match last_runtime_sync_at {
+        Some(last_sync) => now.saturating_duration_since(last_sync) >= sync_interval,
+        None => true,
+    }
+}
+
+fn daemon_websocket_request(
+    connect_config: &terminal_daemon_http::WebsocketConnectConfig,
+) -> Result<tungstenite::http::Request<()>, String> {
+    use tungstenite::client::IntoClientRequest;
+
+    let mut request = connect_config
+        .url
+        .as_str()
+        .into_client_request()
+        .map_err(|error| format!("failed to create websocket request: {error}"))?;
+
+    if let Some(token) = connect_config.auth_token.as_ref() {
+        let header_value = tungstenite::http::HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|error| format!("failed to encode websocket auth token: {error}"))?;
+        request
+            .headers_mut()
+            .insert(tungstenite::http::header::AUTHORIZATION, header_value);
+    }
+
+    Ok(request)
+}
+
+fn spawn_daemon_terminal_ws_watcher(
+    daemon: terminal_daemon_http::SharedTerminalDaemonClient,
+    session_id: String,
+    ws_state: &Arc<DaemonTerminalWsState>,
+) {
+    let ws_state = Arc::downgrade(ws_state);
+    std::thread::spawn(move || {
+        let mut reconnect_delay = DAEMON_TERMINAL_WS_RECONNECT_BASE_DELAY;
+
+        loop {
+            let Some(ws_state) = ws_state.upgrade() else {
+                break;
+            };
+            if ws_state.is_closed() {
+                break;
+            }
+
+            let connect_config = match daemon.terminal_websocket_config(&session_id) {
+                Ok(config) => config,
+                Err(error) => {
+                    tracing::debug!(
+                        session_id = %session_id,
+                        %error,
+                        "failed to build daemon terminal websocket config"
+                    );
+                    std::thread::sleep(reconnect_delay);
+                    reconnect_delay = daemon_terminal_ws_next_backoff(reconnect_delay);
+                    continue;
+                },
+            };
+            let request = match daemon_websocket_request(&connect_config) {
+                Ok(request) => request,
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        %error,
+                        "failed to create daemon terminal websocket request"
+                    );
+                    std::thread::sleep(reconnect_delay);
+                    reconnect_delay = daemon_terminal_ws_next_backoff(reconnect_delay);
+                    continue;
+                },
+            };
+
+            match tungstenite::connect(request) {
+                Ok((mut socket, _)) => {
+                    ws_state.note_event();
+                    reconnect_delay = DAEMON_TERMINAL_WS_RECONNECT_BASE_DELAY;
+
+                    loop {
+                        if ws_state.is_closed() {
+                            let _ = socket.close(None);
+                            return;
+                        }
+
+                        match socket.read() {
+                            Ok(tungstenite::Message::Binary(_))
+                            | Ok(tungstenite::Message::Text(_)) => {
+                                ws_state.note_event();
+                            },
+                            Ok(tungstenite::Message::Ping(_))
+                            | Ok(tungstenite::Message::Pong(_))
+                            | Ok(tungstenite::Message::Frame(_)) => {},
+                            Ok(tungstenite::Message::Close(_)) => {
+                                break;
+                            },
+                            Err(error) => {
+                                tracing::debug!(
+                                    session_id = %session_id,
+                                    %error,
+                                    "daemon terminal websocket disconnected"
+                                );
+                                break;
+                            },
+                        }
+                    }
+                },
+                Err(error) => {
+                    tracing::debug!(
+                        session_id = %session_id,
+                        %error,
+                        "failed to connect daemon terminal websocket"
+                    );
+                },
+            }
+
+            if ws_state.is_closed() {
+                break;
+            }
+
+            std::thread::sleep(reconnect_delay);
+            reconnect_delay = daemon_terminal_ws_next_backoff(reconnect_delay);
+        }
+    });
+}
+
+fn daemon_terminal_ws_next_backoff(current: Duration) -> Duration {
+    current
+        .checked_mul(2)
+        .unwrap_or(DAEMON_TERMINAL_WS_RECONNECT_MAX_DELAY)
+        .min(DAEMON_TERMINAL_WS_RECONNECT_MAX_DELAY)
 }
 
 fn ordered_terminal_sync_indices(
@@ -15322,18 +15578,16 @@ fn try_auto_start_daemon(
         },
     };
 
-    // Bind to 0.0.0.0 so the daemon is reachable on the LAN (for mDNS
-    // discovery and direct connections), while the GUI still connects via
-    // 127.0.0.1.
+    // Let arbor-httpd choose its default bind host based on whether auth is
+    // enabled, while still honoring the requested port.
     let port = daemon_base_url
         .strip_prefix("http://")
         .and_then(|s| s.rsplit_once(':'))
         .and_then(|(_, p)| p.parse::<u16>().ok())
         .unwrap_or(8787);
-    let bind_addr = format!("0.0.0.0:{port}");
 
     let mut cmd = Command::new(&binary);
-    cmd.env("ARBOR_HTTPD_BIND", &bind_addr)
+    cmd.env("ARBOR_HTTPD_PORT", port.to_string())
         .stdin(Stdio::null())
         .stdout(stdout_file)
         .stderr(stderr_file);
@@ -20411,14 +20665,16 @@ fn main() {
 mod tests {
     use {
         crate::{
-            DiffLineKind, TerminalSession, TerminalState, WorktreeHoverPopover, WorktreeSummary,
-            apply_daemon_snapshot, auto_commit_body, auto_commit_subject,
+            DaemonTerminalRuntime, DaemonTerminalWsState, DiffLineKind, TerminalRuntimeHandle,
+            TerminalRuntimeKind, TerminalSession, TerminalState, WorktreeHoverPopover,
+            WorktreeSummary, apply_daemon_snapshot, auto_commit_body, auto_commit_subject,
             build_side_by_side_diff_lines, estimated_worktree_hover_popover_card_height,
             extract_first_url, resolve_github_access_token_from_sources, styled_lines_for_session,
             terminal_backend::{
                 TerminalCursor, TerminalModes, TerminalStyledCell, TerminalStyledLine,
                 TerminalStyledRun,
             },
+            terminal_daemon_http::{HttpTerminalDaemon, WebsocketConnectConfig},
             theme::ThemeKind,
             track_terminal_command_keystroke, worktree_hover_popover_zone_bounds,
             worktree_hover_safe_zone_contains,
@@ -20429,7 +20685,7 @@ mod tests {
             daemon,
         },
         gpui::{Keystroke, point, px},
-        std::time::Duration,
+        std::{sync::Arc, time::Instant},
     };
 
     fn session_with_styled_line(
@@ -20497,6 +20753,24 @@ mod tests {
         }
     }
 
+    fn daemon_runtime_for_test() -> DaemonTerminalRuntime {
+        let daemon = match HttpTerminalDaemon::new("http://127.0.0.1:8787") {
+            Ok(daemon) => daemon,
+            Err(error) => panic!("failed to create daemon client: {error}"),
+        };
+
+        DaemonTerminalRuntime {
+            daemon: Arc::new(daemon),
+            ws_state: Arc::new(DaemonTerminalWsState::default()),
+            last_synced_ws_generation: std::sync::atomic::AtomicU64::new(0),
+            kind: TerminalRuntimeKind::Local,
+            resize_error_label: "resize",
+            snapshot_error_label: "snapshot",
+            exit_labels: None,
+            clear_global_daemon_on_connection_refused: false,
+        }
+    }
+
     #[test]
     fn sanitizes_worktree_name_for_branch_and_path() {
         let sanitized = crate::sanitize_worktree_name("  Remote SSH / Demo  ");
@@ -20524,10 +20798,10 @@ mod tests {
     }
 
     #[test]
-    fn daemon_terminal_sync_interval_keeps_active_session_unthrottled() {
+    fn daemon_terminal_sync_interval_uses_active_fallback() {
         assert_eq!(
             crate::daemon_terminal_sync_interval(true, TerminalState::Running),
-            Duration::ZERO
+            crate::ACTIVE_DAEMON_TERMINAL_SYNC_INTERVAL
         );
         assert_eq!(
             crate::daemon_terminal_sync_interval(false, TerminalState::Running),
@@ -20540,6 +20814,72 @@ mod tests {
         assert_eq!(
             crate::daemon_terminal_sync_interval(false, TerminalState::Failed),
             crate::IDLE_DAEMON_TERMINAL_SYNC_INTERVAL
+        );
+    }
+
+    #[test]
+    fn daemon_runtime_syncs_active_session_immediately_on_ws_event() {
+        let runtime = daemon_runtime_for_test();
+        let mut session = session_with_styled_line("prompt", 0xffffff, 0x000000, None);
+        let now = Instant::now();
+        session.last_runtime_sync_at = Some(now);
+
+        assert!(!runtime.should_sync(&session, true, None, now));
+
+        runtime.ws_state.note_event();
+
+        assert!(runtime.should_sync(&session, true, None, now));
+    }
+
+    #[test]
+    fn daemon_runtime_throttles_inactive_sessions_even_when_ws_is_dirty() {
+        let runtime = daemon_runtime_for_test();
+        let mut session = session_with_styled_line("background", 0xffffff, 0x000000, None);
+        let now = Instant::now();
+        session.last_runtime_sync_at = Some(now);
+
+        runtime.ws_state.note_event();
+
+        assert!(!runtime.should_sync(&session, false, None, now));
+        assert!(runtime.should_sync(
+            &session,
+            false,
+            None,
+            now + crate::INACTIVE_DAEMON_TERMINAL_SYNC_INTERVAL
+        ));
+    }
+
+    #[test]
+    fn daemon_runtime_syncs_active_resize_without_waiting_for_ws() {
+        let runtime = daemon_runtime_for_test();
+        let mut session = session_with_styled_line("prompt", 0xffffff, 0x000000, None);
+        let now = Instant::now();
+        session.last_runtime_sync_at = Some(now);
+
+        assert!(runtime.should_sync(
+            &session,
+            true,
+            Some((session.rows + 1, session.cols, 0, 0)),
+            now
+        ));
+    }
+
+    #[test]
+    fn daemon_websocket_request_adds_bearer_auth_header() {
+        let request = match crate::daemon_websocket_request(&WebsocketConnectConfig {
+            url: "ws://127.0.0.1:8787/api/v1/agent/activity/ws".to_owned(),
+            auth_token: Some("secret-token".to_owned()),
+        }) {
+            Ok(request) => request,
+            Err(error) => panic!("failed to build websocket request: {error}"),
+        };
+
+        assert_eq!(
+            request
+                .headers()
+                .get(tungstenite::http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer secret-token")
         );
     }
 

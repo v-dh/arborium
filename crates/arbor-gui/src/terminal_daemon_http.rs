@@ -77,6 +77,12 @@ pub struct HealthInfo {
     pub version: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebsocketConnectConfig {
+    pub url: String,
+    pub auth_token: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct CreateTerminalRequest {
     session_id: Option<String>,
@@ -124,6 +130,27 @@ impl HttpTerminalDaemon {
 
     pub fn base_url(&self) -> String {
         self.endpoint.display_url()
+    }
+
+    pub fn websocket_connect_config(
+        &self,
+        path: &str,
+    ) -> Result<WebsocketConnectConfig, HttpTerminalDaemonError> {
+        Ok(WebsocketConnectConfig {
+            url: self.endpoint.websocket_url(&path),
+            auth_token: self.auth_token.lock().ok().and_then(|guard| guard.clone()),
+        })
+    }
+
+    pub fn terminal_websocket_config(
+        &self,
+        session_id: &str,
+    ) -> Result<WebsocketConnectConfig, HttpTerminalDaemonError> {
+        let path = format!(
+            "{API_PATH_PREFIX}/terminals/{}/ws",
+            encode_path_segment(session_id)
+        );
+        self.websocket_connect_config(&path)
     }
 
     pub fn create_or_attach(
@@ -382,6 +409,14 @@ impl HttpTerminalDaemon {
 pub trait TerminalDaemonClient: Send + Sync {
     fn base_url(&self) -> String;
     fn set_auth_token(&self, token: Option<String>);
+    fn websocket_connect_config(
+        &self,
+        path: &str,
+    ) -> Result<WebsocketConnectConfig, HttpTerminalDaemonError>;
+    fn terminal_websocket_config(
+        &self,
+        session_id: &str,
+    ) -> Result<WebsocketConnectConfig, HttpTerminalDaemonError>;
     fn create_or_attach(
         &self,
         request: CreateOrAttachRequest,
@@ -407,6 +442,20 @@ impl TerminalDaemonClient for HttpTerminalDaemon {
 
     fn set_auth_token(&self, token: Option<String>) {
         HttpTerminalDaemon::set_auth_token(self, token);
+    }
+
+    fn websocket_connect_config(
+        &self,
+        path: &str,
+    ) -> Result<WebsocketConnectConfig, HttpTerminalDaemonError> {
+        HttpTerminalDaemon::websocket_connect_config(self, path)
+    }
+
+    fn terminal_websocket_config(
+        &self,
+        session_id: &str,
+    ) -> Result<WebsocketConnectConfig, HttpTerminalDaemonError> {
+        HttpTerminalDaemon::terminal_websocket_config(self, session_id)
     }
 
     fn create_or_attach(
@@ -561,6 +610,11 @@ impl HttpEndpoint {
         }
 
         format!("http://{authority}{}", self.base_path)
+    }
+
+    fn websocket_url(&self, path: &str) -> String {
+        let request_path = self.request_path(path);
+        format!("ws://{}{}", self.host_header(), request_path)
     }
 }
 
@@ -810,6 +864,43 @@ mod tests {
             Ok(()) => {},
             Err(_) => panic!("capture server thread panicked"),
         }
+    }
+
+    #[test]
+    fn terminal_websocket_config_uses_encoded_session_id_and_auth_token() {
+        let daemon = match HttpTerminalDaemon::new("http://127.0.0.1:8787/arbor") {
+            Ok(daemon) => daemon,
+            Err(error) => panic!("failed to create daemon client: {error}"),
+        };
+        daemon.set_auth_token(Some("secret-token".to_owned()));
+
+        let config = match daemon.terminal_websocket_config("tmux/demo 1") {
+            Ok(config) => config,
+            Err(error) => panic!("failed to build websocket config: {error}"),
+        };
+
+        assert_eq!(
+            config.url,
+            "ws://127.0.0.1:8787/arbor/api/v1/terminals/tmux%2Fdemo%201/ws"
+        );
+        assert_eq!(config.auth_token.as_deref(), Some("secret-token"));
+    }
+
+    #[test]
+    fn websocket_connect_config_preserves_auth_token_for_agent_paths() {
+        let daemon = match HttpTerminalDaemon::new("http://127.0.0.1:8787") {
+            Ok(daemon) => daemon,
+            Err(error) => panic!("failed to create daemon client: {error}"),
+        };
+        daemon.set_auth_token(Some("agent-secret".to_owned()));
+
+        let config = match daemon.websocket_connect_config("/api/v1/agent/activity/ws") {
+            Ok(config) => config,
+            Err(error) => panic!("failed to build websocket config: {error}"),
+        };
+
+        assert_eq!(config.url, "ws://127.0.0.1:8787/api/v1/agent/activity/ws");
+        assert_eq!(config.auth_token.as_deref(), Some("agent-secret"));
     }
 
     fn spawn_capture_server() -> (

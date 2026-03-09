@@ -2404,8 +2404,20 @@ impl ArborWindow {
                                 mdns_browser::MdnsEvent::Added(daemon) => {
                                     // Skip our own instance
                                     if daemon.instance_name == local_hostname {
+                                        tracing::debug!(
+                                            name = %daemon.instance_name,
+                                            "mDNS: ignoring own instance"
+                                        );
                                         continue;
                                     }
+                                    tracing::info!(
+                                        name = %daemon.instance_name,
+                                        host = %daemon.host,
+                                        addresses = ?daemon.addresses,
+                                        port = daemon.port,
+                                        has_auth = daemon.has_auth,
+                                        "mDNS: discovered LAN daemon"
+                                    );
                                     // Update existing or insert new
                                     if let Some(existing) = this
                                         .discovered_daemons
@@ -2422,6 +2434,7 @@ impl ArborWindow {
                                     }
                                 },
                                 mdns_browser::MdnsEvent::Removed(name) => {
+                                    tracing::info!(name = %name, "mDNS: LAN daemon removed");
                                     let before = this.discovered_daemons.len();
                                     this.discovered_daemons.retain(|d| d.instance_name != name);
                                     if this.discovered_daemons.len() != before {
@@ -4762,6 +4775,13 @@ impl ArborWindow {
         };
         let url = daemon.base_url();
         let label = daemon.display_name().to_owned();
+        tracing::info!(
+            url = %url,
+            name = %label,
+            host = %daemon.host,
+            has_auth = daemon.has_auth,
+            "connecting to discovered LAN daemon"
+        );
         connection_history::record_connection(&url, Some(&label));
         self.connection_history = connection_history::load_history();
         self.connect_to_daemon_url(&url, Some(label), cx);
@@ -4883,6 +4903,7 @@ impl ArborWindow {
             },
             Err(error) => {
                 if error.is_forbidden() {
+                    tracing::warn!(url = %url, "daemon rejected connection: forbidden (no auth token configured on remote)");
                     self.notice = Some(
                         "Remote host has no auth token configured. Set [daemon] auth_token in ~/.config/arbor/config.toml on the remote host.".to_owned(),
                     );
@@ -4891,6 +4912,7 @@ impl ArborWindow {
                     cx.notify();
                     false
                 } else if error.is_unauthorized() {
+                    tracing::info!(url = %url, "daemon requires authentication, showing auth modal");
                     self.daemon_auth_modal = Some(DaemonAuthModal {
                         daemon_url: token_key,
                         token: String::new(),
@@ -16300,9 +16322,14 @@ fn check_daemon_version_and_restart(
 
 /// Attempt to locate and spawn `arbor-httpd` as a detached background process,
 /// then poll until it becomes reachable. Returns `Some(daemon)` on success.
+/// Only works for localhost URLs — auto-starting a remote daemon makes no sense.
 fn try_auto_start_daemon(
     daemon_base_url: &str,
 ) -> Option<terminal_daemon_http::SharedTerminalDaemonClient> {
+    if !is_localhost_url(daemon_base_url) {
+        tracing::debug!(url = %daemon_base_url, "skipping auto-start for non-localhost daemon");
+        return None;
+    }
     let binary = find_arbor_httpd_binary()?;
     tracing::info!(path = %binary.display(), "auto-starting arbor-httpd");
 
@@ -16392,6 +16419,15 @@ fn find_arbor_httpd_binary() -> Option<PathBuf> {
             .map(|dir| dir.join("arbor-httpd"))
             .find(|candidate| candidate.is_file())
     })
+}
+
+fn is_localhost_url(url: &str) -> bool {
+    let host = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .unwrap_or(url);
+    let host = host.split(':').next().unwrap_or(host);
+    host == "127.0.0.1" || host == "localhost" || host == "[::1]"
 }
 
 fn load_outpost_summaries(

@@ -1416,6 +1416,7 @@ struct CreateModal {
     worktree_active_field: CreateWorktreeField,
     // Outpost fields
     host_index: usize,
+    host_dropdown_open: bool,
     clone_url: String,
     clone_url_cursor: usize,
     outpost_name: String,
@@ -1444,6 +1445,8 @@ enum OutpostModalInputEvent {
     SetActiveField(CreateOutpostField),
     MoveActiveField(bool),
     CycleHost(bool),
+    SelectHost(usize),
+    ToggleHostDropdown,
     Edit(TextEditAction),
     ClearError,
 }
@@ -5999,6 +6002,7 @@ impl ArborWindow {
             checkout_kind: self.preferred_checkout_kind,
             worktree_active_field: CreateWorktreeField::WorktreeName,
             host_index: 0,
+            host_dropdown_open: false,
             clone_url_cursor: char_count(&clone_url),
             clone_url,
             outpost_name: String::new(),
@@ -6936,6 +6940,7 @@ impl ArborWindow {
 
         match input {
             OutpostModalInputEvent::SetActiveField(field) => {
+                modal.host_dropdown_open = false;
                 modal.outpost_active_field = field;
                 match field {
                     CreateOutpostField::HostSelector => {},
@@ -6948,6 +6953,7 @@ impl ArborWindow {
                 }
             },
             OutpostModalInputEvent::MoveActiveField(reverse) => {
+                modal.host_dropdown_open = false;
                 modal.outpost_active_field = match (modal.outpost_active_field, reverse) {
                     (CreateOutpostField::HostSelector, false) => CreateOutpostField::CloneUrl,
                     (CreateOutpostField::CloneUrl, false) => CreateOutpostField::OutpostName,
@@ -6966,6 +6972,16 @@ impl ArborWindow {
                         modal.host_index = (modal.host_index + 1) % count;
                     }
                 }
+            },
+            OutpostModalInputEvent::SelectHost(index) => {
+                if index < self.remote_hosts.len() {
+                    modal.host_index = index;
+                }
+                modal.host_dropdown_open = false;
+            },
+            OutpostModalInputEvent::ToggleHostDropdown => {
+                modal.host_dropdown_open = !modal.host_dropdown_open;
+                modal.outpost_active_field = CreateOutpostField::HostSelector;
             },
             OutpostModalInputEvent::Edit(action) => {
                 if modal.outpost_active_field == CreateOutpostField::HostSelector {
@@ -7541,7 +7557,18 @@ impl ArborWindow {
 
         match event.keystroke.key.as_str() {
             "escape" => {
-                self.close_create_modal(cx);
+                if self
+                    .create_modal
+                    .as_ref()
+                    .is_some_and(|m| m.host_dropdown_open)
+                {
+                    if let Some(modal) = self.create_modal.as_mut() {
+                        modal.host_dropdown_open = false;
+                    }
+                    cx.notify();
+                } else {
+                    self.close_create_modal(cx);
+                }
                 cx.stop_propagation();
                 return;
             },
@@ -7566,9 +7593,21 @@ impl ArborWindow {
                 return;
             },
             "enter" | "return" => {
-                match active_tab {
-                    CreateModalTab::LocalWorktree => self.submit_create_worktree_modal(cx),
-                    CreateModalTab::RemoteOutpost => self.submit_create_outpost_modal(cx),
+                if active_tab == CreateModalTab::RemoteOutpost
+                    && self
+                        .create_modal
+                        .as_ref()
+                        .is_some_and(|m| m.outpost_active_field == CreateOutpostField::HostSelector)
+                {
+                    self.update_create_outpost_modal_input(
+                        OutpostModalInputEvent::ToggleHostDropdown,
+                        cx,
+                    );
+                } else {
+                    match active_tab {
+                        CreateModalTab::LocalWorktree => self.submit_create_worktree_modal(cx),
+                        CreateModalTab::RemoteOutpost => self.submit_create_outpost_modal(cx),
+                    }
                 }
                 cx.stop_propagation();
                 return;
@@ -10588,6 +10627,7 @@ impl ArborWindow {
                                                     .id(("worktree-row", index))
                                                     .font_family(FONT_MONO)
                                                     .cursor_pointer()
+                                                    .rounded_sm()
                                                     .hover(|this| this.bg(rgb(theme.panel_active_bg)))
                                                     .flex()
                                                     .items_center()
@@ -12830,6 +12870,14 @@ impl ArborWindow {
             })
             .unwrap_or_else(|| "-".to_owned());
         let host_active = modal.outpost_active_field == CreateOutpostField::HostSelector;
+        let host_dropdown_open = modal.host_dropdown_open;
+        let host_names: Vec<(usize, String)> = self
+            .remote_hosts
+            .iter()
+            .enumerate()
+            .map(|(i, h)| (i, h.name.clone()))
+            .collect();
+        let selected_host_index = modal.host_index;
         let clone_url_active = modal.outpost_active_field == CreateOutpostField::CloneUrl;
         let outpost_name_active = modal.outpost_active_field == CreateOutpostField::OutpostName;
         let outpost_branch_preview = derive_branch_name(&modal.outpost_name);
@@ -13188,58 +13236,67 @@ impl ArborWindow {
                                         )
                                         .child(
                                             div()
-                                                .flex()
-                                                .items_center()
-                                                .gap_1()
-                                                .child(
-                                                    div()
-                                                        .id("outpost-host-prev")
-                                                        .cursor_pointer()
-                                                        .text_xs()
-                                                        .text_color(rgb(theme.text_muted))
-                                                        .hover(|this| this.text_color(rgb(theme.text_primary)))
-                                                        .child("\u{25c0}")
-                                                        .on_click(cx.listener(
-                                                            |this, _, _, cx| {
-                                                                this.update_create_outpost_modal_input(
-                                                                    OutpostModalInputEvent::CycleHost(
-                                                                        true,
-                                                                    ),
-                                                                    cx,
-                                                                );
-                                                            },
-                                                        )),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .id("outpost-host-next")
-                                                        .cursor_pointer()
-                                                        .text_xs()
-                                                        .text_color(rgb(theme.text_muted))
-                                                        .hover(|this| this.text_color(rgb(theme.text_primary)))
-                                                        .child("\u{25b6}")
-                                                        .on_click(cx.listener(
-                                                            |this, _, _, cx| {
-                                                                this.update_create_outpost_modal_input(
-                                                                    OutpostModalInputEvent::CycleHost(
-                                                                        false,
-                                                                    ),
-                                                                    cx,
-                                                                );
-                                                            },
-                                                        )),
-                                                ),
+                                                .text_xs()
+                                                .text_color(rgb(theme.text_muted))
+                                                .child(if host_dropdown_open {
+                                                    "\u{25b2}"
+                                                } else {
+                                                    "\u{25bc}"
+                                                }),
                                         ),
                                 )
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.update_create_outpost_modal_input(
-                                        OutpostModalInputEvent::SetActiveField(
-                                            CreateOutpostField::HostSelector,
-                                        ),
+                                        OutpostModalInputEvent::ToggleHostDropdown,
                                         cx,
                                     );
                                 })),
                         )
+                        .when(host_dropdown_open, |this| {
+                            this.child(
+                                div()
+                                    .id("outpost-host-dropdown")
+                                    .rounded_sm()
+                                    .border_1()
+                                    .border_color(rgb(theme.accent))
+                                    .bg(rgb(theme.panel_bg))
+                                    .py_1()
+                                    .max_h(px(200.))
+                                    .overflow_y_scroll()
+                                    .children(host_names.into_iter().map(
+                                        |(index, name)| {
+                                            let is_selected = index == selected_host_index;
+                                            div()
+                                                .id(("host-option", index))
+                                                .cursor_pointer()
+                                                .px_2()
+                                                .py_1()
+                                                .text_sm()
+                                                .font_family(FONT_MONO)
+                                                .rounded_sm()
+                                                .mx_1()
+                                                .text_color(rgb(theme.text_primary))
+                                                .when(is_selected, |this| {
+                                                    this.bg(rgb(theme.panel_active_bg))
+                                                })
+                                                .hover(|this| {
+                                                    this.bg(rgb(theme.panel_active_bg))
+                                                })
+                                                .child(name)
+                                                .on_click(cx.listener(
+                                                    move |this, _, _, cx| {
+                                                        this.update_create_outpost_modal_input(
+                                                            OutpostModalInputEvent::SelectHost(
+                                                                index,
+                                                            ),
+                                                            cx,
+                                                        );
+                                                    },
+                                                ))
+                                        },
+                                    )),
+                            )
+                        })
                         .child(
                             modal_input_field(
                                 theme,
@@ -22796,11 +22853,11 @@ fn create_command(program: &str) -> Command {
     cmd
 }
 
-/// Explicitly set the dock icon from the app bundle's `AppIcon.icns`.
+/// Explicitly set the dock icon.
 ///
-/// GPUI's custom `GPUIApplication` subclass does not call `setApplicationIconImage:`
-/// after transitioning to `NSApplicationActivationPolicyRegular`, so macOS may show
-/// a generic black icon in the Dock even when the bundle contains a valid `.icns`.
+/// When running inside a `.app` bundle, loads the icon from the bundle resources.
+/// When running via `cargo run` (no bundle), falls back to loading the source PNG
+/// from the `assets/` directory so the dock shows the real icon instead of a folder.
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 fn set_dock_icon() {
@@ -22818,6 +22875,19 @@ fn set_dock_icon() {
         let icon: id = NSImage::imageNamed_(nil, icon_name);
         if icon != nil {
             NSApp().setApplicationIconImage_(icon);
+            return;
+        }
+
+        // Fallback for development: load the icon PNG from the source tree.
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let icon_path = format!("{manifest_dir}/../../assets/icons/arbor-icon-1024.png");
+        if let Ok(canonical) = fs::canonicalize(&icon_path) {
+            let path_str = canonical.to_string_lossy();
+            let ns_path = cocoa::foundation::NSString::alloc(nil).init_str(&path_str);
+            let icon: id = NSImage::alloc(nil).initWithContentsOfFile_(ns_path);
+            if icon != nil {
+                NSApp().setApplicationIconImage_(icon);
+            }
         }
     }
 }

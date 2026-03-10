@@ -82,6 +82,15 @@ const TERMINAL_FONT_SIZE_PX: f32 = 15.0;
 const TERMINAL_SCROLLBAR_WIDTH_PX: f32 = 12.0;
 
 const TITLEBAR_HEIGHT: f32 = 34.;
+
+// Left offset for top bar controls. macOS needs space to clear traffic lights,
+// Linux uses a smaller offset since window controls are on the right or
+// handled by server-side decorations.
+#[cfg(target_os = "macos")]
+const TOP_BAR_LEFT_OFFSET: f32 = 76.;
+#[cfg(not(target_os = "macos"))]
+const TOP_BAR_LEFT_OFFSET: f32 = 8.;
+
 const WORKTREE_AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
 const GITHUB_PR_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const GITHUB_DEVICE_FLOW_POLL_MIN_INTERVAL: Duration = Duration::from_secs(5);
@@ -9384,11 +9393,11 @@ impl ArborWindow {
             .relative()
             .flex()
             .items_center()
-            // Left group: sidebar toggle + back/forward navigation (offset to clear macOS traffic lights)
+            // Left group: sidebar toggle + back/forward navigation
             .child(
                 div()
                     .absolute()
-                    .left(px(76.))
+                    .left(px(TOP_BAR_LEFT_OFFSET))
                     .top_0()
                     .bottom_0()
                     .flex()

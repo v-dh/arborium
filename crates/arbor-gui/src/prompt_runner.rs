@@ -331,7 +331,10 @@ mod prompt_runner_tests {
             "--permission-mode".to_owned(),
             "plan".to_owned(),
         ]));
-        assert!(plan.shell_command.contains("it'\"'\"'s-ready"));
+        assert_eq!(
+            tokens.last().map(String::as_str),
+            Some("review branch named it's-ready")
+        );
     }
 
     #[test]

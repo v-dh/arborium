@@ -88,7 +88,7 @@ pub enum RepoConfigError {
     Read {
         path: PathBuf,
         #[source]
-        source: config::ConfigError,
+        source: Box<config::ConfigError>,
     },
 }
 
@@ -108,7 +108,7 @@ pub fn read_repo_config(repo_root: &Path) -> Result<Option<RepoConfig>, RepoConf
         .and_then(|settings| settings.try_deserialize::<RepoConfig>())
         .map_err(|source| RepoConfigError::Read {
             path: path.clone(),
-            source,
+            source: Box::new(source),
         })?;
 
     Ok(Some(config))

@@ -95,22 +95,9 @@ impl SshTerminalShell {
     }
 
     pub(crate) fn snapshot(&self) -> arbor_terminal_emulator::TerminalSnapshot {
-        let (output, styled_lines, cursor, modes) = match self.emulator.lock() {
-            Ok(emulator) => (
-                emulator.snapshot_output(),
-                emulator.collect_styled_lines(),
-                emulator.snapshot_cursor(),
-                emulator.snapshot_modes(),
-            ),
-            Err(poisoned) => {
-                let emulator = poisoned.into_inner();
-                (
-                    emulator.snapshot_output(),
-                    emulator.collect_styled_lines(),
-                    emulator.snapshot_cursor(),
-                    emulator.snapshot_modes(),
-                )
-            },
+        let mut snapshot = match self.emulator.lock() {
+            Ok(emulator) => emulator.snapshot(),
+            Err(poisoned) => poisoned.into_inner().snapshot(),
         };
 
         let is_closed = self
@@ -119,17 +106,12 @@ impl SshTerminalShell {
             .map(|s| s.is_closed() || s.is_eof())
             .unwrap_or(true);
 
-        arbor_terminal_emulator::TerminalSnapshot {
-            output,
-            styled_lines,
-            cursor,
-            modes,
-            exit_code: if is_closed {
-                Some(0)
-            } else {
-                None
-            },
-        }
+        snapshot.exit_code = if is_closed {
+            Some(0)
+        } else {
+            None
+        };
+        snapshot
     }
 
     pub(crate) fn resize(&self, rows: u16, cols: u16) -> Result<(), String> {

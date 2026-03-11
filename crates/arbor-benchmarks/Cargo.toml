@@ -1,0 +1,21 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "arbor-benchmarks"
+version.workspace = true
+
+[features]
+ghostty-vt-experimental = ["arbor-terminal-emulator/ghostty-vt-experimental"]
+
+[dependencies]
+arbor-terminal-emulator = { path = "../arbor-terminal-emulator" }
+
+[dev-dependencies]
+divan = { workspace = true }
+
+[[bench]]
+harness = false
+name = "embedded_terminal"
+
+[lints]
+workspace = true

@@ -17,7 +17,7 @@ use {
         handler::HandlerWithoutStateExt,
         routing::{delete, get, post},
     },
-    std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc},
+    std::{collections::HashMap, env, net::SocketAddr, path::PathBuf, sync::Arc},
     tokio::sync::Mutex,
     tower_http::services::ServeDir,
 };
@@ -67,6 +67,21 @@ fn router(state: AppState) -> Router {
     )
 }
 
+fn configure_embedded_terminal_engine() {
+    let requested = env::var("ARBOR_TERMINAL_ENGINE")
+        .ok()
+        .or_else(load_embedded_terminal_engine_setting);
+    match arbor_terminal_emulator::parse_terminal_engine_kind(requested.as_deref()) {
+        Ok(engine) => arbor_terminal_emulator::set_default_terminal_engine(engine),
+        Err(error) => {
+            tracing::warn!(%error, "invalid embedded terminal engine configuration");
+            arbor_terminal_emulator::set_default_terminal_engine(
+                arbor_terminal_emulator::TerminalEngineKind::default(),
+            );
+        },
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Set up tracing with a broadcast layer so logs can be streamed to the GUI.
@@ -96,6 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load daemon config and ensure auth token exists
     let mut daemon_config = load_daemon_config();
     ensure_auth_token(&mut daemon_config);
+    configure_embedded_terminal_engine();
     let allow_remote = is_public_bind(
         daemon_config.auth_token.as_deref(),
         daemon_config.bind.as_deref(),
@@ -190,7 +206,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     let local_addr = listener.local_addr()?;
-    tracing::info!("arbor-httpd listening on http://{local_addr}");
+    tracing::info!(
+        terminal_engine = arbor_terminal_emulator::default_terminal_engine().as_str(),
+        "arbor-httpd listening on http://{local_addr}",
+    );
 
     // Announce on the local network via mDNS — hold handle to keep registration alive
     #[cfg(feature = "mdns")]
@@ -350,7 +369,7 @@ mod tests {
     }
 
     async fn create_raw_echo_session(state: &AppState, session_id: &str) -> String {
-        let cwd = match std::env::current_dir() {
+        let cwd = match env::current_dir() {
             Ok(cwd) => cwd,
             Err(error) => panic!("failed to read current directory: {error}"),
         };

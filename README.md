@@ -37,6 +37,7 @@ It gives you one place to manage repositories, parallel worktrees, embedded term
 - Built-in PTY terminal with truecolor and `xterm-256color` support
 - Multiple terminal tabs per worktree
 - Alternative backends: Alacritty, Ghostty
+- Experimental embedded `libghostty-vt` engine behind a compile-time feature flag
 - Persistent daemon-based sessions (survive app restarts)
 - Session attach/detach and signals (interrupt/terminate/kill)
 
@@ -195,6 +196,65 @@ sudo apt-get install -y libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev
 ```
 
 Then install the [CaskaydiaMono Nerd Font](https://www.nerdfonts.com/font-downloads) to `~/.local/share/fonts/`.
+
+### Experimental Ghostty VT Engine
+
+Arbor can also be built with an experimental embedded Ghostty terminal engine.
+This is opt-in, disabled by default, and currently expects:
+
+- the pinned `vendor/ghostty` submodule checked out
+- `zig` on `PATH`
+- a prebuilt `arbor_ghostty_vt_bridge` shared library in `target/ghostty-vt-bridge/lib`
+- optionally, `ARBOR_GHOSTTY_SRC=/path/to/ghostty` to override the pinned submodule
+
+With a build that includes `--features ghostty-vt-experimental`, you can pick
+the embedded engine in `~/.config/arbor/config.toml`:
+
+```toml
+terminal_backend = "embedded"
+embedded_terminal_engine = "ghostty-vt-experimental"
+```
+
+Example:
+
+```bash
+git submodule update --init --recursive vendor/ghostty
+just ghostty-vt-bridge
+RUSTFLAGS="-L native=$(pwd)/target/ghostty-vt-bridge/lib -C link-arg=-Wl,-rpath,$(pwd)/target/ghostty-vt-bridge/lib" \
+  cargo +nightly-2025-11-30 run -p arbor-gui --features ghostty-vt-experimental
+```
+
+To run Arbor with both embedded engines available and let `config.toml` choose:
+
+```bash
+git submodule update --init --recursive vendor/ghostty
+just run-configured-embedded-engine
+```
+
+To run the experimental checks:
+
+```bash
+git submodule update --init --recursive vendor/ghostty
+just test-ghostty-vt
+just check-ghostty-vt-gui
+just check-ghostty-vt-httpd
+```
+
+To compare the embedded engine performance:
+
+```bash
+git submodule update --init --recursive vendor/ghostty
+just bench-embedded-terminal-engines
+```
+
+To build the daemon with the same terminal engine:
+
+```bash
+git submodule update --init --recursive vendor/ghostty
+just ghostty-vt-bridge
+RUSTFLAGS="-L native=$(pwd)/target/ghostty-vt-bridge/lib -C link-arg=-Wl,-rpath,$(pwd)/target/ghostty-vt-bridge/lib" \
+  cargo +nightly-2025-11-30 run -p arbor-httpd --features ghostty-vt-experimental
+```
 
 ## Similar Tools
 

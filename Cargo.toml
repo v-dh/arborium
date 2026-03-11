@@ -1,6 +1,7 @@
 [workspace]
 default-members = ["crates/arbor-core", "crates/arbor-gui", "crates/arbor-httpd"]
 members = [
+  "crates/arbor-benchmarks",
   "crates/arbor-daemon-client",
   "crates/arbor-core",
   "crates/arbor-gui",
@@ -33,6 +34,7 @@ anyhow             = "1"
 axum               = "0.8.4"
 cocoa              = "0.26"
 config             = "0.15.19"
+divan              = { package = "codspeed-divan-compat", version = "4.3" }
 futures            = "0.3"
 git2               = "0.20"
 gix                = "0.80.0"

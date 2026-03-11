@@ -33,12 +33,67 @@ lint: lockfile-check
     cargo +{{nightly_toolchain}} clippy --workspace --all-features --all-targets -- -D warnings
 
 test:
-    cargo +{{nightly_toolchain}} test --workspace --all-features
+    cargo +{{nightly_toolchain}} test --workspace
+
+ghostty-vt-bridge:
+    ./scripts/build-ghostty-vt-bridge.sh
+
+test-ghostty-vt: ghostty-vt-bridge
+    RUSTFLAGS="-L native=$(pwd)/target/ghostty-vt-bridge/lib -C link-arg=-Wl,-rpath,$(pwd)/target/ghostty-vt-bridge/lib ${RUSTFLAGS:-}" cargo +{{nightly_toolchain}} test -p arbor-terminal-emulator --features ghostty-vt-experimental
+
+check-ghostty-vt-gui: ghostty-vt-bridge
+    RUSTFLAGS="-L native=$(pwd)/target/ghostty-vt-bridge/lib -C link-arg=-Wl,-rpath,$(pwd)/target/ghostty-vt-bridge/lib ${RUSTFLAGS:-}" cargo +{{nightly_toolchain}} check -p arbor-gui --features ghostty-vt-experimental
+
+check-ghostty-vt-httpd: ghostty-vt-bridge
+    RUSTFLAGS="-L native=$(pwd)/target/ghostty-vt-bridge/lib -C link-arg=-Wl,-rpath,$(pwd)/target/ghostty-vt-bridge/lib ${RUSTFLAGS:-}" cargo +{{nightly_toolchain}} check -p arbor-httpd --features ghostty-vt-experimental
+
+bench-embedded-terminal-engines: ghostty-vt-bridge
+    RUSTFLAGS="-L native=$(pwd)/target/ghostty-vt-bridge/lib -C link-arg=-Wl,-rpath,$(pwd)/target/ghostty-vt-bridge/lib ${RUSTFLAGS:-}" cargo +{{nightly_toolchain}} test -p arbor-terminal-emulator --features ghostty-vt-experimental --test engine_performance -- --ignored --nocapture
+
+bench-embedded-terminal-codspeed: ghostty-vt-bridge
+    RUSTFLAGS="-L native=$(pwd)/target/ghostty-vt-bridge/lib -C link-arg=-Wl,-rpath,$(pwd)/target/ghostty-vt-bridge/lib ${RUSTFLAGS:-}" cargo +{{nightly_toolchain}} bench -p arbor-benchmarks --features ghostty-vt-experimental --bench embedded_terminal
 
 zizmor:
     zizmor .github/workflows/
 
 ci: format-check lint test
+
+run-configured-embedded-engine port="": web-ui-build-if-needed ghostty-vt-bridge
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -z "{{port}}" ]; then
+      DAEMON_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()')
+    else
+      DAEMON_PORT="{{port}}"
+    fi
+    echo "daemon port: $DAEMON_PORT"
+    export ARBOR_DAEMON_URL="http://127.0.0.1:${DAEMON_PORT}"
+    export ARBOR_HTTPD_PORT="${DAEMON_PORT}"
+    export RUSTFLAGS="-L native=$(pwd)/target/ghostty-vt-bridge/lib -C link-arg=-Wl,-rpath,$(pwd)/target/ghostty-vt-bridge/lib ${RUSTFLAGS:-}"
+    cargo +{{nightly_toolchain}} run -p arbor-httpd --features ghostty-vt-experimental &
+    HTTPD_PID=$!
+    trap "kill $HTTPD_PID 2>/dev/null" EXIT
+    cargo +{{nightly_toolchain}} run -p arbor-gui --features ghostty-vt-experimental
+    kill $HTTPD_PID 2>/dev/null || true
+
+run-ghostty-vt port="": web-ui-build-if-needed ghostty-vt-bridge
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -z "{{port}}" ]; then
+      DAEMON_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()')
+    else
+      DAEMON_PORT="{{port}}"
+    fi
+    echo "daemon port: $DAEMON_PORT"
+    export ARBOR_DAEMON_URL="http://127.0.0.1:${DAEMON_PORT}"
+    export ARBOR_HTTPD_PORT="${DAEMON_PORT}"
+    export ARBOR_TERMINAL_ENGINE="ghostty-vt-experimental"
+    export RUSTFLAGS="-L native=$(pwd)/target/ghostty-vt-bridge/lib -C link-arg=-Wl,-rpath,$(pwd)/target/ghostty-vt-bridge/lib ${RUSTFLAGS:-}"
+    cargo +{{nightly_toolchain}} run -p arbor-httpd --features ghostty-vt-experimental &
+    HTTPD_PID=$!
+    trap "kill $HTTPD_PID 2>/dev/null" EXIT
+    cargo +{{nightly_toolchain}} run -p arbor-gui --features ghostty-vt-experimental
+    kill $HTTPD_PID 2>/dev/null || true
 
 run port="": web-ui-build-if-needed
     #!/usr/bin/env bash

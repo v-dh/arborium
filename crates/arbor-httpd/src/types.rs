@@ -230,6 +230,12 @@ pub(crate) struct DaemonConfig {
     pub(crate) bind: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct RootConfig {
+    embedded_terminal_engine: Option<String>,
+}
+
 pub(crate) fn daemon_config_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_owned());
     PathBuf::from(home).join(".config/arbor/config.toml")
@@ -251,6 +257,28 @@ pub(crate) fn load_daemon_config() -> DaemonConfig {
             config
         },
         Err(_) => DaemonConfig::default(),
+    }
+}
+
+pub(crate) fn load_embedded_terminal_engine_setting() -> Option<String> {
+    let path = daemon_config_path();
+    if !path.exists() {
+        return None;
+    }
+
+    let settings = config::Config::builder()
+        .add_source(config::File::from(path.as_path()).required(false))
+        .build();
+    match settings {
+        Ok(s) => s
+            .try_deserialize::<RootConfig>()
+            .ok()
+            .and_then(|config| config.embedded_terminal_engine)
+            .and_then(|value| {
+                let trimmed = value.trim();
+                (!trimmed.is_empty()).then_some(trimmed.to_owned())
+            }),
+        Err(_) => None,
     }
 }
 

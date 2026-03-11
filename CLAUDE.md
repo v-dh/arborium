@@ -31,6 +31,7 @@ Always run these checks before committing and fix any issues:
 3. `just test` — all tests must pass
 
 If any check fails, fix the issue, then commit the fix.
+Never skip `just format` or `just lint` before a commit, even for small changes.
 
 ## Git Workflow
 

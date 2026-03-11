@@ -12,7 +12,8 @@ This file defines how coding agents should behave in this repository.
 
 1. Read this file at task start.
 2. Prefer `just` recipes for common tasks.
-3. Before handoff, run relevant checks for touched code.
+3. Before committing code, always run `just format` and `just lint` and fix any failures.
+4. Before handoff, run relevant checks for touched code.
 
 ## Commands
 
@@ -88,4 +89,3 @@ All dependency versions live in the root `Cargo.toml` `[workspace.dependencies]`
 | `arbor-ssh` | SSH shell backend (optional) |
 | `arbor-terminal-emulator` | Terminal emulation layer |
 | `arbor-web-ui` | TypeScript dashboard assets + helper crate |
-

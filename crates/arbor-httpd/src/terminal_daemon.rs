@@ -309,14 +309,15 @@ impl LiveSession {
 
         let (styled_lines, cursor, modes) = {
             let emulator = lock_or_recover(&self.emulator);
-            let mut styled_lines = emulator.collect_styled_lines();
+            let snapshot = emulator.snapshot();
+            let mut styled_lines = snapshot.styled_lines;
             let keep_from = if max_lines == 0 {
                 0
             } else {
                 styled_lines.len().saturating_sub(max_lines)
             };
 
-            let cursor = emulator.snapshot_cursor().and_then(|cursor| {
+            let cursor = snapshot.cursor.and_then(|cursor| {
                 (cursor.line >= keep_from).then_some(DaemonTerminalCursor {
                     line: cursor.line - keep_from,
                     column: cursor.column,
@@ -327,14 +328,13 @@ impl LiveSession {
                 styled_lines.drain(..keep_from);
             }
 
-            let modes = emulator.snapshot_modes();
             (
                 styled_lines
                     .into_iter()
                     .map(convert_styled_line)
                     .collect::<Vec<_>>(),
                 cursor,
-                convert_terminal_modes(modes),
+                convert_terminal_modes(snapshot.modes),
             )
         };
 

@@ -123,6 +123,25 @@ fn find_ui_icons_dir() -> Option<PathBuf> {
         .clone()
 }
 
+fn resolve_embedded_terminal_engine(
+    configured: Option<&str>,
+    notices: &mut Vec<String>,
+) -> arbor_terminal_emulator::TerminalEngineKind {
+    let requested = env::var("ARBOR_TERMINAL_ENGINE").ok();
+    match arbor_terminal_emulator::parse_terminal_engine_kind(requested.as_deref().or(configured)) {
+        Ok(engine) => {
+            arbor_terminal_emulator::set_default_terminal_engine(engine);
+            engine
+        },
+        Err(error) => {
+            notices.push(error);
+            let engine = arbor_terminal_emulator::TerminalEngineKind::default();
+            arbor_terminal_emulator::set_default_terminal_engine(engine);
+            engine
+        },
+    }
+}
+
 struct ArborAssets {
     base: PathBuf,
 }
@@ -356,6 +375,14 @@ impl ArborWindow {
                         TerminalBackendKind::Embedded
                     },
                 };
+                let embedded_terminal_engine = resolve_embedded_terminal_engine(
+                    loaded_config.config.embedded_terminal_engine.as_deref(),
+                    &mut notice_parts,
+                );
+                tracing::info!(
+                    terminal_engine = embedded_terminal_engine.as_str(),
+                    "configured embedded terminal engine",
+                );
                 let theme_kind = match parse_theme_kind(loaded_config.config.theme.as_deref()) {
                     Ok(kind) => kind,
                     Err(err) => {
@@ -691,6 +718,14 @@ impl ArborWindow {
                     TerminalBackendKind::Embedded
                 },
             };
+        let embedded_terminal_engine = resolve_embedded_terminal_engine(
+            loaded_config.config.embedded_terminal_engine.as_deref(),
+            &mut notice_parts,
+        );
+        tracing::info!(
+            terminal_engine = embedded_terminal_engine.as_str(),
+            "configured embedded terminal engine",
+        );
         let theme_kind = match parse_theme_kind(loaded_config.config.theme.as_deref()) {
             Ok(kind) => kind,
             Err(error) => {
@@ -1121,6 +1156,19 @@ impl ArborWindow {
                 }
             },
             Err(error) => notices.push(error),
+        }
+
+        let previous_engine = arbor_terminal_emulator::default_terminal_engine();
+        let next_engine = resolve_embedded_terminal_engine(
+            loaded.config.embedded_terminal_engine.as_deref(),
+            &mut notices,
+        );
+        if previous_engine != next_engine {
+            tracing::info!(
+                terminal_engine = next_engine.as_str(),
+                "updated embedded terminal engine",
+            );
+            changed = true;
         }
 
         if self.configured_embedded_shell != loaded.config.embedded_shell {

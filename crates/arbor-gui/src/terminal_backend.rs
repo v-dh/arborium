@@ -168,22 +168,9 @@ impl EmbeddedTerminal {
     }
 
     pub fn snapshot(&self) -> EmbeddedSnapshot {
-        let (output, styled_lines, cursor, modes) = match self.emulator.lock() {
-            Ok(emulator) => (
-                emulator.snapshot_output(),
-                emulator.collect_styled_lines(),
-                emulator.snapshot_cursor(),
-                emulator.snapshot_modes(),
-            ),
-            Err(poisoned) => {
-                let emulator = poisoned.into_inner();
-                (
-                    emulator.snapshot_output(),
-                    emulator.collect_styled_lines(),
-                    emulator.snapshot_cursor(),
-                    emulator.snapshot_modes(),
-                )
-            },
+        let snapshot = match self.emulator.lock() {
+            Ok(emulator) => emulator.snapshot(),
+            Err(poisoned) => poisoned.into_inner().snapshot(),
         };
         let exit_code = match self.exit_code.lock() {
             Ok(code) => *code,
@@ -191,10 +178,10 @@ impl EmbeddedTerminal {
         };
 
         EmbeddedSnapshot {
-            output,
-            styled_lines,
-            cursor,
-            modes,
+            output: snapshot.output,
+            styled_lines: snapshot.styled_lines,
+            cursor: snapshot.cursor,
+            modes: snapshot.modes,
             exit_code,
         }
     }

@@ -44,6 +44,15 @@ else
   echo "note: arbor-mcp not found at ${MCP_PATH}, skipping bundle"
 fi
 
+# Bundle arbor CLI for scripting and automation.
+CLI_PATH="$(dirname "${BINARY_PATH}")/arbor"
+if [[ -f "${CLI_PATH}" ]]; then
+  install -m 0755 "${CLI_PATH}" "${STAGING_DIR}/bin/arbor"
+  echo "bundled arbor CLI from ${CLI_PATH}"
+else
+  echo "note: arbor CLI not found at ${CLI_PATH}, skipping bundle"
+fi
+
 # Bundle web UI assets for arbor-httpd.
 WEB_UI_DIST="${ROOT_DIR}/crates/arbor-web-ui/app/dist"
 if [[ -d "${WEB_UI_DIST}" ]]; then

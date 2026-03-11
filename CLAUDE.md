@@ -96,6 +96,7 @@ When adding or modifying UI, use `screencapture -x /tmp/screenshot.png` to take 
 
 | Crate | Description |
 |-------|-------------|
+| `arbor-cli` | Command-line interface (`arbor` binary) for scripting and automation |
 | `arbor-core` | Worktree primitives, change detection, agent hooks, shared types (`SessionId`, `WorkspaceId`, `ResultExt`) |
 | `arbor-daemon-client` | HTTP client for talking to arbor-httpd |
 | `arbor-gui` | GPUI desktop app (`Arbor` binary) |

@@ -159,6 +159,8 @@ jobs:
           cargo +${{ env.NIGHTLY_TOOLCHAIN }} build --locked --release -p arbor-httpd --features vendored-openssl --target x86_64-apple-darwin
           cargo +${{ env.NIGHTLY_TOOLCHAIN }} build --locked --release -p arbor-mcp --features stdio-server,vendored-openssl --target aarch64-apple-darwin
           cargo +${{ env.NIGHTLY_TOOLCHAIN }} build --locked --release -p arbor-mcp --features stdio-server,vendored-openssl --target x86_64-apple-darwin
+          cargo +${{ env.NIGHTLY_TOOLCHAIN }} build --locked --release -p arbor-cli --features vendored-openssl --target aarch64-apple-darwin
+          cargo +${{ env.NIGHTLY_TOOLCHAIN }} build --locked --release -p arbor-cli --features vendored-openssl --target x86_64-apple-darwin
       - name: Build web UI assets
         working-directory: crates/arbor-web-ui/app
         run: npm ci --no-audit --no-fund && npm run build
@@ -180,6 +182,10 @@ jobs:
             target/aarch64-apple-darwin/release/arbor-mcp \
             target/x86_64-apple-darwin/release/arbor-mcp \
             -output dist/arbor-mcp
+          lipo -create \
+            target/aarch64-apple-darwin/release/arbor \
+            target/x86_64-apple-darwin/release/arbor \
+            -output dist/arbor
           ./scripts/ci/package-macos.sh "$TAG" "universal2-apple-darwin" "dist/Arbor" "dist"
       - name: Import signing certificate
         if: env.MACOS_CERTIFICATE != ''
@@ -230,6 +236,8 @@ jobs:
             exit 1
           fi
 
+          CLI_BIN="${APP_PATH}/Contents/MacOS/arbor"
+
           /usr/bin/codesign --force --timestamp --options runtime \
               --entitlements packaging/macos/Arbor.entitlements \
               --sign "$IDENTITY" \
@@ -239,6 +247,13 @@ jobs:
               --entitlements packaging/macos/Arbor.entitlements \
               --sign "$IDENTITY" \
               "${MCP_BIN}" -v
+
+          if [[ -f "${CLI_BIN}" ]]; then
+            /usr/bin/codesign --force --timestamp --options runtime \
+                --entitlements packaging/macos/Arbor.entitlements \
+                --sign "$IDENTITY" \
+                "${CLI_BIN}" -v
+          fi
 
           /usr/bin/codesign --force --timestamp --options runtime \
               --entitlements packaging/macos/Arbor.entitlements \
@@ -371,6 +386,7 @@ jobs:
           cargo +${{ env.NIGHTLY_TOOLCHAIN }} build --locked --release -p arbor-gui --features vendored-openssl --target "$TARGET"
           cargo +${{ env.NIGHTLY_TOOLCHAIN }} build --locked --release -p arbor-httpd --features vendored-openssl --target "$TARGET"
           cargo +${{ env.NIGHTLY_TOOLCHAIN }} build --locked --release -p arbor-mcp --features stdio-server,vendored-openssl --target "$TARGET"
+          cargo +${{ env.NIGHTLY_TOOLCHAIN }} build --locked --release -p arbor-cli --features vendored-openssl --target "$TARGET"
       - name: Build web UI assets
         working-directory: crates/arbor-web-ui/app
         run: npm ci --no-audit --no-fund && npm run build
@@ -410,6 +426,7 @@ jobs:
           cargo +${{ env.NIGHTLY_TOOLCHAIN }} build --locked --release -p arbor-gui --features vendored-openssl --target x86_64-pc-windows-msvc
           cargo +${{ env.NIGHTLY_TOOLCHAIN }} build --locked --release -p arbor-httpd --features vendored-openssl --target x86_64-pc-windows-msvc
           cargo +${{ env.NIGHTLY_TOOLCHAIN }} build --locked --release -p arbor-mcp --features stdio-server,vendored-openssl --target x86_64-pc-windows-msvc
+          cargo +${{ env.NIGHTLY_TOOLCHAIN }} build --locked --release -p arbor-cli --features vendored-openssl --target x86_64-pc-windows-msvc
       - name: Build web UI assets
         working-directory: crates/arbor-web-ui/app
         run: npm ci --no-audit --no-fund && npm run build

@@ -1,0 +1,23 @@
+[package]
+name = "arbor-cli"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "arbor"
+path = "src/main.rs"
+
+[features]
+vendored-openssl = ["arbor-core/vendored-openssl"]
+
+[dependencies]
+arbor-core          = { path = "../arbor-core" }
+arbor-daemon-client = { path = "../arbor-daemon-client" }
+clap                = { workspace = true }
+serde               = { workspace = true }
+serde_json          = { workspace = true }
+
+[lints]
+workspace = true

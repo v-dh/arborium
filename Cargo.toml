@@ -2,6 +2,7 @@
 default-members = ["crates/arbor-core", "crates/arbor-gui", "crates/arbor-httpd"]
 members = [
   "crates/arbor-benchmarks",
+  "crates/arbor-cli",
   "crates/arbor-daemon-client",
   "crates/arbor-core",
   "crates/arbor-gui",
@@ -75,4 +76,5 @@ schemars           = "1.0"
 toml               = "0.8"
 cron               = "0.15"
 chrono             = "0.4"
+clap               = { version = "4", features = ["derive"] }
 ureq               = "3"

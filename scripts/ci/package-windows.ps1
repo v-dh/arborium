@@ -31,6 +31,13 @@ if (Test-Path $McpPath) {
   Write-Output "bundled arbor-mcp from $McpPath"
 }
 
+# Bundle arbor CLI for scripting and automation
+$CliPath = Join-Path (Split-Path $BinaryPath) 'arbor.exe'
+if (Test-Path $CliPath) {
+  Copy-Item -Path $CliPath -Destination (Join-Path $BinDir 'arbor.exe') -Force
+  Write-Output "bundled arbor CLI from $CliPath"
+}
+
 # Bundle web UI assets
 $WebUiDist = Join-Path $PSScriptRoot '..\..\crates\arbor-web-ui\app\dist'
 if (Test-Path $WebUiDist) {

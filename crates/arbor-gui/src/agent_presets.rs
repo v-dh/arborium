@@ -127,7 +127,18 @@ impl ArborWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let command = self.preset_command_for_kind(preset).trim().to_owned();
+        let command = match command_for_execution_mode(
+            preset,
+            &self.preset_command_for_kind(preset),
+            self.execution_mode,
+        ) {
+            Ok(command) => command,
+            Err(error) => {
+                self.notice = Some(error);
+                cx.notify();
+                return;
+            },
+        };
         self.active_preset_tab = Some(preset);
         if command.is_empty() {
             self.notice = Some(format!("{} preset command is empty", preset.label()));
@@ -157,12 +168,40 @@ impl ArborWindow {
             .iter_mut()
             .find(|session| session.id == session_id)
         {
+            session.agent_preset = Some(preset);
+            session.execution_mode = Some(self.execution_mode);
             session.last_command = Some(command);
             session.pending_command.clear();
             session.updated_at_unix_ms = current_unix_timestamp_millis();
         }
 
         self.sync_daemon_session_store(cx);
+        cx.notify();
+    }
+
+    fn set_execution_mode(
+        &mut self,
+        mode: ExecutionMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.execution_mode == mode {
+            return;
+        }
+
+        self.execution_mode = mode;
+        if let Some(session_id) = self.active_center_tab_for_selected_worktree().and_then(|tab| {
+            match tab {
+                CenterTab::Terminal(session_id) => Some(session_id),
+                _ => None,
+            }
+        }) && let Some(session) = self.terminals.iter_mut().find(|session| session.id == session_id)
+        {
+            session.execution_mode = Some(mode);
+        }
+
+        self.notice = Some(format!("execution mode set to {}", mode.label()));
+        self.sync_ui_state_store(window);
         cx.notify();
     }
 

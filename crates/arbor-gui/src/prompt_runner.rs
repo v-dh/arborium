@@ -9,17 +9,71 @@ struct PromptExecutionPlan {
     shell_command: String,
 }
 
-fn build_prompt_execution_plan(
+fn command_for_execution_mode(
     preset: AgentPresetKind,
     configured_command: &str,
-    prompt: &str,
-    mode: PromptExecutionMode,
-) -> Result<PromptExecutionPlan, String> {
+    execution_mode: ExecutionMode,
+) -> Result<String, String> {
     let configured_command = configured_command.trim();
     if configured_command.is_empty() {
         return Err(format!("{} preset command is empty", preset.label()));
     }
 
+    let mut tokens = shlex::split(configured_command)
+        .ok_or_else(|| format!("failed to parse {} preset command", preset.label()))?;
+    strip_execution_mode_flags(preset, &mut tokens);
+
+    match preset {
+        AgentPresetKind::Claude => match execution_mode {
+            ExecutionMode::Plan => {
+                tokens.push("--permission-mode".to_owned());
+                tokens.push("plan".to_owned());
+            },
+            ExecutionMode::Build => {
+                tokens.push("--permission-mode".to_owned());
+                tokens.push("acceptEdits".to_owned());
+            },
+            ExecutionMode::Yolo => {
+                tokens.push("--dangerously-skip-permissions".to_owned());
+            },
+        },
+        AgentPresetKind::Codex => match execution_mode {
+            ExecutionMode::Plan => {
+                tokens.push("-a".to_owned());
+                tokens.push("on-request".to_owned());
+                tokens.push("-s".to_owned());
+                tokens.push("read-only".to_owned());
+            },
+            ExecutionMode::Build => {
+                tokens.push("--full-auto".to_owned());
+            },
+            ExecutionMode::Yolo => {
+                tokens.push("--dangerously-bypass-approvals-and-sandbox".to_owned());
+            },
+        },
+        AgentPresetKind::Copilot => match execution_mode {
+            ExecutionMode::Plan => {},
+            ExecutionMode::Build => {
+                tokens.push("--allow-all-tools".to_owned());
+            },
+            ExecutionMode::Yolo => {
+                tokens.push("--yolo".to_owned());
+            },
+        },
+        AgentPresetKind::Pi | AgentPresetKind::OpenCode => {},
+    }
+
+    Ok(join_shell_tokens(&tokens))
+}
+
+fn build_prompt_execution_plan(
+    preset: AgentPresetKind,
+    configured_command: &str,
+    prompt: &str,
+    execution_mode: ExecutionMode,
+    mode: PromptExecutionMode,
+) -> Result<PromptExecutionPlan, String> {
+    let configured_command = command_for_execution_mode(preset, configured_command, execution_mode)?;
     let prompt = prompt.trim();
     if prompt.is_empty() {
         return Err("prompt cannot be empty".to_owned());
@@ -37,10 +91,7 @@ fn build_prompt_execution_plan(
                 format!("{configured_command} run {}", shell_quote(prompt))
             },
             AgentPresetKind::Copilot => {
-                format!(
-                    "{configured_command} --allow-all-tools -p {} -s",
-                    shell_quote(prompt)
-                )
+                format!("{configured_command} -p {} -s", shell_quote(prompt))
             },
             AgentPresetKind::Pi => {
                 return Err(format!(
@@ -62,12 +113,14 @@ fn run_prompt_capture(
     preset: AgentPresetKind,
     configured_command: &str,
     prompt: &str,
+    execution_mode: ExecutionMode,
     operation: &str,
 ) -> Result<String, String> {
     let plan = build_prompt_execution_plan(
         preset,
         configured_command,
         prompt,
+        execution_mode,
         PromptExecutionMode::CaptureOutput,
     )?;
     let mut command = shell_expression_command(&plan.shell_command);
@@ -90,14 +143,96 @@ fn prompt_terminal_invocation(
     preset: AgentPresetKind,
     configured_command: &str,
     prompt: &str,
+    execution_mode: ExecutionMode,
 ) -> Result<String, String> {
     build_prompt_execution_plan(
         preset,
         configured_command,
         prompt,
+        execution_mode,
         PromptExecutionMode::TerminalSession,
     )
     .map(|plan| plan.shell_command)
+}
+
+fn strip_execution_mode_flags(preset: AgentPresetKind, tokens: &mut Vec<String>) {
+    match preset {
+        AgentPresetKind::Claude => {
+            *tokens = strip_tokens(
+                tokens,
+                &[
+                    ("--permission-mode", true),
+                    ("--dangerously-skip-permissions", false),
+                    ("--allow-dangerously-skip-permissions", false),
+                ],
+            );
+        },
+        AgentPresetKind::Codex => {
+            *tokens = strip_tokens(
+                tokens,
+                &[
+                    ("--dangerously-bypass-approvals-and-sandbox", false),
+                    ("--full-auto", false),
+                    ("-a", true),
+                    ("--ask-for-approval", true),
+                    ("-s", true),
+                    ("--sandbox", true),
+                ],
+            );
+        },
+        AgentPresetKind::Copilot => {
+            *tokens = strip_tokens(
+                tokens,
+                &[
+                    ("--yolo", false),
+                    ("--allow-all", false),
+                    ("--allow-all-tools", false),
+                    ("--allow-all-paths", false),
+                    ("--allow-all-urls", false),
+                ],
+            );
+        },
+        AgentPresetKind::Pi | AgentPresetKind::OpenCode => {},
+    }
+}
+
+fn strip_tokens(tokens: &[String], flags: &[(&str, bool)]) -> Vec<String> {
+    let mut stripped = Vec::with_capacity(tokens.len());
+    let mut index = 0usize;
+
+    while let Some(token) = tokens.get(index) {
+        let mut matched = false;
+        for (flag, takes_value) in flags {
+            if token == flag {
+                matched = true;
+                index += 1 + usize::from(*takes_value);
+                break;
+            }
+            let inline = format!("{flag}=");
+            if token.starts_with(&inline) {
+                matched = true;
+                index += 1;
+                break;
+            }
+        }
+
+        if matched {
+            continue;
+        }
+
+        stripped.push(token.clone());
+        index += 1;
+    }
+
+    stripped
+}
+
+fn join_shell_tokens(tokens: &[String]) -> String {
+    tokens
+        .iter()
+        .map(|token| shell_quote(token))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(target_os = "windows")]
@@ -124,11 +259,20 @@ mod prompt_runner_tests {
             AgentPresetKind::Codex,
             "codex --model gpt-5",
             "summarize the diff",
+            ExecutionMode::Build,
             PromptExecutionMode::CaptureOutput,
         )
         .unwrap_or_else(|error| panic!("plan should build: {error}"));
 
-        assert!(plan.shell_command.contains("codex --model gpt-5 exec "));
+        let tokens = shlex::split(&plan.shell_command)
+            .unwrap_or_else(|| panic!("shell command should split"));
+        assert!(tokens.starts_with(&[
+            "codex".to_owned(),
+            "--model".to_owned(),
+            "gpt-5".to_owned(),
+            "--full-auto".to_owned(),
+            "exec".to_owned(),
+        ]));
     }
 
     #[test]
@@ -137,6 +281,7 @@ mod prompt_runner_tests {
             AgentPresetKind::Pi,
             "pi",
             "summarize the diff",
+            ExecutionMode::Build,
             PromptExecutionMode::CaptureOutput,
         )
         .err()
@@ -151,12 +296,21 @@ mod prompt_runner_tests {
             AgentPresetKind::Copilot,
             "copilot --model gpt-5.2",
             "summarize the diff",
+            ExecutionMode::Build,
             PromptExecutionMode::CaptureOutput,
         )
         .unwrap_or_else(|error| panic!("plan should build: {error}"));
 
-        assert!(plan.shell_command.contains("copilot --model gpt-5.2 --allow-all-tools -p "));
-        assert!(plan.shell_command.ends_with(" -s"));
+        let tokens = shlex::split(&plan.shell_command)
+            .unwrap_or_else(|| panic!("shell command should split"));
+        assert!(tokens.starts_with(&[
+            "copilot".to_owned(),
+            "--model".to_owned(),
+            "gpt-5.2".to_owned(),
+            "--allow-all-tools".to_owned(),
+            "-p".to_owned(),
+        ]));
+        assert_eq!(tokens.last().map(String::as_str), Some("-s"));
     }
 
     #[test]
@@ -165,11 +319,32 @@ mod prompt_runner_tests {
             AgentPresetKind::Claude,
             "claude --dangerously-skip-permissions",
             "review branch named it's-ready",
+            ExecutionMode::Plan,
             PromptExecutionMode::TerminalSession,
         )
         .unwrap_or_else(|error| panic!("plan should build: {error}"));
 
-        assert!(plan.shell_command.contains("claude --dangerously-skip-permissions "));
+        let tokens = shlex::split(&plan.shell_command)
+            .unwrap_or_else(|| panic!("shell command should split"));
+        assert!(tokens.starts_with(&[
+            "claude".to_owned(),
+            "--permission-mode".to_owned(),
+            "plan".to_owned(),
+        ]));
         assert!(plan.shell_command.contains("it'\"'\"'s-ready"));
+    }
+
+    #[test]
+    fn yolo_mode_rewrites_codex_permissions() {
+        let command = command_for_execution_mode(
+            AgentPresetKind::Codex,
+            "codex --full-auto -a on-request -s read-only",
+            ExecutionMode::Yolo,
+        )
+        .unwrap_or_else(|error| panic!("command should build: {error}"));
+
+        assert!(command.contains("--dangerously-bypass-approvals-and-sandbox"));
+        assert!(!command.contains("--full-auto"));
+        assert!(!command.contains("read-only"));
     }
 }

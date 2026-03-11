@@ -149,6 +149,7 @@ impl ArborWindow {
         let can_run_actions = self.can_run_local_git_actions();
         let is_busy = self.git_action_in_flight.is_some();
         let commit_enabled = can_run_actions && !is_busy && !self.changed_files.is_empty();
+        let stacked_pr_enabled = can_run_actions && !is_busy && !self.changed_files.is_empty();
         let push_enabled = can_run_actions && !is_busy;
         let pr_enabled = can_run_actions && !is_busy;
         let search_lower = self.right_pane_search.to_lowercase();
@@ -196,6 +197,22 @@ impl ArborWindow {
                                     self.git_action_in_flight == Some(GitActionKind::Commit),
                                 )
                                 .when(commit_enabled, |this| {
+                                    this.on_click(cx.listener(|this, _, _, cx| {
+                                        this.open_commit_modal(cx);
+                                    }))
+                                }),
+                            )
+                            .child(
+                                git_action_button(
+                                    theme,
+                                    "changes-action-stacked-pr",
+                                    GIT_ACTION_ICON_PR,
+                                    "Ship PR",
+                                    stacked_pr_enabled,
+                                    self.git_action_in_flight
+                                        == Some(GitActionKind::CommitPushCreatePullRequest),
+                                )
+                                .when(stacked_pr_enabled, |this| {
                                     this.on_click(cx.listener(|this, _, _, cx| {
                                         this.open_commit_modal(cx);
                                     }))

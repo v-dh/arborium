@@ -199,6 +199,7 @@ dependencies = [
  "ropey",
  "serde",
  "serde_json",
+ "shlex",
  "smol",
  "syntect",
  "tokio",

@@ -45,9 +45,15 @@ impl WorktreeScriptContext {
 #[derive(Debug, Error)]
 pub enum WorktreeScriptError {
     #[error(transparent)]
-    RepoConfig(#[from] repo_config::RepoConfigError),
+    RepoConfig(Box<repo_config::RepoConfigError>),
     #[error("{message}")]
     CommandFailed { message: String },
+}
+
+impl From<repo_config::RepoConfigError> for WorktreeScriptError {
+    fn from(error: repo_config::RepoConfigError) -> Self {
+        Self::RepoConfig(Box::new(error))
+    }
 }
 
 pub fn run_worktree_scripts(

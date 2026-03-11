@@ -19,10 +19,26 @@ struct WorktreeSummary {
     pr_number: Option<u64>,
     pr_url: Option<String>,
     pr_details: Option<github_service::PrDetails>,
+    branch_divergence: Option<BranchDivergenceSummary>,
     diff_summary: Option<changes::DiffLineSummary>,
+    recent_turns: Vec<AgentTurnSnapshot>,
+    stuck_turn_count: usize,
+    recent_agent_sessions: Vec<arbor_core::session::AgentSessionSummary>,
     agent_state: Option<AgentState>,
     agent_task: Option<String>,
     last_activity_unix_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BranchDivergenceSummary {
+    ahead: usize,
+    behind: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AgentTurnSnapshot {
+    timestamp_unix_ms: Option<u64>,
+    diff_summary: Option<changes::DiffLineSummary>,
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +62,8 @@ struct TerminalSession {
     last_command: Option<String>,
     pending_command: String,
     command: String,
+    agent_preset: Option<AgentPresetKind>,
+    execution_mode: Option<ExecutionMode>,
     state: TerminalState,
     exit_code: Option<i32>,
     updated_at_unix_ms: Option<u64>,
@@ -740,6 +758,33 @@ enum AgentPresetKind {
     Copilot,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum ExecutionMode {
+    Plan,
+    Build,
+    Yolo,
+}
+
+impl ExecutionMode {
+    const ORDER: [Self; 3] = [Self::Plan, Self::Build, Self::Yolo];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Plan => "Plan",
+            Self::Build => "Build",
+            Self::Yolo => "Yolo",
+        }
+    }
+
+    fn subtitle(self) -> &'static str {
+        match self {
+            Self::Plan => "Minimal write access",
+            Self::Build => "Normal autonomous work",
+            Self::Yolo => "Full permissions",
+        }
+    }
+}
+
 impl AgentPresetKind {
     const ORDER: [Self; 5] = [
         Self::Codex,
@@ -969,6 +1014,7 @@ enum RepoPresetsModalInputEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GitActionKind {
     Commit,
+    CommitPushCreatePullRequest,
     Push,
     CreatePullRequest,
 }
@@ -1111,6 +1157,7 @@ struct OutpostSummary {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CreateModalTab {
     LocalWorktree,
+    ReviewPullRequest,
     RemoteOutpost,
 }
 
@@ -1127,6 +1174,13 @@ enum CreateWorktreeField {
     WorktreeName,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CreateReviewPrField {
+    RepositoryPath,
+    PullRequestReference,
+    WorktreeName,
+}
+
 #[derive(Debug, Clone)]
 struct CreateModal {
     tab: CreateModalTab,
@@ -1137,6 +1191,10 @@ struct CreateModal {
     worktree_name_cursor: usize,
     checkout_kind: CheckoutKind,
     worktree_active_field: CreateWorktreeField,
+    // Review PR fields
+    pr_reference: String,
+    pr_reference_cursor: usize,
+    review_active_field: CreateReviewPrField,
     // Outpost fields
     host_index: usize,
     host_dropdown_open: bool,
@@ -1159,6 +1217,13 @@ struct GitHubAuthModal {
 
 enum ModalInputEvent {
     SetActiveField(CreateWorktreeField),
+    MoveActiveField,
+    Edit(TextEditAction),
+    ClearError,
+}
+
+enum ReviewPrModalInputEvent {
+    SetActiveField(CreateReviewPrField),
     MoveActiveField,
     Edit(TextEditAction),
     ClearError,
@@ -1258,9 +1323,12 @@ struct CommandPaletteItem {
 #[derive(Debug, Clone)]
 enum CommandPaletteAction {
     OpenCreateWorktree,
+    OpenReviewPullRequest,
     RefreshWorktrees,
+    ToggleCompactSidebar,
     OpenSettings,
     OpenThemePicker,
+    SetExecutionMode(ExecutionMode),
     LaunchAgentPreset(AgentPresetKind),
     LaunchRepoPreset(usize),
     SelectRepository(usize),
@@ -1412,6 +1480,7 @@ struct CreatedWorktree {
     worktree_path: PathBuf,
     checkout_kind: CheckoutKind,
     source_repo_root: PathBuf,
+    review_pull_request_number: Option<u64>,
 }
 
 struct ArborWindow {
@@ -1494,6 +1563,8 @@ struct ArborWindow {
     command_palette_modal: Option<CommandPaletteModal>,
     command_palette_scroll_handle: ScrollHandle,
     command_palette_recent_actions: Vec<String>,
+    compact_sidebar: bool,
+    execution_mode: ExecutionMode,
     connection_history: Vec<connection_history::ConnectionHistoryEntry>,
     daemon_auth_tokens: HashMap<String, String>,
     connected_daemon_label: Option<String>,

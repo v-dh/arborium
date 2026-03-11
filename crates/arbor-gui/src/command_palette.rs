@@ -23,10 +23,26 @@ impl ArborWindow {
                 action: CommandPaletteAction::OpenCreateWorktree,
             },
             CommandPaletteItem {
+                title: "Review Pull Request".to_owned(),
+                subtitle: "Create a worktree from a GitHub PR".to_owned(),
+                search_text: "review pull request pr github worktree".to_owned(),
+                action: CommandPaletteAction::OpenReviewPullRequest,
+            },
+            CommandPaletteItem {
                 title: "Refresh Worktrees".to_owned(),
                 subtitle: "Reload repositories and worktrees".to_owned(),
                 search_text: "refresh worktrees reload repos".to_owned(),
                 action: CommandPaletteAction::RefreshWorktrees,
+            },
+            CommandPaletteItem {
+                title: if self.compact_sidebar {
+                    "Disable Compact Sidebar".to_owned()
+                } else {
+                    "Enable Compact Sidebar".to_owned()
+                },
+                subtitle: "Toggle dense sidebar rows".to_owned(),
+                search_text: "compact sidebar list dense toggle".to_owned(),
+                action: CommandPaletteAction::ToggleCompactSidebar,
             },
             CommandPaletteItem {
                 title: "Open Settings".to_owned(),
@@ -41,6 +57,27 @@ impl ArborWindow {
                 action: CommandPaletteAction::OpenThemePicker,
             },
         ];
+
+        for mode in ExecutionMode::ORDER {
+            items.push(CommandPaletteItem {
+                title: format!("Execution Mode: {}", mode.label()),
+                subtitle: format!(
+                    "{}{}",
+                    mode.subtitle(),
+                    if self.execution_mode == mode {
+                        " · Active"
+                    } else {
+                        ""
+                    }
+                ),
+                search_text: format!(
+                    "execution mode {} {}",
+                    mode.label().to_ascii_lowercase(),
+                    mode.subtitle().to_ascii_lowercase()
+                ),
+                action: CommandPaletteAction::SetExecutionMode(mode),
+            });
+        }
 
         for preset in AgentPresetKind::ORDER.iter().copied() {
             items.push(CommandPaletteItem {
@@ -193,9 +230,12 @@ impl ArborWindow {
                 usize::from(self.active_preset_tab != Some(*kind)) + 1
             },
             CommandPaletteAction::OpenCreateWorktree
+            | CommandPaletteAction::OpenReviewPullRequest
             | CommandPaletteAction::RefreshWorktrees
+            | CommandPaletteAction::ToggleCompactSidebar
             | CommandPaletteAction::OpenSettings
-            | CommandPaletteAction::OpenThemePicker => 3,
+            | CommandPaletteAction::OpenThemePicker
+            | CommandPaletteAction::SetExecutionMode(_) => 3,
         }
     }
 
@@ -225,9 +265,25 @@ impl ArborWindow {
                 let repo_index = self.active_repository_index.unwrap_or(0);
                 self.open_create_modal(repo_index, CreateModalTab::LocalWorktree, cx);
             },
+            CommandPaletteAction::OpenReviewPullRequest => {
+                let repo_index = self.active_repository_index.unwrap_or(0);
+                self.open_create_modal(repo_index, CreateModalTab::ReviewPullRequest, cx);
+            },
             CommandPaletteAction::RefreshWorktrees => self.refresh_worktrees(cx),
+            CommandPaletteAction::ToggleCompactSidebar => {
+                self.compact_sidebar = !self.compact_sidebar;
+                self.notice = Some(if self.compact_sidebar {
+                    "compact sidebar enabled".to_owned()
+                } else {
+                    "compact sidebar disabled".to_owned()
+                });
+                self.sync_ui_state_store(window);
+            },
             CommandPaletteAction::OpenSettings => self.open_settings_modal(cx),
             CommandPaletteAction::OpenThemePicker => self.open_theme_picker_modal(cx),
+            CommandPaletteAction::SetExecutionMode(mode) => {
+                self.set_execution_mode(mode, window, cx);
+            },
             CommandPaletteAction::LaunchAgentPreset(preset) => {
                 self.launch_agent_preset(preset, window, cx);
             },
@@ -324,7 +380,12 @@ impl ArborWindow {
             return;
         }
 
-        let invocation = match prompt_terminal_invocation(preset, &command, &task.prompt) {
+        let invocation = match prompt_terminal_invocation(
+            preset,
+            &command,
+            &task.prompt,
+            self.execution_mode,
+        ) {
             Ok(invocation) => format!("{invocation}\n"),
             Err(error) => {
                 self.notice = Some(format!("failed to run task {}: {error}", task.name));
@@ -353,6 +414,8 @@ impl ArborWindow {
             .iter_mut()
             .find(|session| session.id == session_id)
         {
+            session.agent_preset = Some(preset);
+            session.execution_mode = Some(self.execution_mode);
             session.last_command = Some(invocation.trim().to_owned());
             session.pending_command.clear();
             session.updated_at_unix_ms = current_unix_timestamp_millis();
@@ -524,14 +587,25 @@ fn command_palette_icon(action: &CommandPaletteAction, theme: ThemePalette) -> A
         CommandPaletteAction::OpenCreateWorktree => {
             command_palette_glyph_icon("\u{f055}", 0x98c379, theme)
         },
+        CommandPaletteAction::OpenReviewPullRequest => {
+            command_palette_glyph_icon("\u{f0ea}", 0xc678dd, theme)
+        },
         CommandPaletteAction::RefreshWorktrees => {
             command_palette_glyph_icon("\u{f021}", 0x61afef, theme)
+        },
+        CommandPaletteAction::ToggleCompactSidebar => {
+            command_palette_glyph_icon("\u{f03a}", 0x56b6c2, theme)
         },
         CommandPaletteAction::OpenSettings => {
             command_palette_glyph_icon("\u{f013}", 0xd19a66, theme)
         },
         CommandPaletteAction::OpenThemePicker => {
             command_palette_glyph_icon("\u{f53f}", 0xc678dd, theme)
+        },
+        CommandPaletteAction::SetExecutionMode(mode) => match mode {
+            ExecutionMode::Plan => command_palette_glyph_icon("\u{f19c}", 0xe5c07b, theme),
+            ExecutionMode::Build => command_palette_glyph_icon("\u{f085}", 0x72d69c, theme),
+            ExecutionMode::Yolo => command_palette_glyph_icon("\u{f06d}", 0xeb6f92, theme),
         },
         CommandPaletteAction::LaunchAgentPreset(kind) => command_palette_preset_icon(*kind, theme),
         CommandPaletteAction::LaunchRepoPreset(_) => {

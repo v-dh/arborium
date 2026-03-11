@@ -81,6 +81,7 @@ impl ArborWindow {
             _ => None,
         };
         let active_preset_tab = self.active_preset_tab;
+        let execution_mode = self.execution_mode;
         let preset_button = |kind: AgentPresetKind| {
             let is_active = active_preset_tab == Some(kind);
             let text_color = if is_active {
@@ -117,6 +118,40 @@ impl ArborWindow {
                         this.launch_agent_preset(kind, window, cx);
                     }),
                 )
+        };
+        let execution_mode_button = |mode: ExecutionMode| {
+            let is_active = execution_mode == mode;
+            div()
+                .id(ElementId::Name(
+                    format!("execution-mode-{}", mode.label().to_ascii_lowercase()).into(),
+                ))
+                .cursor_pointer()
+                .h(px(22.))
+                .px_2()
+                .flex()
+                .items_center()
+                .rounded_sm()
+                .border_b_1()
+                .border_color(rgb(if is_active {
+                    theme.accent
+                } else {
+                    theme.tab_bg
+                }))
+                .text_size(px(11.))
+                .text_color(rgb(if is_active {
+                    theme.text_primary
+                } else {
+                    theme.text_muted
+                }))
+                .hover(|surface| {
+                    surface
+                        .bg(rgb(theme.panel_active_bg))
+                        .text_color(rgb(theme.text_primary))
+                })
+                .child(mode.label())
+                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| {
+                    this.set_execution_mode(mode, window, cx);
+                }))
         };
 
         div()
@@ -509,6 +544,25 @@ impl ArborWindow {
                                     )
                             })),
                     ),
+            )
+            .child(
+                div()
+                    .h(px(24.))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .border_l_1()
+                    .border_color(rgb(theme.border))
+                    .border_b_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(theme.text_muted))
+                            .child("Mode"),
+                    )
+                    .children(ExecutionMode::ORDER.into_iter().map(execution_mode_button)),
             )
             .child(
                 div()

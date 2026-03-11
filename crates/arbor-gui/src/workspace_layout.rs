@@ -131,6 +131,8 @@ impl ArborWindow {
                 height,
             }),
             left_pane_visible: Some(self.left_pane_visible),
+            compact_sidebar: Some(self.compact_sidebar),
+            execution_mode: Some(self.execution_mode),
             preferred_checkout_kind: Some(self.preferred_checkout_kind),
             sidebar_order: self.last_persisted_ui_state.sidebar_order.clone(),
         }

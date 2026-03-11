@@ -884,25 +884,24 @@ pub(crate) async fn agent_notify(
     );
     if let Some(event_name) =
         notification_event_name_for_agent_transition(previous_state, agent_state)
+        && let Ok(repo_root) = worktree::repo_root(&cwd_path)
     {
-        if let Ok(repo_root) = worktree::repo_root(&cwd_path) {
-            let branch = git_branch_name_for_worktree(&cwd_path).ok();
-            spawn_notification_webhooks(
-                repo_root.clone(),
-                event_name,
-                serde_json::json!({
-                    "event": event_name,
-                    "repo_root": repo_root,
-                    "worktree_path": cwd_path,
-                    "cwd": dto.cwd.clone(),
-                    "branch": branch,
-                    "session_id": session_id,
-                    "state": agent_state_label(agent_state),
-                    "previous_state": previous_state.map(agent_state_label),
-                    "timestamp_unix_ms": now_ms,
-                }),
-            );
-        }
+        let branch = git_branch_name_for_worktree(&cwd_path).ok();
+        spawn_notification_webhooks(
+            repo_root.clone(),
+            event_name,
+            serde_json::json!({
+                "event": event_name,
+                "repo_root": repo_root,
+                "worktree_path": cwd_path,
+                "cwd": dto.cwd.clone(),
+                "branch": branch,
+                "session_id": session_id,
+                "state": agent_state_label(agent_state),
+                "previous_state": previous_state.map(agent_state_label),
+                "timestamp_unix_ms": now_ms,
+            }),
+        );
     }
     let _ = state
         .agent_broadcast

@@ -466,6 +466,7 @@ impl ArborWindow {
                                 )
                                 .when(!is_collapsed, |this| {
                                     let selection_epoch = self.worktree_selection_epoch;
+                                    let compact_sidebar = self.compact_sidebar;
                                     this.child(
                                     div()
                                         .flex()
@@ -489,6 +490,9 @@ impl ArborWindow {
                                                 } else {
                                                     theme.accent
                                                 };
+                                                let branch_divergence = worktree.branch_divergence;
+                                                let pr_details = worktree.pr_details.clone();
+                                                let is_stuck = worktree.stuck_turn_count >= 2;
                                                 let is_primary = worktree.is_primary_checkout;
                                                 let agent_dot_color = match worktree.agent_state {
                                                     Some(AgentState::Working) => Some(0xe5c07b_u32),
@@ -553,7 +557,7 @@ impl ArborWindow {
                                                         }))
                                                         .bg(rgb(theme.panel_bg))
                                                         .px_2()
-                                                        .py_1()
+                                                        .py(px(if compact_sidebar { 4. } else { 6. }))
                                                         .flex()
                                                         .flex_row()
                                                         .items_center()
@@ -604,6 +608,15 @@ impl ArborWindow {
                                                                         .bg(rgb(color)),
                                                                 )
                                                             })
+                                                            .when(is_stuck, |this| {
+                                                                this.child(
+                                                                    div()
+                                                                        .flex_none()
+                                                                        .text_xs()
+                                                                        .text_color(rgb(0xeb6f92))
+                                                                        .child("\u{f071}"),
+                                                                )
+                                                            })
                                                             // Name/label
                                                             .child(
                                                                 div()
@@ -615,7 +628,15 @@ impl ArborWindow {
                                                                     .text_xs()
                                                                     .font_weight(FontWeight::SEMIBOLD)
                                                                     .text_color(rgb(theme.text_primary))
-                                                                    .child(worktree.branch.clone()),
+                                                                    .child(if compact_sidebar {
+                                                                        format!(
+                                                                            "{} · {}",
+                                                                            worktree.label,
+                                                                            worktree.branch
+                                                                        )
+                                                                    } else {
+                                                                        worktree.branch.clone()
+                                                                    }),
                                                             )
                                                             // Right side: [+- lines] [time ago]
                                                             .child({
@@ -632,6 +653,7 @@ impl ArborWindow {
 
                                                                 if self.worktree_stats_loading
                                                                     && diff_summary.is_none()
+                                                                    && !compact_sidebar
                                                                 {
                                                                     right = right.child(
                                                                         div()
@@ -641,7 +663,9 @@ impl ArborWindow {
                                                                             ))
                                                                             .child("..."),
                                                                     );
-                                                                } else if show_diff_summary {
+                                                                } else if show_diff_summary
+                                                                    && !compact_sidebar
+                                                                {
                                                                     if summary.additions > 0 {
                                                                         right = right.child(
                                                                             div()
@@ -683,11 +707,38 @@ impl ArborWindow {
                                                                     );
                                                                 }
 
+                                                                if let Some(divergence) = branch_divergence
+                                                                    && !compact_sidebar
+                                                                {
+                                                                    if divergence.ahead > 0 {
+                                                                        right = right.child(
+                                                                            div()
+                                                                                .text_xs()
+                                                                                .text_color(rgb(0x72d69c))
+                                                                                .child(format!(
+                                                                                    "\u{2191}{}",
+                                                                                    divergence.ahead
+                                                                                )),
+                                                                        );
+                                                                    }
+                                                                    if divergence.behind > 0 {
+                                                                        right = right.child(
+                                                                            div()
+                                                                                .text_xs()
+                                                                                .text_color(rgb(0xe5c07b))
+                                                                                .child(format!(
+                                                                                    "\u{2193}{}",
+                                                                                    divergence.behind
+                                                                                )),
+                                                                        );
+                                                                    }
+                                                                }
+
                                                                 right
                                                             }),
                                                     )
                                                     // Line 2: [agent task or dir name] ... [PR number]
-                                                    .child(
+                                                    .when(!compact_sidebar, |this| this.child(
                                                         div()
                                                             .flex()
                                                             .items_center()
@@ -708,6 +759,53 @@ impl ArborWindow {
                                                                             .unwrap_or_else(|| worktree.label.clone()),
                                                                     ),
                                                             )
+                                                            .when_some(pr_details.clone(), |this, pr| {
+                                                                let (checks_icon, checks_color) = match pr.checks_status {
+                                                                    github_service::CheckStatus::Success => ("\u{f00c}", 0x72d69c_u32),
+                                                                    github_service::CheckStatus::Failure => ("\u{f00d}", 0xeb6f92_u32),
+                                                                    github_service::CheckStatus::Pending => ("\u{f192}", 0xe5c07b_u32),
+                                                                };
+                                                                let (review_icon, review_color) = match pr.review_decision {
+                                                                    github_service::ReviewDecision::Approved => ("\u{f00c}", 0x72d69c_u32),
+                                                                    github_service::ReviewDecision::ChangesRequested => ("\u{f071}", 0xeb6f92_u32),
+                                                                    github_service::ReviewDecision::Pending => ("\u{f128}", theme.text_disabled),
+                                                                };
+
+                                                                let mut badges = this.child(
+                                                                    div()
+                                                                        .flex_none()
+                                                                        .text_xs()
+                                                                        .text_color(rgb(checks_color))
+                                                                        .child(checks_icon),
+                                                                ).child(
+                                                                    div()
+                                                                        .flex_none()
+                                                                        .text_xs()
+                                                                        .text_color(rgb(review_color))
+                                                                        .child(review_icon),
+                                                                );
+
+                                                                if pr.additions > 0 {
+                                                                    badges = badges.child(
+                                                                        div()
+                                                                            .flex_none()
+                                                                            .text_xs()
+                                                                            .text_color(rgb(0x72d69c))
+                                                                            .child(format!("+{}", pr.additions)),
+                                                                    );
+                                                                }
+                                                                if pr.deletions > 0 {
+                                                                    badges = badges.child(
+                                                                        div()
+                                                                            .flex_none()
+                                                                            .text_xs()
+                                                                            .text_color(rgb(0xeb6f92))
+                                                                            .child(format!("-{}", pr.deletions)),
+                                                                    );
+                                                                }
+
+                                                                badges
+                                                            })
                                                             .when_some(pr_number, |this, pr_num| {
                                                                 let pr_text = format!("#{pr_num}");
                                                                 if let Some(pr_url) = pr_url.clone() {
@@ -740,7 +838,7 @@ impl ArborWindow {
                                                                     )
                                                                 }
                                                             }),
-                                                    )
+                                                    ))
                                                     ) // text column
                                                     ); // bordered cell
                                                 if is_active {
@@ -1759,6 +1857,123 @@ impl ArborWindow {
             }
 
             card = card.child(agent_row);
+        }
+
+        if !worktree.recent_turns.is_empty() {
+            if worktree.agent_state.is_some() {
+                card = card.child(div().h(px(1.)).bg(rgb(theme.border)).my_1());
+            }
+
+            let heading = if worktree.stuck_turn_count >= 2 {
+                format!("Recent turns · stuck for {} turns", worktree.stuck_turn_count + 1)
+            } else {
+                "Recent turns".to_owned()
+            };
+            card = card.child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(if worktree.stuck_turn_count >= 2 {
+                        0xeb6f92
+                    } else {
+                        theme.text_primary
+                    }))
+                    .child(heading),
+            );
+
+            for snapshot in worktree.recent_turns.iter().take(3) {
+                let summary_text = match snapshot.diff_summary {
+                    Some(summary) if summary.additions > 0 || summary.deletions > 0 => {
+                        format!("Changed +{} -{}", summary.additions, summary.deletions)
+                    },
+                    _ => "No file changes".to_owned(),
+                };
+
+                card = card.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(theme.text_muted))
+                                .child(summary_text),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(theme.text_disabled))
+                                .child(
+                                    snapshot
+                                        .timestamp_unix_ms
+                                        .map(format_relative_time)
+                                        .unwrap_or_else(|| "-".to_owned()),
+                                ),
+                        ),
+                );
+            }
+        }
+
+        if !worktree.recent_agent_sessions.is_empty() {
+            card = card.child(div().h(px(1.)).bg(rgb(theme.border)).my_1());
+            card = card.child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(theme.text_primary))
+                    .child("Recent sessions"),
+            );
+
+            let mut current_provider = None;
+            for session in worktree.recent_agent_sessions.iter().take(4) {
+                if current_provider != Some(session.provider) {
+                    current_provider = Some(session.provider);
+                    card = card.child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(theme.text_disabled))
+                            .child(session.provider.label()),
+                    );
+                }
+
+                let mut meta = Vec::new();
+                if session.message_count > 0 {
+                    meta.push(format!("{} msgs", session.message_count));
+                }
+                if let Some(timestamp) = session.timestamp_unix_ms {
+                    meta.push(format_relative_time(timestamp));
+                }
+
+                card = card.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .text_xs()
+                                .text_color(rgb(theme.text_muted))
+                                .child(session.title.clone()),
+                        )
+                        .when(!meta.is_empty(), |this| {
+                            this.child(
+                                div()
+                                    .flex_none()
+                                    .text_xs()
+                                    .text_color(rgb(theme.text_disabled))
+                                    .child(meta.join(" · ")),
+                            )
+                        }),
+                );
+            }
         }
 
         // PR section

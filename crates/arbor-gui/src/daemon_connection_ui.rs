@@ -80,6 +80,8 @@ impl ArborWindow {
                 last_command: None,
                 pending_command: String::new(),
                 command: String::new(),
+                agent_preset: None,
+                execution_mode: None,
                 state: TerminalState::Running,
                 exit_code: None,
                 updated_at_unix_ms: current_unix_timestamp_millis(),

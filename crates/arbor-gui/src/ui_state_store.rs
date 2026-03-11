@@ -1,5 +1,5 @@
 use {
-    crate::{SidebarItemId, checkout::CheckoutKind},
+    crate::{ExecutionMode, SidebarItemId, checkout::CheckoutKind},
     serde::{Deserialize, Serialize},
     std::{
         collections::HashMap,
@@ -17,6 +17,8 @@ pub struct UiState {
     pub right_pane_width: Option<i32>,
     pub window: Option<WindowGeometry>,
     pub left_pane_visible: Option<bool>,
+    pub compact_sidebar: Option<bool>,
+    pub execution_mode: Option<ExecutionMode>,
     pub preferred_checkout_kind: Option<CheckoutKind>,
     /// Custom sidebar item display order per repository group.
     /// Key: group_key, Value: ordered list of SidebarItemIds.

@@ -287,6 +287,10 @@ impl ArborWindow {
                     command_palette_modal: None,
                     command_palette_scroll_handle: ScrollHandle::new(),
                     command_palette_recent_actions: Vec::new(),
+                    compact_sidebar: startup_ui_state.compact_sidebar.unwrap_or(false),
+                    execution_mode: startup_ui_state
+                        .execution_mode
+                        .unwrap_or(ExecutionMode::Build),
                     connection_history: connection_history::load_history(),
                     daemon_auth_tokens: connection_history::load_tokens(),
                     connected_daemon_label: None,
@@ -617,6 +621,10 @@ impl ArborWindow {
             command_palette_modal: None,
             command_palette_scroll_handle: ScrollHandle::new(),
             command_palette_recent_actions: Vec::new(),
+            compact_sidebar: startup_ui_state.compact_sidebar.unwrap_or(false),
+            execution_mode: startup_ui_state
+                .execution_mode
+                .unwrap_or(ExecutionMode::Build),
             connection_history: connection_history::load_history(),
             daemon_auth_tokens: connection_history::load_tokens(),
             connected_daemon_label: None,
@@ -1229,6 +1237,8 @@ impl ArborWindow {
                     last_command: record.last_command.clone(),
                     pending_command: String::new(),
                     command,
+                    agent_preset: None,
+                    execution_mode: None,
                     state: session_state,
                     exit_code: record.exit_code,
                     updated_at_unix_ms: record.updated_at_unix_ms,
@@ -1467,6 +1477,29 @@ impl ArborWindow {
                     .map(|task| (worktree.path.clone(), task.clone()))
             })
             .collect();
+        let previous_recent_turns: HashMap<PathBuf, Vec<AgentTurnSnapshot>> = self
+            .worktrees
+            .iter()
+            .map(|worktree| (worktree.path.clone(), worktree.recent_turns.clone()))
+            .collect();
+        let previous_recent_agent_sessions: HashMap<
+            PathBuf,
+            Vec<arbor_core::session::AgentSessionSummary>,
+        > = self
+            .worktrees
+            .iter()
+            .map(|worktree| {
+                (
+                    worktree.path.clone(),
+                    worktree.recent_agent_sessions.clone(),
+                )
+            })
+            .collect();
+        let previous_stuck_turn_counts: HashMap<PathBuf, usize> = self
+            .worktrees
+            .iter()
+            .map(|worktree| (worktree.path.clone(), worktree.stuck_turn_count))
+            .collect();
         let previous_activity: HashMap<PathBuf, u64> = self
             .worktrees
             .iter()
@@ -1521,6 +1554,18 @@ impl ArborWindow {
             worktree.pr_details = previous_pr_details.get(&worktree.path).cloned();
             worktree.agent_state = previous_agent_states.get(&worktree.path).copied();
             worktree.agent_task = previous_agent_tasks.get(&worktree.path).cloned();
+            worktree.recent_turns = previous_recent_turns
+                .get(&worktree.path)
+                .cloned()
+                .unwrap_or_default();
+            worktree.recent_agent_sessions = previous_recent_agent_sessions
+                .get(&worktree.path)
+                .cloned()
+                .unwrap_or_default();
+            worktree.stuck_turn_count = previous_stuck_turn_counts
+                .get(&worktree.path)
+                .copied()
+                .unwrap_or_default();
             // Take the max of fresh git-based timestamp and previous value
             // (which may include agent activity).
             let prev = previous_activity.get(&worktree.path).copied();
@@ -1595,6 +1640,7 @@ impl ArborWindow {
 
         self.refresh_worktree_diff_summaries(cx);
         self.refresh_agent_tasks(cx);
+        self.refresh_agent_sessions(cx);
         self.refresh_worktree_pull_requests(cx);
         let changed_files_changed = self.reload_changed_files();
         let created_terminal = self.ensure_selected_worktree_terminal();
@@ -1686,6 +1732,51 @@ impl ArborWindow {
                         && let Some(wt) = this.worktrees.iter_mut().find(|wt| wt.path == path)
                     {
                         wt.agent_task = Some(task);
+                        changed = true;
+                    }
+                }
+                if changed {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn refresh_agent_sessions(&mut self, cx: &mut Context<Self>) {
+        let worktree_paths: Vec<PathBuf> = self
+            .worktrees
+            .iter()
+            .filter(|worktree| worktree.recent_agent_sessions.is_empty())
+            .map(|worktree| worktree.path.clone())
+            .collect();
+        if worktree_paths.is_empty() {
+            return;
+        }
+
+        cx.spawn(async move |this, cx| {
+            let results = cx
+                .background_spawn(async move {
+                    worktree_paths
+                        .into_iter()
+                        .map(|path| {
+                            let sessions = arbor_core::session::recent_agent_sessions(&path, 6);
+                            (path, sessions)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+
+            let _ = this.update(cx, |this, cx| {
+                let mut changed = false;
+                for (path, sessions) in results {
+                    if let Some(worktree) = this
+                        .worktrees
+                        .iter_mut()
+                        .find(|worktree| worktree.path == path)
+                        && worktree.recent_agent_sessions != sessions
+                    {
+                        worktree.recent_agent_sessions = sessions;
                         changed = true;
                     }
                 }
@@ -2617,6 +2708,12 @@ impl ArborWindow {
                             cx,
                         );
                     },
+                    CreateModalTab::ReviewPullRequest => {
+                        self.update_create_review_pr_modal_input(
+                            ReviewPrModalInputEvent::MoveActiveField,
+                            cx,
+                        );
+                    },
                     CreateModalTab::RemoteOutpost => {
                         self.update_create_outpost_modal_input(
                             OutpostModalInputEvent::MoveActiveField(
@@ -2643,6 +2740,7 @@ impl ArborWindow {
                 } else {
                     match active_tab {
                         CreateModalTab::LocalWorktree => self.submit_create_worktree_modal(cx),
+                        CreateModalTab::ReviewPullRequest => self.submit_create_review_pr_modal(cx),
                         CreateModalTab::RemoteOutpost => self.submit_create_outpost_modal(cx),
                     }
                 }
@@ -2673,6 +2771,16 @@ impl ArborWindow {
                 CreateModalTab::LocalWorktree => {
                     self.update_create_worktree_modal_input(ModalInputEvent::ClearError, cx);
                     self.update_create_worktree_modal_input(ModalInputEvent::Edit(action), cx);
+                },
+                CreateModalTab::ReviewPullRequest => {
+                    self.update_create_review_pr_modal_input(
+                        ReviewPrModalInputEvent::ClearError,
+                        cx,
+                    );
+                    self.update_create_review_pr_modal_input(
+                        ReviewPrModalInputEvent::Edit(action),
+                        cx,
+                    );
                 },
                 CreateModalTab::RemoteOutpost => {
                     self.update_create_outpost_modal_input(OutpostModalInputEvent::ClearError, cx);
@@ -2977,6 +3085,8 @@ impl ArborWindow {
             last_command: None,
             pending_command: String::new(),
             command: String::new(),
+            agent_preset: None,
+            execution_mode: None,
             state: TerminalState::Running,
             exit_code: None,
             updated_at_unix_ms: current_unix_timestamp_millis(),
@@ -3148,6 +3258,7 @@ impl ArborWindow {
         self.terminal_scroll_handle.scroll_to_bottom();
         window.focus(&self.terminal_focus);
         self.focus_terminal_on_next_render = false;
+        self.sync_ui_state_store(window);
         cx.notify();
     }
 
@@ -3190,6 +3301,8 @@ impl ArborWindow {
             last_command: None,
             pending_command: String::new(),
             command: String::new(),
+            agent_preset: None,
+            execution_mode: None,
             state: TerminalState::Running,
             exit_code: None,
             updated_at_unix_ms: current_unix_timestamp_millis(),
@@ -3312,6 +3425,18 @@ impl ArborWindow {
 
         self.active_terminal_by_worktree
             .insert(worktree_path, session_id);
+        if let Some(session) = self
+            .terminals
+            .iter()
+            .find(|session| session.id == session_id)
+        {
+            if let Some(preset) = session.agent_preset {
+                self.active_preset_tab = Some(preset);
+            }
+            if let Some(mode) = session.execution_mode {
+                self.execution_mode = mode;
+            }
+        }
         self.active_diff_session_id = None;
         self.active_file_view_session_id = None;
         self.logs_tab_active = false;
@@ -3593,7 +3718,11 @@ impl WorktreeSummary {
             pr_number: None,
             pr_url: None,
             pr_details: None,
+            branch_divergence: branch_divergence_summary(&entry.path),
             diff_summary: None,
+            recent_turns: Vec::new(),
+            stuck_turn_count: 0,
+            recent_agent_sessions: Vec::new(),
             agent_state: None,
             agent_task: None,
             last_activity_unix_ms,
@@ -4083,6 +4212,7 @@ fn apply_agent_ws_update(app: &mut ArborWindow, entries: &[(String, AgentState, 
                         Some(worktree.last_activity_unix_ms.unwrap_or(0).max(*ts));
                 }
                 if previous_state == Some(AgentState::Working) && *state == AgentState::Waiting {
+                    capture_agent_turn_snapshot(worktree, *updated_at);
                     notification_worktree = Some(worktree.clone());
                 }
             }
@@ -4097,6 +4227,27 @@ fn apply_agent_ws_update(app: &mut ArborWindow, entries: &[(String, AgentState, 
             );
         }
     }
+}
+
+fn capture_agent_turn_snapshot(worktree: &mut WorktreeSummary, updated_at: Option<u64>) {
+    let diff_summary = changes::diff_line_summary(&worktree.path).ok();
+    let next_snapshot = AgentTurnSnapshot {
+        timestamp_unix_ms: updated_at.or(worktree.last_activity_unix_ms),
+        diff_summary,
+    };
+
+    if worktree
+        .recent_turns
+        .first()
+        .is_some_and(|previous| previous.diff_summary == next_snapshot.diff_summary)
+    {
+        worktree.stuck_turn_count += 1;
+    } else {
+        worktree.stuck_turn_count = 0;
+    }
+
+    worktree.recent_turns.insert(0, next_snapshot);
+    worktree.recent_turns.truncate(5);
 }
 
 fn inject_daemon_log_entry(log_buffer: &log_layer::LogBuffer, text: &str) {
@@ -4401,6 +4552,7 @@ fn worktree_rows_changed(previous: &[WorktreeSummary], next: &[WorktreeSummary])
             || left.label != right.label
             || left.branch != right.branch
             || left.is_primary_checkout != right.is_primary_checkout
+            || left.branch_divergence != right.branch_divergence
     })
 }
 
@@ -4419,6 +4571,27 @@ fn estimated_worktree_hover_popover_card_height(
 
     if worktree.agent_state.is_some() {
         height += 18.;
+    }
+
+    if !worktree.recent_turns.is_empty() {
+        height += 24. + worktree.recent_turns.iter().take(3).count() as f32 * 18.;
+    }
+
+    if !worktree.recent_agent_sessions.is_empty() {
+        let visible_sessions = worktree.recent_agent_sessions.iter().take(4);
+        let provider_headers = visible_sessions
+            .clone()
+            .fold((None, 0usize), |(previous, count), session| {
+                if previous == Some(session.provider) {
+                    (previous, count)
+                } else {
+                    (Some(session.provider), count + 1)
+                }
+            })
+            .1;
+        height += 24.
+            + worktree.recent_agent_sessions.iter().take(4).count() as f32 * 18.
+            + provider_headers as f32 * 16.;
     }
 
     if let Some(pr) = worktree.pr_details.as_ref() {
@@ -5825,6 +5998,25 @@ fn repository_display_name(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+fn branch_divergence_summary(worktree_path: &Path) -> Option<BranchDivergenceSummary> {
+    let repo = git2::Repository::open(worktree_path).ok()?;
+    let head = repo.head().ok()?;
+    if !head.is_branch() {
+        return None;
+    }
+
+    let branch_name = head.shorthand()?;
+    let branch = repo
+        .find_branch(branch_name, git2::BranchType::Local)
+        .ok()?;
+    let upstream = branch.upstream().ok()?;
+    let head_oid = branch.get().target()?;
+    let upstream_oid = upstream.get().target()?;
+    let (ahead, behind) = repo.graph_ahead_behind(head_oid, upstream_oid).ok()?;
+
+    Some(BranchDivergenceSummary { ahead, behind })
+}
+
 fn should_seed_repo_root_from_cwd(store_file_exists: bool, loaded_roots_were_empty: bool) -> bool {
     // Seed from CWD on first run (no store file), or when there are existing
     // saved roots and CWD is simply not listed yet. If the store exists and is
@@ -6168,6 +6360,8 @@ mod tests {
             last_command: None,
             pending_command: String::new(),
             command: "zsh".to_owned(),
+            agent_preset: None,
+            execution_mode: None,
             state: TerminalState::Running,
             exit_code: None,
             updated_at_unix_ms: None,
@@ -6211,10 +6405,14 @@ mod tests {
             pr_number: None,
             pr_url: None,
             pr_details: None,
+            branch_divergence: None,
             diff_summary: Some(DiffLineSummary {
                 additions: 3,
                 deletions: 1,
             }),
+            recent_turns: vec![],
+            stuck_turn_count: 0,
+            recent_agent_sessions: vec![],
             agent_state: Some(AgentState::Working),
             agent_task: Some("Investigating hover".to_owned()),
             last_activity_unix_ms: None,

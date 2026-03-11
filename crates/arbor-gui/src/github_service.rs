@@ -56,6 +56,19 @@ struct GhPrResponse {
     status_check_rollup: Vec<GhCheckContext>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ReviewPullRequest {
+    pub(crate) number: u64,
+    pub(crate) title: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhReviewPrResponse {
+    number: u64,
+    title: String,
+}
+
 #[derive(Deserialize)]
 struct GhCheckContext {
     name: Option<String>,
@@ -289,9 +302,127 @@ pub fn github_access_token_from_gh_cli() -> Option<String> {
     (!token.is_empty()).then_some(token.to_owned())
 }
 
+pub(crate) fn resolve_pull_request_for_review(
+    repo_slug: &str,
+    reference: &str,
+    github_token: Option<&str>,
+) -> Result<ReviewPullRequest, String> {
+    let reference = reference.trim();
+    if reference.is_empty() {
+        return Err("pull request reference is required".to_owned());
+    }
+
+    if let Some(pull_request) = resolve_pull_request_for_review_via_gh(repo_slug, reference) {
+        return Ok(pull_request);
+    }
+
+    let pull_request_number = parse_pull_request_number(reference).ok_or_else(|| {
+        "failed to resolve pull request with gh; use a PR number or GitHub pull request URL"
+            .to_owned()
+    })?;
+    let token = crate::resolve_github_access_token(github_token).ok_or_else(|| {
+        "failed to resolve pull request with gh and no GitHub token is available for API fallback"
+            .to_owned()
+    })?;
+
+    resolve_pull_request_for_review_via_api(repo_slug, pull_request_number, &token)
+}
+
+fn resolve_pull_request_for_review_via_gh(
+    repo_slug: &str,
+    reference: &str,
+) -> Option<ReviewPullRequest> {
+    let output = Command::new("gh")
+        .args([
+            "pr",
+            "view",
+            "--repo",
+            repo_slug,
+            "--json",
+            "number,title",
+            reference,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let response: GhReviewPrResponse = serde_json::from_slice(&output.stdout).ok()?;
+    Some(ReviewPullRequest {
+        number: response.number,
+        title: response.title,
+    })
+}
+
+fn resolve_pull_request_for_review_via_api(
+    repo_slug: &str,
+    pull_request_number: u64,
+    token: &str,
+) -> Result<ReviewPullRequest, String> {
+    let (owner, repo_name) = repo_slug
+        .split_once('/')
+        .ok_or_else(|| format!("invalid repository slug: {repo_slug}"))?;
+
+    let owner = owner.to_owned();
+    let repo_name = repo_name.to_owned();
+    let token = token.to_owned();
+
+    let runtime = tokio::runtime::Runtime::new()
+        .map_err(|error| format!("failed to create runtime: {error}"))?;
+
+    runtime.block_on(async move {
+        let octocrab = octocrab::Octocrab::builder()
+            .personal_token(token)
+            .build()
+            .map_err(|error| format!("failed to create GitHub client: {error}"))?;
+
+        let pull_request = octocrab
+            .pulls(&owner, &repo_name)
+            .get(pull_request_number)
+            .await
+            .map_err(|error| {
+                format!("failed to resolve pull request #{pull_request_number}: {error}")
+            })?;
+
+        Ok(ReviewPullRequest {
+            number: pull_request.number,
+            title: pull_request
+                .title
+                .unwrap_or_else(|| format!("PR {}", pull_request.number)),
+        })
+    })
+}
+
+pub(crate) fn parse_pull_request_number(reference: &str) -> Option<u64> {
+    let trimmed = reference.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let trimmed = trimmed.strip_prefix('#').unwrap_or(trimmed);
+    if let Ok(number) = trimmed.parse::<u64>() {
+        return Some(number);
+    }
+
+    let url_path = trimmed.strip_prefix("https://github.com/")?;
+    let segments = url_path.split('/').collect::<Vec<_>>();
+    if segments.len() < 4 || segments[2] != "pull" {
+        return None;
+    }
+
+    segments[3].parse::<u64>().ok()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CheckStatus, GhCheckContext, GhPrResponse, parse_pr_details};
+    use super::{
+        CheckStatus, GhCheckContext, GhPrResponse, parse_pr_details, parse_pull_request_number,
+    };
 
     #[test]
     fn in_progress_checks_remain_pending_without_conclusion() {
@@ -327,5 +458,16 @@ mod tests {
             ("Clippy".to_owned(), CheckStatus::Pending),
             ("Test".to_owned(), CheckStatus::Pending),
         ]);
+    }
+
+    #[test]
+    fn parse_pull_request_number_supports_hash_number_and_url() {
+        assert_eq!(parse_pull_request_number("#42"), Some(42));
+        assert_eq!(parse_pull_request_number("42"), Some(42));
+        assert_eq!(
+            parse_pull_request_number("https://github.com/penso/arbor/pull/42"),
+            Some(42)
+        );
+        assert_eq!(parse_pull_request_number("feature/test"), None);
     }
 }

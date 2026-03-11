@@ -38,6 +38,18 @@ impl ArborWindow {
     }
 
     fn submit_commit_modal(&mut self, cx: &mut Context<Self>) {
+        self.submit_commit_modal_with_follow_up(false, cx);
+    }
+
+    fn submit_commit_modal_and_create_pr(&mut self, cx: &mut Context<Self>) {
+        self.submit_commit_modal_with_follow_up(true, cx);
+    }
+
+    fn submit_commit_modal_with_follow_up(
+        &mut self,
+        create_pull_request: bool,
+        cx: &mut Context<Self>,
+    ) {
         if self.git_action_in_flight.is_some() {
             return;
         }
@@ -62,34 +74,187 @@ impl ArborWindow {
         };
 
         let changed_files = self.changed_files.clone();
-        self.git_action_in_flight = Some(GitActionKind::Commit);
-        self.notice = Some("running git commit".to_owned());
-        cx.spawn(async move |this, cx| {
-            let result = cx.background_spawn(async move {
-                run_git_commit_for_worktree(worktree_path.as_path(), &changed_files, &message)
-            });
-            let result = result.await;
+        if !create_pull_request {
+            self.git_action_in_flight = Some(GitActionKind::Commit);
+            self.notice = Some("running git commit".to_owned());
+            cx.spawn(async move |this, cx| {
+                let result = cx.background_spawn(async move {
+                    run_git_commit_for_worktree(worktree_path.as_path(), &changed_files, &message)
+                });
+                let result = result.await;
 
-            let _ = this.update(cx, |this, cx| {
-                this.git_action_in_flight = None;
-                match result {
-                    Ok(message) => {
-                        this.commit_modal = None;
-                        this.notice = Some(message);
-                        let _ = this.reload_changed_files();
-                        this.refresh_worktree_diff_summaries(cx);
-                        this.refresh_worktree_pull_requests(cx);
-                    },
+                let _ = this.update(cx, |this, cx| {
+                    this.git_action_in_flight = None;
+                    match result {
+                        Ok(message) => {
+                            this.commit_modal = None;
+                            this.notice = Some(message);
+                            let _ = this.reload_changed_files();
+                            this.refresh_worktree_diff_summaries(cx);
+                            this.refresh_worktree_pull_requests(cx);
+                        },
+                        Err(error) => {
+                            if let Some(modal) = this.commit_modal.as_mut() {
+                                modal.error = Some(error);
+                            } else {
+                                this.notice = Some("failed to create commit".to_owned());
+                            }
+                        },
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+            return;
+        }
+
+        let repo_slug = self
+            .github_repo_slug
+            .clone()
+            .or_else(|| github_repo_slug_for_repo(worktree_path.as_path()));
+        let github_token = self.github_access_token();
+        let github_service = self.github_service.clone();
+
+        self.git_action_in_flight = Some(GitActionKind::CommitPushCreatePullRequest);
+        self.notice = Some("committing changes…".to_owned());
+        cx.notify();
+
+        enum StackedGitActionProgress {
+            Status(String),
+            Done(Result<String, StackedGitActionFailure>),
+        }
+
+        cx.spawn(async move |this, cx| {
+            let (progress_tx, progress_rx) = smol::channel::unbounded::<StackedGitActionProgress>();
+
+            cx.background_spawn(async move {
+                let _ = progress_tx.send_blocking(StackedGitActionProgress::Status(
+                    "committing changes…".to_owned(),
+                ));
+
+                let commit_message = match run_git_commit_for_worktree(
+                    worktree_path.as_path(),
+                    &changed_files,
+                    &message,
+                ) {
+                    Ok(message) => message,
                     Err(error) => {
-                        if let Some(modal) = this.commit_modal.as_mut() {
-                            modal.error = Some(error);
-                        } else {
-                            this.notice = Some("failed to create commit".to_owned());
-                        }
+                        let _ = progress_tx.send_blocking(StackedGitActionProgress::Done(Err(
+                            StackedGitActionFailure::Commit(error),
+                        )));
+                        return;
                     },
+                };
+
+                let _ = progress_tx.send_blocking(StackedGitActionProgress::Status(
+                    "pushing branch…".to_owned(),
+                ));
+                let push_message = match run_git_push_for_worktree(worktree_path.as_path()) {
+                    Ok(message) => message,
+                    Err(error) => {
+                        let _ = progress_tx.send_blocking(StackedGitActionProgress::Done(Err(
+                            StackedGitActionFailure::Push {
+                                commit_message,
+                                error,
+                            },
+                        )));
+                        return;
+                    },
+                };
+
+                let _ = progress_tx.send_blocking(StackedGitActionProgress::Status(
+                    "creating pull request…".to_owned(),
+                ));
+                let pr_message = match run_create_pr_for_worktree(
+                    github_service.as_ref(),
+                    worktree_path.as_path(),
+                    repo_slug.as_deref(),
+                    github_token.as_deref(),
+                ) {
+                    Ok(message) => message,
+                    Err(error) => {
+                        let _ = progress_tx.send_blocking(StackedGitActionProgress::Done(Err(
+                            StackedGitActionFailure::CreatePullRequest {
+                                commit_message,
+                                push_message,
+                                error,
+                            },
+                        )));
+                        return;
+                    },
+                };
+
+                let summary = format!(
+                    "{}; {}; {}",
+                    commit_message, push_message, pr_message
+                );
+                let _ = progress_tx
+                    .send_blocking(StackedGitActionProgress::Done(Ok(summary)));
+            })
+            .detach();
+
+            while let Ok(progress) = progress_rx.recv().await {
+                let should_stop = matches!(progress, StackedGitActionProgress::Done(_));
+                let _ = this.update(cx, |this, cx| {
+                    match progress {
+                        StackedGitActionProgress::Status(status) => {
+                            this.notice = Some(status);
+                        },
+                        StackedGitActionProgress::Done(result) => {
+                            this.git_action_in_flight = None;
+                            match result {
+                                Ok(message) => {
+                                    this.commit_modal = None;
+                                    if let Some(url) = extract_first_url(&message) {
+                                        this.open_external_url(&url, cx);
+                                    }
+                                    this.notice = Some(message);
+                                    let _ = this.reload_changed_files();
+                                    this.refresh_worktree_diff_summaries(cx);
+                                    this.refresh_worktree_pull_requests(cx);
+                                },
+                                Err(StackedGitActionFailure::Commit(error)) => {
+                                    if let Some(modal) = this.commit_modal.as_mut() {
+                                        modal.error = Some(error);
+                                    } else {
+                                        this.notice = Some("failed to create commit".to_owned());
+                                    }
+                                },
+                                Err(StackedGitActionFailure::Push {
+                                    commit_message,
+                                    error,
+                                }) => {
+                                    this.commit_modal = None;
+                                    this.notice = Some(format!(
+                                        "{commit_message}; push failed: {error}"
+                                    ));
+                                    let _ = this.reload_changed_files();
+                                    this.refresh_worktree_diff_summaries(cx);
+                                    this.refresh_worktree_pull_requests(cx);
+                                },
+                                Err(StackedGitActionFailure::CreatePullRequest {
+                                    commit_message,
+                                    push_message,
+                                    error,
+                                }) => {
+                                    this.commit_modal = None;
+                                    this.notice = Some(format!(
+                                        "{commit_message}; {push_message}; PR creation failed: {error}"
+                                    ));
+                                    let _ = this.reload_changed_files();
+                                    this.refresh_worktree_diff_summaries(cx);
+                                    this.refresh_worktree_pull_requests(cx);
+                                },
+                            }
+                        },
+                    }
+                    cx.notify();
+                });
+
+                if should_stop {
+                    break;
                 }
-                cx.notify();
-            });
+            }
         })
         .detach();
     }
@@ -107,6 +272,7 @@ impl ArborWindow {
         let changed_files = self.changed_files.clone();
         let preset = self.active_preset_tab.unwrap_or(AgentPresetKind::Codex);
         let command = self.preset_command_for_kind(preset);
+        let execution_mode = self.execution_mode;
 
         if let Some(modal) = self.commit_modal.as_mut() {
             modal.generating = true;
@@ -121,6 +287,7 @@ impl ArborWindow {
                     &changed_files,
                     preset,
                     &command,
+                    execution_mode,
                 )
             });
             let result = result.await;
@@ -404,6 +571,20 @@ impl ArborWindow {
                                                 this.submit_commit_modal(cx);
                                             }))
                                         }),
+                                    )
+                                    .child(
+                                        action_button(
+                                            theme,
+                                            "commit-submit-pr",
+                                            "Commit + Push + PR",
+                                            ActionButtonStyle::Primary,
+                                            !modal.generating,
+                                        )
+                                        .when(!modal.generating, |this| {
+                                            this.on_click(cx.listener(|this, _, _, cx| {
+                                                this.submit_commit_modal_and_create_pr(cx);
+                                            }))
+                                        }),
                                     ),
                             ),
                     ),
@@ -411,11 +592,25 @@ impl ArborWindow {
     }
 }
 
+enum StackedGitActionFailure {
+    Commit(String),
+    Push {
+        commit_message: String,
+        error: String,
+    },
+    CreatePullRequest {
+        commit_message: String,
+        push_message: String,
+        error: String,
+    },
+}
+
 fn generate_commit_message_with_ai(
     worktree_path: &Path,
     changed_files: &[ChangedFile],
     preset: AgentPresetKind,
     command: &str,
+    execution_mode: ExecutionMode,
 ) -> Result<String, String> {
     let prompt = build_commit_message_prompt(changed_files);
     run_prompt_capture(
@@ -423,6 +618,7 @@ fn generate_commit_message_with_ai(
         preset,
         command,
         &prompt,
+        execution_mode,
         "commit message generation",
     )
 }

@@ -24,6 +24,9 @@ impl ArborWindow {
             worktree_name_cursor: 0,
             checkout_kind: self.preferred_checkout_kind,
             worktree_active_field: CreateWorktreeField::WorktreeName,
+            pr_reference: String::new(),
+            pr_reference_cursor: 0,
+            review_active_field: CreateReviewPrField::PullRequestReference,
             host_index: 0,
             host_dropdown_open: false,
             clone_url_cursor: char_count(&clone_url),
@@ -35,6 +38,72 @@ impl ArborWindow {
             creating_status: None,
             error: None,
         });
+        cx.notify();
+    }
+
+    fn update_create_review_pr_modal_input(
+        &mut self,
+        input: ReviewPrModalInputEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(modal) = self.create_modal.as_mut() else {
+            return;
+        };
+
+        if modal.is_creating {
+            return;
+        }
+
+        match input {
+            ReviewPrModalInputEvent::SetActiveField(field) => {
+                modal.review_active_field = field;
+                match field {
+                    CreateReviewPrField::RepositoryPath => {
+                        modal.repository_path_cursor = char_count(&modal.repository_path);
+                    },
+                    CreateReviewPrField::PullRequestReference => {
+                        modal.pr_reference_cursor = char_count(&modal.pr_reference);
+                    },
+                    CreateReviewPrField::WorktreeName => {
+                        modal.worktree_name_cursor = char_count(&modal.worktree_name);
+                    },
+                }
+            },
+            ReviewPrModalInputEvent::MoveActiveField => {
+                modal.review_active_field = match modal.review_active_field {
+                    CreateReviewPrField::RepositoryPath => CreateReviewPrField::PullRequestReference,
+                    CreateReviewPrField::PullRequestReference => CreateReviewPrField::WorktreeName,
+                    CreateReviewPrField::WorktreeName => CreateReviewPrField::RepositoryPath,
+                };
+            },
+            ReviewPrModalInputEvent::Edit(action) => match modal.review_active_field {
+                CreateReviewPrField::RepositoryPath => {
+                    apply_text_edit_action(
+                        &mut modal.repository_path,
+                        &mut modal.repository_path_cursor,
+                        &action,
+                    );
+                },
+                CreateReviewPrField::PullRequestReference => {
+                    apply_text_edit_action(
+                        &mut modal.pr_reference,
+                        &mut modal.pr_reference_cursor,
+                        &action,
+                    );
+                },
+                CreateReviewPrField::WorktreeName => {
+                    apply_text_edit_action(
+                        &mut modal.worktree_name,
+                        &mut modal.worktree_name_cursor,
+                        &action,
+                    );
+                },
+            },
+            ReviewPrModalInputEvent::ClearError => {
+                modal.error = None;
+            },
+        }
+
         cx.notify();
     }
 
@@ -397,6 +466,122 @@ impl ArborWindow {
         .detach();
     }
 
+    fn submit_create_review_pr_modal(&mut self, cx: &mut Context<Self>) {
+        let github_token = self.github_access_token();
+        let Some(modal) = self.create_modal.as_mut() else {
+            return;
+        };
+        if modal.is_creating {
+            return;
+        }
+
+        modal.error = None;
+        let repository_input = modal.repository_path.trim().to_owned();
+        let pr_reference = modal.pr_reference.trim().to_owned();
+        let worktree_input = modal.worktree_name.trim().to_owned();
+        let checkout_kind = modal.checkout_kind;
+
+        if repository_input.is_empty() {
+            modal.error = Some("Repository path is required.".to_owned());
+            cx.notify();
+            return;
+        }
+
+        if pr_reference.is_empty() {
+            modal.error = Some("Pull request reference is required.".to_owned());
+            cx.notify();
+            return;
+        }
+
+        modal.is_creating = true;
+        modal.creating_status = Some("Resolving pull request…".to_owned());
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let creation = cx
+                .background_spawn(async move {
+                    create_review_worktree(
+                        repository_input,
+                        pr_reference,
+                        worktree_input,
+                        checkout_kind,
+                        github_token,
+                    )
+                })
+                .await;
+
+            let _ = this.update(cx, |this, cx| {
+                match creation {
+                    Ok(created) => {
+                        if created.checkout_kind == CheckoutKind::DiscreteClone {
+                            let group_key = this
+                                .repositories
+                                .iter()
+                                .find(|repository| {
+                                    repository.contains_checkout_root(&created.source_repo_root)
+                                })
+                                .map(|repository| repository.group_key.clone())
+                                .unwrap_or_else(|| {
+                                    repository_store::default_group_key_for_root(
+                                        &created.source_repo_root,
+                                    )
+                                });
+                            this.upsert_repository_checkout_root(
+                                created.worktree_path.clone(),
+                                CheckoutKind::DiscreteClone,
+                                group_key,
+                            );
+                            this.persist_repositories(cx);
+                        }
+
+                        let notice = match created.review_pull_request_number {
+                            Some(number) => format!(
+                                "created PR review {} `{}` from pull request #{number} on branch `{}`",
+                                created.checkout_kind.label().to_ascii_lowercase(),
+                                created.worktree_name,
+                                created.branch_name
+                            ),
+                            None => format!(
+                                "created {} `{}` on branch `{}`",
+                                created.checkout_kind.label().to_ascii_lowercase(),
+                                created.worktree_name,
+                                created.branch_name
+                            ),
+                        };
+                        this.notice = Some(notice);
+                        this.create_modal = None;
+                        this.refresh_worktrees(cx);
+                        if let Some(index) = this
+                            .worktrees
+                            .iter()
+                            .position(|worktree| worktree.path == created.worktree_path)
+                        {
+                            this.active_worktree_index = Some(index);
+                            let _ = this.reload_changed_files();
+                            if this.ensure_selected_worktree_terminal() {
+                                this.sync_daemon_session_store(cx);
+                            }
+                            this.terminal_scroll_handle.scroll_to_bottom();
+                            this.focus_terminal_on_next_render = true;
+                        }
+                    },
+                    Err(error) => {
+                        tracing::error!("pull request review creation failed: {error}");
+                        if let Some(modal) = this.create_modal.as_mut() {
+                            modal.is_creating = false;
+                            modal.creating_status = None;
+                            modal.error = Some(error);
+                        } else {
+                            this.notice = Some(error);
+                        }
+                    },
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn update_create_outpost_modal_input(
         &mut self,
         input: OutpostModalInputEvent,
@@ -740,6 +925,7 @@ impl ArborWindow {
         let theme = self.theme();
         let has_remote_hosts = !self.remote_hosts.is_empty();
         let is_worktree_tab = modal.tab == CreateModalTab::LocalWorktree;
+        let is_review_pr_tab = modal.tab == CreateModalTab::ReviewPullRequest;
         let is_outpost_tab = modal.tab == CreateModalTab::RemoteOutpost;
 
         // Worktree tab data
@@ -754,6 +940,26 @@ impl ArborWindow {
         let worktree_create_disabled = modal.is_creating
             || modal.repository_path.trim().is_empty()
             || modal.worktree_name.trim().is_empty();
+
+        // Review PR tab data
+        let review_repository_active =
+            modal.review_active_field == CreateReviewPrField::RepositoryPath;
+        let review_pr_active =
+            modal.review_active_field == CreateReviewPrField::PullRequestReference;
+        let review_name_active = modal.review_active_field == CreateReviewPrField::WorktreeName;
+        let review_name_preview =
+            review_worktree_name_preview(modal.pr_reference.trim(), modal.worktree_name.trim());
+        let review_branch_preview = review_name_preview
+            .as_deref()
+            .map(derive_branch_name)
+            .unwrap_or_else(|| "Will derive from pull request".to_owned());
+        let review_path_preview = review_name_preview
+            .as_deref()
+            .and_then(|name| preview_managed_worktree_path(modal.repository_path.trim(), name).ok())
+            .unwrap_or_else(|| "Will resolve after pull request lookup".to_owned());
+        let review_create_disabled = modal.is_creating
+            || modal.repository_path.trim().is_empty()
+            || modal.pr_reference.trim().is_empty();
 
         // Outpost tab data
         let host_name = self
@@ -789,6 +995,8 @@ impl ArborWindow {
 
         let create_disabled = if is_worktree_tab {
             worktree_create_disabled
+        } else if is_review_pr_tab {
+            review_create_disabled
         } else {
             outpost_create_disabled
         };
@@ -797,6 +1005,8 @@ impl ArborWindow {
             creating_status.as_deref().unwrap_or("Creating…").to_owned()
         } else if is_worktree_tab {
             checkout_kind.action_label().to_owned()
+        } else if is_review_pr_tab {
+            "Review Pull Request".to_owned()
         } else {
             "Create Outpost".to_owned()
         };
@@ -885,6 +1095,36 @@ impl ArborWindow {
                                             && !modal.is_creating
                                         {
                                             modal.tab = CreateModalTab::LocalWorktree;
+                                            modal.error = None;
+                                            cx.notify();
+                                        }
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("tab-review-pr")
+                                    .cursor_pointer()
+                                    .px_3()
+                                    .py_1()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(if is_review_pr_tab {
+                                        theme.text_primary
+                                    } else {
+                                        theme.text_muted
+                                    }))
+                                    .when(is_review_pr_tab, |this| {
+                                        this.border_b_2().border_color(rgb(theme.accent))
+                                    })
+                                    .when(!is_review_pr_tab, |this| {
+                                        this.hover(|this| this.text_color(rgb(theme.text_primary)))
+                                    })
+                                    .child("Review PR")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if let Some(modal) = this.create_modal.as_mut()
+                                            && !modal.is_creating
+                                        {
+                                            modal.tab = CreateModalTab::ReviewPullRequest;
                                             modal.error = None;
                                             cx.notify();
                                         }
@@ -1097,6 +1337,201 @@ impl ArborWindow {
                                         .font_family(FONT_MONO)
                                         .text_color(rgb(theme.text_primary))
                                         .child(target_path_preview),
+                                ),
+                        )
+                    })
+                    // Review PR tab content
+                    .when(is_review_pr_tab, |this| {
+                        this.child(
+                            div()
+                                .flex_none()
+                                .text_xs()
+                                .text_color(rgb(theme.text_muted))
+                                .child("Paste a GitHub PR number, `#123`, or full pull-request URL."),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .id("create-review-pr-discrete-clone-checkbox")
+                                .cursor_pointer()
+                                .rounded_sm()
+                                .border_1()
+                                .border_color(rgb(if is_discrete_clone {
+                                    theme.accent
+                                } else {
+                                    theme.border
+                                }))
+                                .bg(rgb(theme.panel_bg))
+                                .hover(|this| this.bg(rgb(theme.panel_active_bg)))
+                                .px_2()
+                                .py_2()
+                                .flex()
+                                .items_start()
+                                .gap_2()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let next_kind = if is_discrete_clone {
+                                        CheckoutKind::LinkedWorktree
+                                    } else {
+                                        CheckoutKind::DiscreteClone
+                                    };
+                                    this.set_create_modal_checkout_kind(next_kind, cx);
+                                }))
+                                .child(
+                                    div()
+                                        .mt(px(1.))
+                                        .w(px(14.))
+                                        .h(px(14.))
+                                        .rounded_sm()
+                                        .border_1()
+                                        .border_color(rgb(if is_discrete_clone {
+                                            theme.accent
+                                        } else {
+                                            theme.border
+                                        }))
+                                        .bg(rgb(if is_discrete_clone {
+                                            theme.accent
+                                        } else {
+                                            theme.panel_bg
+                                        }))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(
+                                            div()
+                                                .font_family(FONT_MONO)
+                                                .text_size(px(9.))
+                                                .text_color(rgb(if is_discrete_clone {
+                                                    theme.sidebar_bg
+                                                } else {
+                                                    theme.panel_bg
+                                                }))
+                                                .child(if is_discrete_clone {
+                                                    "\u{f00c}"
+                                                } else {
+                                                    ""
+                                                }),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(2.))
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(rgb(theme.text_primary))
+                                                .child("Discrete clone"),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(theme.text_muted))
+                                                .child(checkout_kind.description()),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            modal_input_field(
+                                theme,
+                                "review-pr-repo-input",
+                                "Repository",
+                                &modal.repository_path,
+                                modal.repository_path_cursor,
+                                "Path to git repository",
+                                review_repository_active,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.update_create_review_pr_modal_input(
+                                    ReviewPrModalInputEvent::SetActiveField(
+                                        CreateReviewPrField::RepositoryPath,
+                                    ),
+                                    cx,
+                                );
+                            })),
+                        )
+                        .child(
+                            modal_input_field(
+                                theme,
+                                "review-pr-reference-input",
+                                "Pull Request",
+                                &modal.pr_reference,
+                                modal.pr_reference_cursor,
+                                "e.g. 42, #42, or https://github.com/org/repo/pull/42",
+                                review_pr_active,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.update_create_review_pr_modal_input(
+                                    ReviewPrModalInputEvent::SetActiveField(
+                                        CreateReviewPrField::PullRequestReference,
+                                    ),
+                                    cx,
+                                );
+                            })),
+                        )
+                        .child(
+                            modal_input_field(
+                                theme,
+                                "review-pr-name-input",
+                                "Worktree Name",
+                                &modal.worktree_name,
+                                modal.worktree_name_cursor,
+                                "Optional. Defaults from the pull request title.",
+                                review_name_active,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.update_create_review_pr_modal_input(
+                                    ReviewPrModalInputEvent::SetActiveField(
+                                        CreateReviewPrField::WorktreeName,
+                                    ),
+                                    cx,
+                                );
+                            })),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .rounded_sm()
+                                .border_1()
+                                .border_color(rgb(theme.border))
+                                .bg(rgb(theme.panel_bg))
+                                .p_2()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(theme.text_muted))
+                                        .child("Branch"),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_family(FONT_MONO)
+                                        .text_color(rgb(theme.text_primary))
+                                        .child(review_branch_preview),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .rounded_sm()
+                                .border_1()
+                                .border_color(rgb(theme.border))
+                                .bg(rgb(theme.panel_bg))
+                                .p_2()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(theme.text_muted))
+                                        .child("Path"),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_family(FONT_MONO)
+                                        .text_color(rgb(theme.text_primary))
+                                        .child(review_path_preview),
                                 ),
                         )
                     })
@@ -1331,6 +1766,9 @@ impl ArborWindow {
                                             match modal.tab {
                                                 CreateModalTab::LocalWorktree => {
                                                     this.submit_create_worktree_modal(cx);
+                                                },
+                                                CreateModalTab::ReviewPullRequest => {
+                                                    this.submit_create_review_pr_modal(cx);
                                                 },
                                                 CreateModalTab::RemoteOutpost => {
                                                     this.submit_create_outpost_modal(cx);
@@ -1587,6 +2025,15 @@ fn preview_managed_worktree_path(
     Ok(path.display().to_string())
 }
 
+fn review_worktree_name_preview(pr_reference: &str, explicit_worktree_name: &str) -> Option<String> {
+    let explicit = sanitize_worktree_name(explicit_worktree_name);
+    if !explicit.is_empty() {
+        return Some(explicit);
+    }
+
+    github_service::parse_pull_request_number(pr_reference).map(|number| format!("pr-{number}"))
+}
+
 fn create_managed_worktree(
     repository_path_input: String,
     worktree_name_input: String,
@@ -1670,7 +2117,148 @@ fn create_managed_worktree(
         worktree_path,
         checkout_kind,
         source_repo_root: repository_root,
+        review_pull_request_number: None,
     })
+}
+
+fn create_review_worktree(
+    repository_path_input: String,
+    pr_reference_input: String,
+    worktree_name_input: String,
+    checkout_kind: CheckoutKind,
+    github_token: Option<String>,
+) -> Result<CreatedWorktree, String> {
+    let repository_path = expand_home_path(&repository_path_input)?;
+    if !repository_path.exists() {
+        return Err(format!(
+            "repository path does not exist: {}",
+            repository_path.display()
+        ));
+    }
+
+    let repository_root = worktree::repo_root(&repository_path)
+        .map_err(|error| format!("failed to resolve repository root: {error}"))?;
+    let repository_name = repository_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "repository root has no terminal directory name".to_owned())?;
+    let repo_slug = github_repo_slug_for_repo(&repository_root).ok_or_else(|| {
+        format!(
+            "repository `{}` does not have a GitHub origin remote",
+            repository_root.display()
+        )
+    })?;
+    let pull_request = github_service::resolve_pull_request_for_review(
+        &repo_slug,
+        &pr_reference_input,
+        github_token.as_deref(),
+    )?;
+
+    let requested_name = if worktree_name_input.trim().is_empty() {
+        default_review_worktree_name(&pull_request)
+    } else {
+        worktree_name_input
+    };
+    let sanitized_worktree_name = sanitize_worktree_name(&requested_name);
+    if sanitized_worktree_name.is_empty() {
+        return Err("worktree name contains no usable characters".to_owned());
+    }
+
+    let branch_name = derive_branch_name(&requested_name);
+    let worktree_path = build_managed_worktree_path(repository_name, &sanitized_worktree_name)?;
+    if worktree_path.exists() {
+        return Err(format!(
+            "worktree path already exists: {}",
+            worktree_path.display()
+        ));
+    }
+
+    let Some(parent_directory) = worktree_path.parent() else {
+        return Err("invalid worktree path".to_owned());
+    };
+    fs::create_dir_all(parent_directory).map_err(|error| {
+        format!(
+            "failed to create worktree parent directory `{}`: {error}",
+            parent_directory.display()
+        )
+    })?;
+
+    match checkout_kind {
+        CheckoutKind::LinkedWorktree => {
+            fetch_pull_request_head_into_branch(&repository_root, pull_request.number, &branch_name)?;
+            worktree::add(
+                &repository_root,
+                &worktree_path,
+                worktree::AddWorktreeOptions {
+                    branch: Some(&branch_name),
+                    detach: false,
+                    force: false,
+                },
+            )
+            .map_err(|error| format!("failed to create worktree: {error}"))?;
+        },
+        CheckoutKind::DiscreteClone => create_discrete_clone_from_pull_request(
+            &repository_root,
+            &worktree_path,
+            pull_request.number,
+            &branch_name,
+        )?,
+    }
+
+    let script_context =
+        WorktreeScriptContext::new(&repository_root, &worktree_path, Some(&branch_name));
+    if let Err(error) = run_worktree_scripts(
+        &repository_root,
+        WorktreeScriptPhase::Setup,
+        &script_context,
+    ) {
+        rollback_created_checkout(
+            &repository_root,
+            &worktree_path,
+            checkout_kind,
+            &branch_name,
+        )
+        .map_err(|rollback_error| format!("{error}. rollback also failed: {rollback_error}"))?;
+        return Err(error.to_string());
+    }
+
+    Ok(CreatedWorktree {
+        worktree_name: sanitized_worktree_name,
+        branch_name,
+        worktree_path,
+        checkout_kind,
+        source_repo_root: repository_root,
+        review_pull_request_number: Some(pull_request.number),
+    })
+}
+
+fn default_review_worktree_name(pull_request: &github_service::ReviewPullRequest) -> String {
+    let title_slug = sanitize_worktree_name(&pull_request.title);
+    if title_slug.is_empty() {
+        format!("pr-{}", pull_request.number)
+    } else {
+        format!("pr-{}-{title_slug}", pull_request.number)
+    }
+}
+
+fn fetch_pull_request_head_into_branch(
+    repository_root: &Path,
+    pull_request_number: u64,
+    branch_name: &str,
+) -> Result<(), String> {
+    let fetch_ref = format!("+refs/pull/{pull_request_number}/head:refs/heads/{branch_name}");
+    let mut command = create_command("git");
+    command
+        .arg("-C")
+        .arg(repository_root)
+        .args(["fetch", "origin", &fetch_ref]);
+
+    let output = run_command_output(&mut command, "fetch pull request")?;
+    if !output.status.success() {
+        return Err(command_failure_message("fetch pull request", &output));
+    }
+
+    Ok(())
 }
 
 fn create_discrete_clone(
@@ -1730,6 +2318,58 @@ fn create_discrete_clone(
     Ok(())
 }
 
+fn create_discrete_clone_from_pull_request(
+    source_repo_root: &Path,
+    checkout_path: &Path,
+    pull_request_number: u64,
+    branch_name: &str,
+) -> Result<(), String> {
+    let clone_source = source_repo_root
+        .to_str()
+        .ok_or_else(|| "repository path contains invalid UTF-8".to_owned())?;
+    let checkout_target = checkout_path
+        .to_str()
+        .ok_or_else(|| "checkout path contains invalid UTF-8".to_owned())?;
+
+    let source_repo = git2::Repository::open(source_repo_root).map_err(|error| {
+        format!(
+            "failed to open source repository `{}`: {error}",
+            source_repo_root.display()
+        )
+    })?;
+    let origin_url = source_repo
+        .find_remote("origin")
+        .ok()
+        .and_then(|remote| remote.url().map(str::to_owned));
+
+    let cloned_repo = git2::Repository::clone(clone_source, checkout_target).map_err(|error| {
+        format!(
+            "failed to clone `{}` into `{}`: {error}",
+            source_repo_root.display(),
+            checkout_path.display()
+        )
+    })?;
+
+    if let Some(origin_url) = origin_url.as_deref() {
+        let _ = cloned_repo.remote_set_url("origin", origin_url);
+    }
+
+    fetch_pull_request_head_into_branch(checkout_path, pull_request_number, branch_name)?;
+
+    let branch_ref = format!("refs/heads/{branch_name}");
+    cloned_repo
+        .set_head(&branch_ref)
+        .map_err(|error| format!("failed to set HEAD to `{branch_name}`: {error}"))?;
+
+    let mut checkout = git2::build::CheckoutBuilder::new();
+    checkout.force();
+    cloned_repo
+        .checkout_head(Some(&mut checkout))
+        .map_err(|error| format!("failed to check out `{branch_name}`: {error}"))?;
+
+    Ok(())
+}
+
 fn rollback_created_checkout(
     repo_root: &Path,
     worktree_path: &Path,
@@ -1757,4 +2397,38 @@ fn rollback_created_checkout(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod worktree_lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn review_worktree_name_preview_prefers_explicit_name() {
+        assert_eq!(
+            review_worktree_name_preview("#42", "review auth fix"),
+            Some("review-auth-fix".to_owned())
+        );
+    }
+
+    #[test]
+    fn review_worktree_name_preview_falls_back_to_pr_number() {
+        assert_eq!(
+            review_worktree_name_preview("https://github.com/penso/arbor/pull/42", ""),
+            Some("pr-42".to_owned())
+        );
+    }
+
+    #[test]
+    fn default_review_worktree_name_uses_pr_number_and_title() {
+        let pull_request = github_service::ReviewPullRequest {
+            number: 42,
+            title: "Fix auth callback race".to_owned(),
+        };
+
+        assert_eq!(
+            default_review_worktree_name(&pull_request),
+            "pr-42-fix-auth-callback-race"
+        );
+    }
 }

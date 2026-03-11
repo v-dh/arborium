@@ -2150,37 +2150,51 @@ pub(crate) fn read_git_ref_file_bytes(
 pub(crate) fn fetch_pr_changed_files(
     repo_slug: &str,
     pr_number: u64,
+    token: Option<&str>,
 ) -> Result<Vec<PrChangedFile>, String> {
-    let output = Command::new("gh")
-        .args([
-            "pr",
-            "diff",
-            "--repo",
-            repo_slug,
-            "--name-only",
-            &pr_number.to_string(),
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| format!("failed to run `gh pr diff`: {e}"))?;
+    let token = token.ok_or_else(|| "GitHub token not available".to_owned())?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("gh pr diff failed: {stderr}"));
+    let config = ureq::config::Config::builder()
+        .http_status_as_error(false)
+        .build();
+    let agent = ureq::Agent::new_with_config(config);
+
+    let url =
+        format!("https://api.github.com/repos/{repo_slug}/pulls/{pr_number}/files?per_page=100");
+
+    let response = agent
+        .get(&url)
+        .header("Authorization", &format!("Bearer {token}"))
+        .header("User-Agent", "Arbor")
+        .header("Accept", "application/vnd.github+json")
+        .call()
+        .map_err(|e| format!("GitHub REST request failed: {e}"))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.into_body().read_to_string().unwrap_or_default();
+        return Err(format!("GitHub REST returned {status}: {text}"));
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let files = stdout
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| PrChangedFile {
-            path: PathBuf::from(line.trim()),
-        })
-        .collect();
+    let text = response
+        .into_body()
+        .read_to_string()
+        .map_err(|e| format!("failed to read PR files response: {e}"))?;
 
-    Ok(files)
+    #[derive(serde::Deserialize)]
+    struct PrFile {
+        filename: String,
+    }
+
+    let files: Vec<PrFile> =
+        serde_json::from_str(&text).map_err(|e| format!("failed to parse PR files: {e}"))?;
+
+    Ok(files
+        .into_iter()
+        .map(|f| PrChangedFile {
+            path: PathBuf::from(f.filename),
+        })
+        .collect())
 }
 
 /// Compute the merge-base between `origin/{base_ref}` and `HEAD`.

@@ -1,10 +1,25 @@
 use {
+    crate::graphql::{PullRequestDetails, ReviewThreads, pull_request_details, review_threads},
+    graphql_client::GraphQLQuery,
     serde::Deserialize,
     std::{
         process::{Command, Stdio},
         sync::Arc,
     },
 };
+
+fn github_api_agent() -> ureq::Agent {
+    let config = ureq::config::Config::builder()
+        .http_status_as_error(false)
+        .build();
+    ureq::Agent::new_with_config(config)
+}
+
+fn split_slug(repo_slug: &str) -> Result<(&str, &str), String> {
+    repo_slug
+        .split_once('/')
+        .ok_or_else(|| format!("invalid repository slug: {repo_slug}"))
+}
 
 // ---------------------------------------------------------------------------
 // Review comment types
@@ -121,99 +136,102 @@ pub struct PrDetails {
     pub checks: Vec<(String, CheckStatus)>,
 }
 
+// ---------------------------------------------------------------------------
+// Typed GraphQL helper
+// ---------------------------------------------------------------------------
+
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GhPrResponse {
-    number: u64,
-    title: String,
-    url: String,
-    state: String,
-    is_draft: bool,
-    base_ref_name: String,
-    additions: usize,
-    deletions: usize,
-    review_decision: Option<String>,
-    #[serde(default)]
-    status_check_rollup: Vec<GhCheckContext>,
+struct GraphQLResponse<D> {
+    data: Option<D>,
+    errors: Option<Vec<GraphQLError>>,
 }
 
 #[derive(Deserialize)]
-struct GhCheckContext {
-    name: Option<String>,
-    context: Option<String>,
-    conclusion: Option<String>,
-    status: Option<String>,
-    state: Option<String>,
+struct GraphQLError {
+    message: String,
 }
 
-impl GhCheckContext {
-    fn display_name(&self) -> String {
-        self.name
-            .as_deref()
-            .or(self.context.as_deref())
-            .unwrap_or("check")
-            .to_owned()
+fn execute_graphql<Q: GraphQLQuery>(
+    token: &str,
+    variables: Q::Variables,
+) -> Result<Q::ResponseData, String> {
+    let request_body = Q::build_query(variables);
+    let body = serde_json::to_string(&request_body)
+        .map_err(|e| format!("failed to serialize GraphQL request: {e}"))?;
+
+    let response = github_api_agent()
+        .post("https://api.github.com/graphql")
+        .header("Authorization", &format!("Bearer {token}"))
+        .header("User-Agent", "Arbor")
+        .content_type("application/json")
+        .send(&body)
+        .map_err(|e| format!("GitHub GraphQL request failed: {e}"))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.into_body().read_to_string().unwrap_or_default();
+        return Err(format!("GitHub GraphQL returned {status}: {text}"));
     }
 
-    fn to_check_status(&self) -> CheckStatus {
-        if self
-            .status
-            .as_deref()
-            .is_some_and(|status| !status.eq_ignore_ascii_case("completed"))
-        {
-            return CheckStatus::Pending;
-        }
+    let text = response
+        .into_body()
+        .read_to_string()
+        .map_err(|e| format!("failed to read GraphQL response: {e}"))?;
 
-        if let Some(conclusion) = &self.conclusion {
-            return match conclusion.as_str() {
-                "" => CheckStatus::Pending,
-                "SUCCESS" | "success" | "NEUTRAL" | "neutral" | "SKIPPED" | "skipped" => {
-                    CheckStatus::Success
-                },
-                _ => CheckStatus::Failure,
+    let gql: GraphQLResponse<Q::ResponseData> = serde_json::from_str(&text)
+        .map_err(|e| format!("failed to parse GraphQL response: {e}"))?;
+
+    if let Some(errors) = gql.errors {
+        let msgs: Vec<String> = errors.into_iter().map(|e| e.message).collect();
+        return Err(format!("GraphQL errors: {}", msgs.join(", ")));
+    }
+
+    gql.data
+        .ok_or_else(|| "GraphQL response contained no data".to_owned())
+}
+
+// ---------------------------------------------------------------------------
+// PR details mapping from typed GraphQL response
+// ---------------------------------------------------------------------------
+
+use pull_request_details::{
+    CheckConclusionState, CheckStatusState,
+    PullRequestDetailsRepositoryPullRequestsNodes as PrNode,
+    PullRequestDetailsRepositoryPullRequestsNodesCommitsNodesCommitStatusCheckRollupContextsNodes as ContextNode,
+    PullRequestReviewDecision as GqlReviewDecision, PullRequestState, StatusState,
+};
+
+fn check_status_from_context(ctx: &ContextNode) -> (String, CheckStatus) {
+    match ctx {
+        ContextNode::CheckRun(run) => {
+            let status = if !matches!(run.status, CheckStatusState::COMPLETED) {
+                CheckStatus::Pending
+            } else {
+                match &run.conclusion {
+                    Some(
+                        CheckConclusionState::SUCCESS
+                        | CheckConclusionState::NEUTRAL
+                        | CheckConclusionState::SKIPPED,
+                    ) => CheckStatus::Success,
+                    None => CheckStatus::Pending,
+                    _ => CheckStatus::Failure,
+                }
             };
-        }
-        if let Some(state) = &self.state {
-            return match state.as_str() {
-                "SUCCESS" | "success" => CheckStatus::Success,
-                "FAILURE" | "failure" | "ERROR" | "error" => CheckStatus::Failure,
+            (run.name.clone(), status)
+        },
+        ContextNode::StatusContext(sc) => {
+            let status = match sc.state {
+                StatusState::SUCCESS => CheckStatus::Success,
+                StatusState::FAILURE | StatusState::ERROR => CheckStatus::Failure,
                 _ => CheckStatus::Pending,
             };
-        }
-        if let Some(status) = &self.status {
-            return match status.as_str() {
-                "COMPLETED" | "completed" => CheckStatus::Success,
-                _ => CheckStatus::Pending,
-            };
-        }
-        CheckStatus::Pending
+            (sc.context.clone(), status)
+        },
     }
 }
 
-fn parse_pr_details(response: GhPrResponse) -> PrDetails {
-    let state = if response.is_draft {
-        PrState::Draft
-    } else {
-        match response.state.as_str() {
-            "MERGED" | "merged" => PrState::Merged,
-            "CLOSED" | "closed" => PrState::Closed,
-            _ => PrState::Open,
-        }
-    };
-
-    let review_decision = match response.review_decision.as_deref() {
-        Some("APPROVED") => ReviewDecision::Approved,
-        Some("CHANGES_REQUESTED") => ReviewDecision::ChangesRequested,
-        _ => ReviewDecision::Pending,
-    };
-
-    let checks: Vec<(String, CheckStatus)> = response
-        .status_check_rollup
-        .iter()
-        .map(|c| (c.display_name(), c.to_check_status()))
-        .collect();
-
-    let checks_status = if checks.is_empty() {
+fn aggregate_checks_status(checks: &[(String, CheckStatus)]) -> CheckStatus {
+    if checks.is_empty() {
         CheckStatus::Pending
     } else if checks.iter().any(|(_, s)| *s == CheckStatus::Failure) {
         CheckStatus::Failure
@@ -221,47 +239,90 @@ fn parse_pr_details(response: GhPrResponse) -> PrDetails {
         CheckStatus::Success
     } else {
         CheckStatus::Pending
+    }
+}
+
+fn pr_details_from_node(node: PrNode) -> PrDetails {
+    let state = if node.is_draft {
+        PrState::Draft
+    } else {
+        match node.state {
+            PullRequestState::MERGED => PrState::Merged,
+            PullRequestState::CLOSED => PrState::Closed,
+            _ => PrState::Open,
+        }
     };
 
+    let review_decision = match node.review_decision {
+        Some(GqlReviewDecision::APPROVED) => ReviewDecision::Approved,
+        Some(GqlReviewDecision::CHANGES_REQUESTED) => ReviewDecision::ChangesRequested,
+        _ => ReviewDecision::Pending,
+    };
+
+    let context_nodes: Vec<ContextNode> = node
+        .commits
+        .nodes
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|c| c.as_ref())
+        .flat_map(|c| {
+            c.commit
+                .status_check_rollup
+                .as_ref()
+                .and_then(|r| r.contexts.nodes.as_deref())
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|n| n.as_ref())
+                .cloned()
+        })
+        .collect();
+
+    let checks: Vec<(String, CheckStatus)> = context_nodes
+        .iter()
+        .map(check_status_from_context)
+        .collect();
+    let checks_status = aggregate_checks_status(&checks);
+
     PrDetails {
-        number: response.number,
-        title: response.title,
-        url: response.url,
+        number: node.number as u64,
+        title: node.title,
+        url: node.url,
         state,
-        base_ref_name: response.base_ref_name,
-        additions: response.additions,
-        deletions: response.deletions,
+        base_ref_name: node.base_ref_name,
+        additions: node.additions as usize,
+        deletions: node.deletions as usize,
         review_decision,
         checks_status,
         checks,
     }
 }
 
-/// Fetch rich PR details using `gh pr view`. Returns `None` if `gh` is not
-/// installed, the command fails, or no PR exists for the given branch.
-pub fn pull_request_details(repo_slug: &str, branch: &str) -> Option<PrDetails> {
-    let output = Command::new("gh")
-        .args([
-            "pr",
-            "view",
-            "--repo",
-            repo_slug,
-            "--json",
-            "number,title,url,state,isDraft,baseRefName,additions,deletions,reviewDecision,statusCheckRollup",
-            branch,
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+/// Fetch rich PR details using the GitHub GraphQL API. Returns `None` if no
+/// token is available, the request fails, or no PR exists for the given branch.
+pub fn pull_request_details(
+    repo_slug: &str,
+    branch: &str,
+    token: Option<&str>,
+) -> Option<PrDetails> {
+    let token = token?;
+    let (owner, repo) = split_slug(repo_slug).ok()?;
 
-    if !output.status.success() {
-        return None;
-    }
+    let vars = pull_request_details::Variables {
+        owner: owner.to_owned(),
+        repo: repo.to_owned(),
+        head: branch.to_owned(),
+    };
 
-    let response: GhPrResponse = serde_json::from_slice(&output.stdout).ok()?;
-    Some(parse_pr_details(response))
+    let data = execute_graphql::<PullRequestDetails>(token, vars).ok()?;
+
+    data.repository?
+        .pull_requests
+        .nodes?
+        .into_iter()
+        .flatten()
+        .next()
+        .map(pr_details_from_node)
 }
 
 pub trait GitHubService: Send + Sync {
@@ -354,93 +415,17 @@ pub fn default_github_service() -> Arc<dyn GitHubService> {
 }
 
 // ---------------------------------------------------------------------------
-// GhCliReviewService — uses `gh api graphql` / `gh api` REST
+// UreqReviewService — uses ureq for GitHub GraphQL & REST API
 // ---------------------------------------------------------------------------
 
-pub struct GhCliReviewService;
+pub struct UreqReviewService {
+    token_fn: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+}
 
-impl GhCliReviewService {
-    fn split_slug(repo_slug: &str) -> Result<(&str, &str), String> {
-        repo_slug
-            .split_once('/')
-            .ok_or_else(|| format!("invalid repository slug: {repo_slug}"))
+impl UreqReviewService {
+    fn token(&self) -> Result<String, String> {
+        (self.token_fn)().ok_or_else(|| "GitHub token not available".to_owned())
     }
-}
-
-// Serde types for GraphQL response -----------------------------------------
-
-#[derive(Deserialize)]
-struct GqlResponse {
-    data: Option<GqlData>,
-    errors: Option<Vec<GqlError>>,
-}
-
-#[derive(Deserialize)]
-struct GqlError {
-    message: String,
-}
-
-#[derive(Deserialize)]
-struct GqlData {
-    repository: Option<GqlRepository>,
-}
-
-#[derive(Deserialize)]
-struct GqlRepository {
-    #[serde(rename = "pullRequest")]
-    pull_request: Option<GqlPullRequest>,
-}
-
-#[derive(Deserialize)]
-struct GqlPullRequest {
-    #[serde(rename = "reviewThreads")]
-    review_threads: GqlReviewThreadConnection,
-}
-
-#[derive(Deserialize)]
-struct GqlReviewThreadConnection {
-    nodes: Vec<GqlReviewThread>,
-}
-
-#[derive(Deserialize)]
-struct GqlReviewThread {
-    id: String,
-    #[serde(rename = "isResolved")]
-    is_resolved: bool,
-    #[serde(rename = "isOutdated")]
-    is_outdated: bool,
-    path: String,
-    line: Option<usize>,
-    #[serde(rename = "startLine")]
-    start_line: Option<usize>,
-    #[serde(rename = "diffSide")]
-    diff_side: Option<String>,
-    comments: GqlCommentConnection,
-}
-
-#[derive(Deserialize)]
-struct GqlCommentConnection {
-    nodes: Vec<GqlComment>,
-}
-
-#[derive(Deserialize)]
-struct GqlComment {
-    #[serde(rename = "databaseId")]
-    database_id: Option<u64>,
-    body: String,
-    author: Option<GqlAuthor>,
-    #[serde(rename = "createdAt")]
-    created_at: String,
-    outdated: bool,
-    path: String,
-    line: Option<usize>,
-    #[serde(rename = "startLine")]
-    start_line: Option<usize>,
-}
-
-#[derive(Deserialize)]
-struct GqlAuthor {
-    login: String,
 }
 
 // REST response for posting a comment ---------------------------------------
@@ -474,102 +459,54 @@ fn parse_diff_side(raw: Option<&str>) -> DiffSide {
     }
 }
 
-impl GitHubReviewService for GhCliReviewService {
+fn gql_diff_side_to_diff_side(side: &review_threads::DiffSide) -> DiffSide {
+    match side {
+        review_threads::DiffSide::LEFT => DiffSide::Left,
+        _ => DiffSide::Right,
+    }
+}
+
+impl GitHubReviewService for UreqReviewService {
+    #[allow(deprecated)] // databaseId deprecated in favour of fullDatabaseId (BigInt)
     fn fetch_review_threads(
         &self,
         repo_slug: &str,
         pr_number: u64,
     ) -> Result<Vec<ReviewThread>, String> {
-        let (owner, repo) = Self::split_slug(repo_slug)?;
+        let token = self.token()?;
+        let (owner, repo) = split_slug(repo_slug)?;
 
-        let query = r#"
-query($owner: String!, $repo: String!, $pr: Int!) {
-  repository(owner: $owner, name: $repo) {
-    pullRequest(number: $pr) {
-      reviewThreads(first: 100) {
-        nodes {
-          id
-          isResolved
-          isOutdated
-          path
-          line
-          startLine
-          diffSide
-          comments(first: 50) {
-            nodes {
-              databaseId
-              body
-              author { login }
-              createdAt
-              outdated
-              path
-              line
-              startLine
-            }
-          }
-        }
-      }
-    }
-  }
-}
-"#;
+        let vars = review_threads::Variables {
+            owner: owner.to_owned(),
+            repo: repo.to_owned(),
+            pr: pr_number as i64,
+        };
 
-        let variables = format!(
-            r#"{{"owner":"{}","repo":"{}","pr":{}}}"#,
-            owner, repo, pr_number
-        );
+        let data = execute_graphql::<ReviewThreads>(&token, vars)?;
 
-        let output = Command::new("gh")
-            .args([
-                "api",
-                "graphql",
-                "-f",
-                &format!("query={query}"),
-                "-f",
-                &format!("variables={variables}"),
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|e| format!("failed to run `gh api graphql`: {e}"))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("gh api graphql failed: {stderr}"));
-        }
-
-        let response: GqlResponse = serde_json::from_slice(&output.stdout)
-            .map_err(|e| format!("failed to parse GraphQL response: {e}"))?;
-
-        if let Some(errors) = response.errors {
-            let msgs: Vec<String> = errors.into_iter().map(|e| e.message).collect();
-            return Err(format!("GraphQL errors: {}", msgs.join(", ")));
-        }
-
-        let threads = response
-            .data
-            .and_then(|d| d.repository)
+        let threads = data
+            .repository
             .and_then(|r| r.pull_request)
-            .map(|pr| pr.review_threads.nodes)
+            .map(|pr| pr.review_threads.nodes.unwrap_or_default())
             .unwrap_or_default();
 
         Ok(threads
             .into_iter()
+            .flatten()
             .map(|thread| {
-                let side = parse_diff_side(thread.diff_side.as_deref());
-                let first_comment_id = thread
-                    .comments
-                    .nodes
+                let side = gql_diff_side_to_diff_side(&thread.diff_side);
+                let comments_vec = thread.comments.nodes.unwrap_or_default();
+                let first_comment_id = comments_vec
                     .first()
-                    .and_then(|first| first.database_id);
-                let comments = thread
-                    .comments
-                    .nodes
+                    .and_then(|first| first.as_ref())
+                    .and_then(|first| first.database_id)
+                    .map(|id| id as u64);
+                let comments = comments_vec
                     .into_iter()
+                    .flatten()
                     .enumerate()
                     .map(|(i, c)| ReviewComment {
-                        id: c.database_id.unwrap_or(0),
+                        id: c.database_id.map(|id| id as u64).unwrap_or(0),
                         author: c
                             .author
                             .map(|a| a.login)
@@ -578,8 +515,8 @@ query($owner: String!, $repo: String!, $pr: Int!) {
                         created_at: c.created_at,
                         outdated: c.outdated,
                         path: c.path,
-                        line: c.line,
-                        start_line: c.start_line,
+                        line: c.line.map(|l| l as usize),
+                        start_line: c.start_line.map(|l| l as usize),
                         side,
                         in_reply_to: if i > 0 {
                             first_comment_id
@@ -592,8 +529,8 @@ query($owner: String!, $repo: String!, $pr: Int!) {
                 ReviewThread {
                     id: thread.id,
                     path: thread.path,
-                    line: thread.line,
-                    start_line: thread.start_line,
+                    line: thread.line.map(|l| l as usize),
+                    start_line: thread.start_line.map(|l| l as usize),
                     side,
                     is_resolved: thread.is_resolved,
                     is_outdated: thread.is_outdated,
@@ -613,40 +550,43 @@ query($owner: String!, $repo: String!, $pr: Int!) {
         body: &str,
         commit_sha: &str,
     ) -> Result<ReviewComment, String> {
+        let token = self.token()?;
         let side_str = match side {
             DiffSide::Left => "LEFT",
             DiffSide::Right => "RIGHT",
         };
 
-        let endpoint = format!("repos/{repo_slug}/pulls/{pr_number}/comments");
+        let url = format!("https://api.github.com/repos/{repo_slug}/pulls/{pr_number}/comments");
+        let payload = serde_json::to_string(&serde_json::json!({
+            "body": body,
+            "commit_id": commit_sha,
+            "path": path,
+            "line": line,
+            "side": side_str,
+        }))
+        .map_err(|e| format!("failed to serialize comment payload: {e}"))?;
 
-        let output = Command::new("gh")
-            .args([
-                "api",
-                &endpoint,
-                "-f",
-                &format!("body={body}"),
-                "-f",
-                &format!("commit_id={commit_sha}"),
-                "-f",
-                &format!("path={path}"),
-                "-F",
-                &format!("line={line}"),
-                "-f",
-                &format!("side={side_str}"),
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|e| format!("failed to run `gh api`: {e}"))?;
+        let response = github_api_agent()
+            .post(&url)
+            .header("Authorization", &format!("Bearer {token}"))
+            .header("User-Agent", "Arbor")
+            .content_type("application/json")
+            .header("Accept", "application/vnd.github+json")
+            .send(&payload)
+            .map_err(|e| format!("GitHub REST POST failed: {e}"))?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("gh api POST failed: {stderr}"));
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.into_body().read_to_string().unwrap_or_default();
+            return Err(format!("GitHub REST POST returned {status}: {text}"));
         }
 
-        let resp: RestCommentResponse = serde_json::from_slice(&output.stdout)
+        let text = response
+            .into_body()
+            .read_to_string()
+            .map_err(|e| format!("failed to read comment response: {e}"))?;
+
+        let resp: RestCommentResponse = serde_json::from_str(&text)
             .map_err(|e| format!("failed to parse comment response: {e}"))?;
 
         Ok(ReviewComment {
@@ -673,22 +613,34 @@ query($owner: String!, $repo: String!, $pr: Int!) {
         comment_id: u64,
         body: &str,
     ) -> Result<ReviewComment, String> {
-        let endpoint = format!("repos/{repo_slug}/pulls/{pr_number}/comments/{comment_id}/replies");
+        let token = self.token()?;
+        let url = format!(
+            "https://api.github.com/repos/{repo_slug}/pulls/{pr_number}/comments/{comment_id}/replies"
+        );
+        let payload = serde_json::to_string(&serde_json::json!({ "body": body }))
+            .map_err(|e| format!("failed to serialize reply payload: {e}"))?;
 
-        let output = Command::new("gh")
-            .args(["api", &endpoint, "-f", &format!("body={body}")])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|e| format!("failed to run `gh api`: {e}"))?;
+        let response = github_api_agent()
+            .post(&url)
+            .header("Authorization", &format!("Bearer {token}"))
+            .header("User-Agent", "Arbor")
+            .content_type("application/json")
+            .header("Accept", "application/vnd.github+json")
+            .send(&payload)
+            .map_err(|e| format!("GitHub REST POST reply failed: {e}"))?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("gh api POST reply failed: {stderr}"));
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.into_body().read_to_string().unwrap_or_default();
+            return Err(format!("GitHub REST reply returned {status}: {text}"));
         }
 
-        let resp: RestCommentResponse = serde_json::from_slice(&output.stdout)
+        let text = response
+            .into_body()
+            .read_to_string()
+            .map_err(|e| format!("failed to read reply response: {e}"))?;
+
+        let resp: RestCommentResponse = serde_json::from_str(&text)
             .map_err(|e| format!("failed to parse reply response: {e}"))?;
 
         Ok(ReviewComment {
@@ -709,8 +661,10 @@ query($owner: String!, $repo: String!, $pr: Int!) {
     }
 }
 
-pub fn default_review_service() -> Arc<dyn GitHubReviewService> {
-    Arc::new(GhCliReviewService)
+pub fn default_review_service(
+    token_fn: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+) -> Arc<dyn GitHubReviewService> {
+    Arc::new(UreqReviewService { token_fn })
 }
 
 pub fn github_access_token_from_gh_cli() -> Option<String> {
@@ -732,43 +686,72 @@ pub fn github_access_token_from_gh_cli() -> Option<String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{CheckStatus, GhCheckContext, GhPrResponse, parse_pr_details};
+    use super::*;
 
     #[test]
-    fn in_progress_checks_remain_pending_without_conclusion() {
-        let details = parse_pr_details(GhPrResponse {
-            number: 40,
-            title: "Fix native toolbar buttons and linked worktree grouping".to_owned(),
-            url: "https://github.com/penso/arbor/pull/40".to_owned(),
-            state: "OPEN".to_owned(),
-            is_draft: false,
-            base_ref_name: "main".to_owned(),
-            additions: 10,
-            deletions: 2,
-            review_decision: None,
-            status_check_rollup: vec![
-                GhCheckContext {
-                    name: Some("Clippy".to_owned()),
-                    context: None,
-                    conclusion: Some(String::new()),
-                    status: Some("IN_PROGRESS".to_owned()),
-                    state: None,
-                },
-                GhCheckContext {
-                    name: Some("Test".to_owned()),
-                    context: None,
-                    conclusion: Some(String::new()),
-                    status: Some("IN_PROGRESS".to_owned()),
-                    state: None,
-                },
-            ],
-        });
+    fn in_progress_checks_remain_pending() {
+        use pull_request_details::{
+            CheckStatusState,
+            PullRequestDetailsRepositoryPullRequestsNodesCommitsNodesCommitStatusCheckRollupContextsNodesOnCheckRun as CheckRun,
+        };
 
-        assert_eq!(details.checks_status, CheckStatus::Pending);
-        assert_eq!(details.checks, vec![
+        let contexts = [
+            ContextNode::CheckRun(CheckRun {
+                name: "Clippy".to_owned(),
+                conclusion: None,
+                status: CheckStatusState::IN_PROGRESS,
+            }),
+            ContextNode::CheckRun(CheckRun {
+                name: "Test".to_owned(),
+                conclusion: None,
+                status: CheckStatusState::IN_PROGRESS,
+            }),
+        ];
+
+        let checks: Vec<(String, CheckStatus)> =
+            contexts.iter().map(check_status_from_context).collect();
+
+        assert_eq!(aggregate_checks_status(&checks), CheckStatus::Pending);
+        assert_eq!(checks, vec![
             ("Clippy".to_owned(), CheckStatus::Pending),
             ("Test".to_owned(), CheckStatus::Pending),
         ]);
+    }
+
+    #[test]
+    fn completed_check_with_success_conclusion() {
+        use pull_request_details::{
+            CheckConclusionState, CheckStatusState,
+            PullRequestDetailsRepositoryPullRequestsNodesCommitsNodesCommitStatusCheckRollupContextsNodesOnCheckRun as CheckRun,
+        };
+
+        let ctx = ContextNode::CheckRun(CheckRun {
+            name: "Build".to_owned(),
+            conclusion: Some(CheckConclusionState::SUCCESS),
+            status: CheckStatusState::COMPLETED,
+        });
+
+        let (name, status) = check_status_from_context(&ctx);
+        assert_eq!(name, "Build");
+        assert_eq!(status, CheckStatus::Success);
+    }
+
+    #[test]
+    fn status_context_failure() {
+        use pull_request_details::{
+            PullRequestDetailsRepositoryPullRequestsNodesCommitsNodesCommitStatusCheckRollupContextsNodesOnStatusContext as StatusCtx,
+            StatusState,
+        };
+
+        let ctx = ContextNode::StatusContext(StatusCtx {
+            context: "ci/deploy".to_owned(),
+            state: StatusState::FAILURE,
+        });
+
+        let (name, status) = check_status_from_context(&ctx);
+        assert_eq!(name, "ci/deploy");
+        assert_eq!(status, CheckStatus::Failure);
     }
 }

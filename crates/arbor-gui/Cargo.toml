@@ -32,6 +32,7 @@ futures = { workspace = true }
 git2 = { workspace = true }
 gix = { workspace = true }
 gix-diff = { workspace = true, features = ["blob-experimental"] }
+graphql_client = { workspace = true }
 gpui = { workspace = true }
 hostname = { workspace = true }
 gpui_http_client = { workspace = true }

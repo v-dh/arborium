@@ -5,6 +5,7 @@ mod connection_history;
 mod constants;
 mod github_auth_store;
 mod github_service;
+mod graphql;
 mod helpers;
 mod log_layer;
 #[cfg(feature = "mdns")]
@@ -179,6 +180,7 @@ struct ArborWindow {
     github_auth_store: Box<dyn github_auth_store::GithubAuthStore>,
     github_service: Arc<dyn github_service::GitHubService>,
     review_service: Arc<dyn github_service::GitHubReviewService>,
+    github_token_shared: Arc<std::sync::RwLock<Option<String>>>,
     review_threads: HashMap<PathBuf, Vec<github_service::ReviewThread>>,
     review_threads_loading: bool,
     github_auth_state: github_auth_store::GithubAuthState,
@@ -340,7 +342,15 @@ impl ArborWindow {
         let ui_state_store = ui_state_store::default_ui_state_store();
         let github_auth_store = github_auth_store::default_github_auth_store();
         let github_service = github_service::default_github_service();
-        let review_service = github_service::default_review_service();
+        let github_token_shared: Arc<std::sync::RwLock<Option<String>>> =
+            Arc::new(std::sync::RwLock::new(None));
+        let token_shared_clone = github_token_shared.clone();
+        let review_service = github_service::default_review_service(Arc::new(move || {
+            token_shared_clone
+                .read()
+                .ok()
+                .and_then(|guard| guard.clone())
+        }));
         let notification_service = notifications::default_notification_service();
         let loaded_github_auth_state = github_auth_store.load();
         let config_path = app_config_store.config_path();
@@ -438,6 +448,7 @@ impl ArborWindow {
                     github_auth_store,
                     github_service,
                     review_service: review_service.clone(),
+                    github_token_shared: github_token_shared.clone(),
                     review_threads: HashMap::new(),
                     review_threads_loading: false,
                     github_auth_state,
@@ -774,6 +785,7 @@ impl ArborWindow {
             github_auth_store,
             github_service,
             review_service,
+            github_token_shared: github_token_shared.clone(),
             review_threads: HashMap::new(),
             review_threads_loading: false,
             github_auth_state,
@@ -1797,6 +1809,7 @@ impl ArborWindow {
             ));
         }
 
+        self.sync_github_token_shared();
         self.refresh_worktree_diff_summaries(cx);
         self.refresh_agent_tasks(cx);
         self.refresh_worktree_pull_requests(cx);
@@ -2155,9 +2168,12 @@ impl ArborWindow {
                     tracked_branches
                         .into_iter()
                         .map(|(path, branch, repo_slug)| {
-                            // Try gh CLI first for rich details
                             let details = repo_slug.as_ref().and_then(|slug| {
-                                github_service::pull_request_details(slug, &branch)
+                                github_service::pull_request_details(
+                                    slug,
+                                    &branch,
+                                    github_token.as_deref(),
+                                )
                             });
 
                             let (pr_number, pr_url) = if let Some(ref d) = details {
@@ -2527,12 +2543,13 @@ impl ArborWindow {
         };
 
         let worktree_path = worktree.path.clone();
+        let token = self.github_access_token();
 
         self.pr_changed_files_loading = true;
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
-                    let files = fetch_pr_changed_files(&repo_slug, pr_number)?;
+                    let files = fetch_pr_changed_files(&repo_slug, pr_number, token.as_deref())?;
                     let merge_base = compute_merge_base(&worktree_path, &base_ref_name)?;
                     Ok::<_, String>((files, merge_base))
                 })
@@ -3787,6 +3804,12 @@ impl ArborWindow {
         resolve_github_access_token(self.github_auth_state.access_token.as_deref())
     }
 
+    fn sync_github_token_shared(&self) {
+        if let Ok(mut guard) = self.github_token_shared.write() {
+            *guard = self.github_access_token();
+        }
+    }
+
     fn persist_github_auth_state(&self) -> Result<(), String> {
         self.github_auth_store.save(&self.github_auth_state)
     }
@@ -3805,6 +3828,7 @@ impl ArborWindow {
                 "disconnected, but failed to persist auth state: {error}"
             )),
         };
+        self.sync_github_token_shared();
         self.refresh_worktree_pull_requests(cx);
         cx.notify();
     }
@@ -3913,6 +3937,7 @@ impl ArborWindow {
                                 "GitHub connected, but failed to persist auth state: {error}"
                             )),
                         };
+                        this.sync_github_token_shared();
                         this.refresh_worktree_pull_requests(cx);
                     },
                     Err(error) => {
@@ -11706,8 +11731,14 @@ impl ArborWindow {
                                     .id("log-copy-all")
                                     .cursor_pointer()
                                     .text_xs()
+                                    .px(px(4.))
+                                    .py(px(1.))
+                                    .rounded_sm()
                                     .text_color(rgb(theme.text_muted))
-                                    .hover(|this| this.text_color(rgb(theme.text_primary)))
+                                    .hover(|this| {
+                                        this.text_color(rgb(theme.text_primary))
+                                            .bg(rgb(theme.panel_active_bg))
+                                    })
                                     .child("Copy All")
                                     .on_mouse_down(
                                         MouseButton::Left,

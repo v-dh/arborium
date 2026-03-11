@@ -306,6 +306,7 @@ impl ArborWindow {
                     notification_service,
                     notifications_enabled,
                     last_agent_finished_notifications: HashMap::new(),
+                    auto_checkpoint_in_flight: HashSet::new(),
                     window_is_active: true,
                     notice: (!notice_parts.is_empty()).then_some(notice_parts.join(" | ")),
                     theme_toast: None,
@@ -314,6 +315,11 @@ impl ArborWindow {
                     right_pane_search: String::new(),
                     right_pane_search_cursor: 0,
                     right_pane_search_active: false,
+                    worktree_notes_lines: vec![String::new()],
+                    worktree_notes_cursor: FileViewCursor { line: 0, col: 0 },
+                    worktree_notes_path: None,
+                    worktree_notes_active: false,
+                    worktree_notes_error: None,
                     file_tree_entries: Vec::new(),
                     expanded_dirs: HashSet::new(),
                     selected_file_tree_entry: None,
@@ -654,6 +660,7 @@ impl ArborWindow {
             notification_service,
             notifications_enabled,
             last_agent_finished_notifications: HashMap::new(),
+            auto_checkpoint_in_flight: HashSet::new(),
             window_is_active: true,
             notice: (!notice_parts.is_empty()).then_some(notice_parts.join(" | ")),
             theme_toast: None,
@@ -662,6 +669,11 @@ impl ArborWindow {
             right_pane_search: String::new(),
             right_pane_search_cursor: 0,
             right_pane_search_active: false,
+            worktree_notes_lines: vec![String::new()],
+            worktree_notes_cursor: FileViewCursor { line: 0, col: 0 },
+            worktree_notes_path: None,
+            worktree_notes_active: false,
+            worktree_notes_error: None,
             file_tree_entries: Vec::new(),
             expanded_dirs: HashSet::new(),
             selected_file_tree_entry: None,
@@ -685,6 +697,7 @@ impl ArborWindow {
 
         app.refresh_worktrees(cx);
         app.refresh_repo_config_if_changed(cx);
+        app.refresh_github_auth_identity(cx);
         app.restore_terminal_sessions_from_records(initial_daemon_records, attach_daemon_runtime);
         let _ = app.ensure_selected_worktree_terminal();
         app.sync_daemon_session_store(cx);
@@ -782,6 +795,7 @@ impl ArborWindow {
                     }
 
                     this.refresh_worktree_diff_summaries(cx);
+                    this.refresh_worktree_ports(cx);
                     if this.active_outpost_index.is_some() {
                         this.refresh_remote_changed_files(cx);
                     } else if this.reload_changed_files() {
@@ -1066,9 +1080,24 @@ impl ArborWindow {
     }
 
     fn refresh_repo_config_if_changed(&mut self, cx: &mut Context<Self>) {
+        let mut changed = false;
         let next_presets = self.load_all_repo_presets();
         if self.repo_presets != next_presets {
             self.repo_presets = next_presets;
+            changed = true;
+        }
+
+        if self.active_preset_tab.is_none()
+            && let Some(preset) = self
+                .active_repo_config()
+                .and_then(|config| config.agent.default_preset)
+                .and_then(|value| AgentPresetKind::from_key(&value))
+        {
+            self.active_preset_tab = Some(preset);
+            changed = true;
+        }
+
+        if changed {
             cx.notify();
         }
     }
@@ -1095,6 +1124,176 @@ impl ArborWindow {
             .unwrap_or_else(|| self.repo_root.clone())
     }
 
+    fn active_repo_config(&self) -> Option<app_config::RepoConfig> {
+        self.app_config_store.load_repo_config(&self.repo_root)
+    }
+
+    fn selected_agent_preset_or_default(&self) -> AgentPresetKind {
+        self.active_preset_tab.unwrap_or_else(|| {
+            self.active_repo_config()
+                .and_then(|config| config.agent.default_preset)
+                .and_then(|value| AgentPresetKind::from_key(&value))
+                .unwrap_or(AgentPresetKind::Codex)
+        })
+    }
+
+    fn branch_prefix_github_login(&self) -> Option<String> {
+        self.github_auth_state
+            .user_login
+            .clone()
+            .or_else(|| env::var("ARBOR_GITHUB_USER").ok())
+            .or_else(|| env::var("GITHUB_USER").ok())
+            .and_then(|value| non_empty_trimmed_str(&value).map(str::to_owned))
+    }
+
+    fn derive_branch_name_for_repo(&self, repo_root: &Path, worktree_name: &str) -> String {
+        if repo_root.as_os_str().is_empty() || !repo_root.exists() {
+            return derive_branch_name(worktree_name);
+        }
+        let repo_root = worktree::repo_root(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+        derive_branch_name_with_repo_config(
+            &repo_root,
+            worktree_name,
+            self.branch_prefix_github_login().as_deref(),
+        )
+    }
+
+    fn repo_auto_checkpoint_enabled(&self, worktree: &WorktreeSummary) -> bool {
+        self.app_config_store
+            .load_repo_config(&worktree.repo_root)
+            .and_then(|config| config.agent.auto_checkpoint)
+            .unwrap_or(false)
+    }
+
+    fn refresh_worktree_ports(&mut self, cx: &mut Context<Self>) {
+        let worktree_paths: Vec<PathBuf> = self
+            .worktrees
+            .iter()
+            .map(|worktree| worktree.path.clone())
+            .collect();
+        if worktree_paths.is_empty() {
+            return;
+        }
+
+        let scan_targets: Vec<PortScanTarget> = self
+            .terminals
+            .iter()
+            .filter(|session| {
+                session.state == TerminalState::Running
+                    && session
+                        .runtime
+                        .as_ref()
+                        .is_some_and(|runtime| runtime.kind() == TerminalRuntimeKind::Local)
+            })
+            .filter_map(|session| {
+                session.root_pid.map(|root_pid| PortScanTarget {
+                    worktree_path: session.worktree_path.clone(),
+                    root_pid,
+                })
+            })
+            .collect();
+        let terminal_output_hints: HashMap<PathBuf, String> = worktree_paths
+            .iter()
+            .map(|worktree_path| {
+                let mut combined = String::new();
+                for session in self
+                    .terminals
+                    .iter()
+                    .filter(|session| session.worktree_path == *worktree_path)
+                {
+                    if !combined.is_empty() {
+                        combined.push('\n');
+                    }
+                    combined.push_str(&terminal_output_tail_for_metadata(session, 48, 8_000));
+                }
+                (worktree_path.clone(), combined)
+            })
+            .collect();
+
+        cx.spawn(async move |this, cx| {
+            let detected = cx
+                .background_spawn(async move {
+                    detect_ports_for_worktrees(
+                        &worktree_paths,
+                        &scan_targets,
+                        &terminal_output_hints,
+                    )
+                })
+                .await;
+
+            let _ = this.update(cx, |this, cx| {
+                let mut changed = false;
+                for worktree in &mut this.worktrees {
+                    let next_ports = detected.get(&worktree.path).cloned().unwrap_or_default();
+                    if worktree.detected_ports != next_ports {
+                        worktree.detected_ports = next_ports;
+                        changed = true;
+                    }
+                }
+
+                if changed {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn maybe_run_auto_checkpoint(&mut self, worktree: &WorktreeSummary) {
+        if !self.repo_auto_checkpoint_enabled(worktree) {
+            return;
+        }
+        if self.active_outpost_index.is_some() {
+            return;
+        }
+        if !self.auto_checkpoint_in_flight.insert(worktree.path.clone()) {
+            return;
+        }
+
+        let changed_files = match changes::changed_files(&worktree.path) {
+            Ok(files) => files,
+            Err(error) => {
+                self.auto_checkpoint_in_flight.remove(&worktree.path);
+                self.notice = Some(format!(
+                    "failed to inspect auto-checkpoint changes: {error}"
+                ));
+                return;
+            },
+        };
+        if changed_files.is_empty() {
+            self.auto_checkpoint_in_flight.remove(&worktree.path);
+            return;
+        }
+
+        let message =
+            auto_checkpoint_commit_message(&changed_files, worktree.agent_task.as_deref());
+        match run_git_commit_for_worktree(&worktree.path, &changed_files, &message) {
+            Ok(summary) => {
+                if let Some(target) = self
+                    .worktrees
+                    .iter_mut()
+                    .find(|candidate| candidate.path == worktree.path)
+                {
+                    target.diff_summary = changes::diff_line_summary(&target.path).ok();
+                    target.branch_divergence = branch_divergence_summary(&target.path);
+                }
+                if self
+                    .selected_local_worktree_path()
+                    .is_some_and(|selected| selected == worktree.path.as_path())
+                {
+                    let _ = self.reload_changed_files();
+                }
+                self.notice = Some(summary);
+            },
+            Err(error) if error == "nothing to commit" => {},
+            Err(error) => {
+                self.notice = Some(format!("auto-checkpoint failed: {error}"));
+            },
+        }
+
+        self.auto_checkpoint_in_flight.remove(&worktree.path);
+    }
+
     fn sync_daemon_session_store(&mut self, cx: &mut Context<Self>) {
         let shell = self.embedded_shell();
         let updated_at_unix_ms = current_unix_timestamp_millis();
@@ -1111,6 +1310,7 @@ impl ArborWindow {
                 } else {
                     session.command.clone()
                 },
+                root_pid: session.root_pid,
                 cols: session.cols.max(2),
                 rows: session.rows.max(1),
                 title: Some(session.title.clone()),
@@ -1213,6 +1413,10 @@ impl ArborWindow {
                     session.updated_at_unix_ms = record.updated_at_unix_ms;
                     changed = true;
                 }
+                if session.root_pid != record.root_pid {
+                    session.root_pid = record.root_pid;
+                    changed = true;
+                }
                 if session.cols != cols || session.rows != rows {
                     session.cols = cols;
                     session.rows = rows;
@@ -1242,6 +1446,7 @@ impl ArborWindow {
                     state: session_state,
                     exit_code: record.exit_code,
                     updated_at_unix_ms: record.updated_at_unix_ms,
+                    root_pid: record.root_pid,
                     cols,
                     rows,
                     generation: 0,
@@ -1348,6 +1553,7 @@ impl ArborWindow {
 
     fn sync_running_terminals(&mut self, cx: &mut Context<Self>) {
         let mut changed = false;
+        let mut should_refresh_ports = false;
         let follow_output = terminal_scroll_is_near_bottom(&self.terminal_scroll_handle);
         let active_terminal_id = self.active_terminal_id_for_selected_worktree();
         let target_grid_size =
@@ -1381,6 +1587,13 @@ impl ArborWindow {
             self.terminals[index].last_runtime_sync_at = Some(now);
 
             changed |= outcome.changed;
+            if outcome.changed {
+                let recent_output =
+                    terminal_output_tail_for_metadata(&self.terminals[index], 24, 4_000);
+                if output_contains_port_hint(&recent_output) {
+                    should_refresh_ports = true;
+                }
+            }
 
             if outcome.clear_global_daemon {
                 self.terminal_daemon = None;
@@ -1410,6 +1623,9 @@ impl ArborWindow {
 
         if changed {
             self.sync_daemon_session_store(cx);
+            if should_refresh_ports {
+                self.refresh_worktree_ports(cx);
+            }
             if should_auto_follow_terminal_output(changed, follow_output) {
                 self.terminal_scroll_handle.scroll_to_bottom();
             }
@@ -1481,6 +1697,11 @@ impl ArborWindow {
             .worktrees
             .iter()
             .map(|worktree| (worktree.path.clone(), worktree.recent_turns.clone()))
+            .collect();
+        let previous_detected_ports: HashMap<PathBuf, Vec<DetectedPort>> = self
+            .worktrees
+            .iter()
+            .map(|worktree| (worktree.path.clone(), worktree.detected_ports.clone()))
             .collect();
         let previous_recent_agent_sessions: HashMap<
             PathBuf,
@@ -1554,6 +1775,10 @@ impl ArborWindow {
             worktree.pr_details = previous_pr_details.get(&worktree.path).cloned();
             worktree.agent_state = previous_agent_states.get(&worktree.path).copied();
             worktree.agent_task = previous_agent_tasks.get(&worktree.path).cloned();
+            worktree.detected_ports = previous_detected_ports
+                .get(&worktree.path)
+                .cloned()
+                .unwrap_or_default();
             worktree.recent_turns = previous_recent_turns
                 .get(&worktree.path)
                 .cloned()
@@ -1639,10 +1864,12 @@ impl ArborWindow {
         }
 
         self.refresh_worktree_diff_summaries(cx);
+        self.refresh_worktree_ports(cx);
         self.refresh_agent_tasks(cx);
         self.refresh_agent_sessions(cx);
         self.refresh_worktree_pull_requests(cx);
         let changed_files_changed = self.reload_changed_files();
+        self.sync_selected_worktree_notes();
         let created_terminal = self.ensure_selected_worktree_terminal();
         if created_terminal {
             self.sync_daemon_session_store(cx);
@@ -2240,6 +2467,13 @@ impl ArborWindow {
                 );
                 self.welcome_clone_error = None;
                 cx.notify();
+                cx.stop_propagation();
+            }
+            return;
+        }
+
+        if self.worktree_notes_active && self.right_pane_tab == RightPaneTab::Notes {
+            if self.handle_worktree_notes_key_down(event, cx) {
                 cx.stop_propagation();
             }
             return;
@@ -3090,6 +3324,7 @@ impl ArborWindow {
             state: TerminalState::Running,
             exit_code: None,
             updated_at_unix_ms: current_unix_timestamp_millis(),
+            root_pid: None,
             cols: 120,
             rows: 35,
             generation: 0,
@@ -3130,6 +3365,7 @@ impl ArborWindow {
                     session.state = terminal_state_from_daemon_record(&daemon_session);
                     session.exit_code = daemon_session.exit_code;
                     session.updated_at_unix_ms = daemon_session.updated_at_unix_ms;
+                    session.root_pid = daemon_session.root_pid;
                     session.cols = daemon_session.cols.max(2);
                     session.rows = daemon_session.rows.max(1);
                     session.runtime = Some(local_daemon_runtime(
@@ -3157,6 +3393,7 @@ impl ArborWindow {
             let (initial_rows, initial_cols) = self.last_terminal_grid_size.unwrap_or((0, 0));
             match terminal_backend::launch_backend(backend_kind, &cwd, initial_rows, initial_cols) {
                 Ok(TerminalLaunch::Embedded(runtime)) => {
+                    session.root_pid = runtime.root_pid();
                     runtime.set_notify(self.terminal_poll_tx.clone());
                     session.command = "embedded shell".to_owned();
                     session.generation = runtime.generation();
@@ -3306,6 +3543,7 @@ impl ArborWindow {
             state: TerminalState::Running,
             exit_code: None,
             updated_at_unix_ms: current_unix_timestamp_millis(),
+            root_pid: None,
             cols: 120,
             rows: 35,
             generation: 0,
@@ -3720,6 +3958,7 @@ impl WorktreeSummary {
             pr_details: None,
             branch_divergence: branch_divergence_summary(&entry.path),
             diff_summary: None,
+            detected_ports: Vec::new(),
             recent_turns: Vec::new(),
             stuck_turn_count: 0,
             recent_agent_sessions: Vec::new(),
@@ -3843,6 +4082,11 @@ impl EntityInputHandler for ArborWindow {
         if self.welcome_clone_url_active {
             self.welcome_clone_url.push_str(text);
             self.welcome_clone_error = None;
+            cx.notify();
+            return;
+        }
+        if self.worktree_notes_active && self.right_pane_tab == RightPaneTab::Notes {
+            self.insert_text_into_selected_worktree_notes(text);
             cx.notify();
             return;
         }
@@ -4218,6 +4462,7 @@ fn apply_agent_ws_update(app: &mut ArborWindow, entries: &[(String, AgentState, 
             }
             if let Some(worktree) = notification_worktree.as_ref() {
                 app.maybe_notify_agent_finished(worktree, *updated_at);
+                app.maybe_run_auto_checkpoint(worktree);
             }
         } else {
             tracing::warn!(
@@ -4553,6 +4798,7 @@ fn worktree_rows_changed(previous: &[WorktreeSummary], next: &[WorktreeSummary])
             || left.branch != right.branch
             || left.is_primary_checkout != right.is_primary_checkout
             || left.branch_divergence != right.branch_divergence
+            || left.detected_ports != right.detected_ports
     })
 }
 
@@ -4569,12 +4815,14 @@ fn estimated_worktree_hover_popover_card_height(
         height += 18.;
     }
 
-    if worktree.agent_state.is_some() {
-        height += 18.;
-    }
+    height += 18.;
 
     if !worktree.recent_turns.is_empty() {
         height += 24. + worktree.recent_turns.iter().take(3).count() as f32 * 18.;
+    }
+
+    if !worktree.detected_ports.is_empty() {
+        height += 22.;
     }
 
     if !worktree.recent_agent_sessions.is_empty() {
@@ -5970,6 +6218,651 @@ fn default_commit_message(changed_files: &[ChangedFile]) -> String {
     )
 }
 
+fn auto_checkpoint_commit_message(
+    changed_files: &[ChangedFile],
+    agent_task: Option<&str>,
+) -> String {
+    let mut body_lines = vec!["Auto-checkpoint created by Arbor after an agent turn.".to_owned()];
+    if let Some(task) = agent_task.map(str::trim).filter(|task| !task.is_empty()) {
+        body_lines.push(format!("Task: {task}"));
+    }
+    body_lines.push(String::new());
+    for change in changed_files.iter().take(12) {
+        let mut line = format!("- {} {}", change_code(change.kind), change.path.display());
+        if change.additions > 0 || change.deletions > 0 {
+            line.push_str(&format!(" (+{} -{})", change.additions, change.deletions));
+        }
+        body_lines.push(line);
+    }
+    if changed_files.len() > 12 {
+        body_lines.push(format!("- ... and {} more", changed_files.len() - 12));
+    }
+
+    format!("arbor: auto-checkpoint\n\n{}", body_lines.join("\n"))
+}
+
+#[derive(Clone)]
+struct PortScanTarget {
+    worktree_path: PathBuf,
+    root_pid: u32,
+}
+
+#[derive(Clone)]
+struct ProcessInfoSnapshot {
+    parent_pid: u32,
+    #[cfg_attr(unix, allow(dead_code))]
+    name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ScannedPortInfo {
+    port: u16,
+    pid: u32,
+    address: String,
+    process_name: String,
+}
+
+const IGNORED_PORTS: [u16; 7] = [22, 80, 443, 3306, 5432, 6379, 27017];
+
+fn detect_ports_for_worktrees(
+    worktree_paths: &[PathBuf],
+    scan_targets: &[PortScanTarget],
+    terminal_output_hints: &HashMap<PathBuf, String>,
+) -> HashMap<PathBuf, Vec<DetectedPort>> {
+    let mut ports_by_worktree: HashMap<PathBuf, Vec<DetectedPort>> = HashMap::new();
+    let mut dynamic_paths = Vec::new();
+
+    for worktree_path in worktree_paths {
+        match load_static_ports_for_worktree(worktree_path) {
+            Ok(Some(static_ports)) => {
+                ports_by_worktree.insert(worktree_path.clone(), static_ports);
+            },
+            Ok(None) => dynamic_paths.push(worktree_path.clone()),
+            Err(error) => {
+                tracing::warn!(path = %worktree_path.display(), %error, "invalid static port config");
+                ports_by_worktree.insert(worktree_path.clone(), Vec::new());
+            },
+        }
+    }
+
+    let process_snapshot = list_process_snapshot();
+    let pid_owner_map = build_pid_owner_map(scan_targets, &process_snapshot);
+    let scanned_ports = list_listening_ports_for_pids(
+        &pid_owner_map.keys().copied().collect::<Vec<_>>(),
+        &process_snapshot,
+    );
+    for port_info in scanned_ports {
+        if IGNORED_PORTS.contains(&port_info.port) {
+            continue;
+        }
+        let Some(worktree_path) = pid_owner_map.get(&port_info.pid) else {
+            continue;
+        };
+        ports_by_worktree
+            .entry(worktree_path.clone())
+            .or_default()
+            .push(DetectedPort {
+                port: port_info.port,
+                pid: Some(port_info.pid),
+                address: port_info.address,
+                process_name: port_info.process_name,
+                label: None,
+            });
+    }
+
+    for worktree_path in dynamic_paths {
+        let current_ports = ports_by_worktree.entry(worktree_path.clone()).or_default();
+        if current_ports.is_empty()
+            && let Some(output) = terminal_output_hints.get(&worktree_path)
+        {
+            current_ports.extend(
+                extract_ports_from_terminal_output(output)
+                    .into_iter()
+                    .filter(|port| !IGNORED_PORTS.contains(&port.port)),
+            );
+        }
+    }
+
+    for ports in ports_by_worktree.values_mut() {
+        ports.sort_by(|left, right| {
+            left.port
+                .cmp(&right.port)
+                .then(left.address.cmp(&right.address))
+                .then(left.label.cmp(&right.label))
+        });
+        ports.dedup_by(|left, right| {
+            left.port == right.port && left.address == right.address && left.label == right.label
+        });
+    }
+
+    ports_by_worktree.retain(|_, ports| !ports.is_empty());
+    ports_by_worktree
+}
+
+fn load_static_ports_for_worktree(
+    worktree_path: &Path,
+) -> Result<Option<Vec<DetectedPort>>, String> {
+    let path = worktree_path.join(".arbor").join("ports.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let content = fs::read_to_string(&path)
+        .map_err(|error| format!("failed to read `{}`: {error}", path.display()))?;
+    let config = serde_json::from_str::<StaticPortsConfig>(&content)
+        .map_err(|error| format!("failed to parse `{}`: {error}", path.display()))?;
+
+    Ok(Some(
+        config
+            .ports
+            .into_iter()
+            .filter(|entry| entry.port > 0)
+            .map(|entry| DetectedPort {
+                port: entry.port,
+                pid: None,
+                address: "127.0.0.1".to_owned(),
+                process_name: "configured".to_owned(),
+                label: entry.label.and_then(|label| {
+                    let trimmed = label.trim().to_owned();
+                    (!trimmed.is_empty()).then_some(trimmed)
+                }),
+            })
+            .collect(),
+    ))
+}
+
+#[derive(serde::Deserialize)]
+struct StaticPortsConfig {
+    #[serde(default)]
+    ports: Vec<StaticPortEntry>,
+}
+
+#[derive(serde::Deserialize)]
+struct StaticPortEntry {
+    port: u16,
+    label: Option<String>,
+}
+
+fn build_pid_owner_map(
+    scan_targets: &[PortScanTarget],
+    process_snapshot: &HashMap<u32, ProcessInfoSnapshot>,
+) -> HashMap<u32, PathBuf> {
+    let mut children_by_parent: HashMap<u32, Vec<u32>> = HashMap::new();
+    for (&pid, process) in process_snapshot {
+        children_by_parent
+            .entry(process.parent_pid)
+            .or_default()
+            .push(pid);
+    }
+
+    let mut pid_owner_map = HashMap::new();
+    for target in scan_targets {
+        let mut stack = vec![target.root_pid];
+        while let Some(pid) = stack.pop() {
+            if pid_owner_map.contains_key(&pid) {
+                continue;
+            }
+            pid_owner_map.insert(pid, target.worktree_path.clone());
+            if let Some(children) = children_by_parent.get(&pid) {
+                stack.extend(children.iter().copied());
+            }
+        }
+    }
+
+    pid_owner_map
+}
+
+#[cfg(unix)]
+fn list_process_snapshot() -> HashMap<u32, ProcessInfoSnapshot> {
+    let mut command = create_command("ps");
+    command.args(["-axo", "pid=,ppid=,comm="]);
+    let output = match run_command_output(&mut command, "list processes") {
+        Ok(output) if output.status.success() => output,
+        _ => return HashMap::new(),
+    };
+
+    parse_unix_process_snapshot(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(windows)]
+fn list_process_snapshot() -> HashMap<u32, ProcessInfoSnapshot> {
+    let mut command = create_command("powershell");
+    command.args([
+        "-NoProfile",
+        "-Command",
+        "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name | ConvertTo-Json -Compress",
+    ]);
+    let output = match run_command_output(&mut command, "list processes") {
+        Ok(output) if output.status.success() => output,
+        _ => return HashMap::new(),
+    };
+
+    parse_windows_process_snapshot(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn list_process_snapshot() -> HashMap<u32, ProcessInfoSnapshot> {
+    HashMap::new()
+}
+
+#[cfg(unix)]
+fn list_listening_ports_for_pids(
+    pids: &[u32],
+    _process_snapshot: &HashMap<u32, ProcessInfoSnapshot>,
+) -> Vec<ScannedPortInfo> {
+    if pids.is_empty() {
+        return Vec::new();
+    }
+
+    let pid_arg = pids
+        .iter()
+        .map(|pid| pid.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let pid_set: HashSet<u32> = pids.iter().copied().collect();
+    let mut command = create_command("sh");
+    command.arg("-lc").arg(format!(
+        "lsof -p {pid_arg} -iTCP -sTCP:LISTEN -P -n 2>/dev/null || true"
+    ));
+    let output = match run_command_output(&mut command, "scan listening ports") {
+        Ok(output) => output,
+        Err(_) => return Vec::new(),
+    };
+
+    parse_unix_lsof_ports(&String::from_utf8_lossy(&output.stdout), &pid_set)
+}
+
+#[cfg(windows)]
+fn list_listening_ports_for_pids(
+    pids: &[u32],
+    process_snapshot: &HashMap<u32, ProcessInfoSnapshot>,
+) -> Vec<ScannedPortInfo> {
+    if pids.is_empty() {
+        return Vec::new();
+    }
+
+    let pid_set: HashSet<u32> = pids.iter().copied().collect();
+    let mut command = create_command("netstat");
+    command.args(["-ano", "-p", "tcp"]);
+    let output = match run_command_output(&mut command, "scan listening ports") {
+        Ok(output) if output.status.success() => output,
+        _ => return Vec::new(),
+    };
+
+    parse_windows_netstat_ports(
+        &String::from_utf8_lossy(&output.stdout),
+        &pid_set,
+        process_snapshot,
+    )
+}
+
+#[cfg(not(any(unix, windows)))]
+fn list_listening_ports_for_pids(
+    _pids: &[u32],
+    _process_snapshot: &HashMap<u32, ProcessInfoSnapshot>,
+) -> Vec<ScannedPortInfo> {
+    Vec::new()
+}
+
+#[cfg(unix)]
+fn parse_unix_process_snapshot(output: &str) -> HashMap<u32, ProcessInfoSnapshot> {
+    let mut processes = HashMap::new();
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut parts = trimmed.split_whitespace();
+        let Some(pid) = parts.next().and_then(|value| value.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(parent_pid) = parts.next().and_then(|value| value.parse::<u32>().ok()) else {
+            continue;
+        };
+        let name = parts.collect::<Vec<_>>().join(" ");
+        processes.insert(pid, ProcessInfoSnapshot { parent_pid, name });
+    }
+    processes
+}
+
+#[cfg(windows)]
+fn parse_windows_process_snapshot(output: &str) -> HashMap<u32, ProcessInfoSnapshot> {
+    let parsed = match serde_json::from_str::<serde_json::Value>(output.trim()) {
+        Ok(parsed) => parsed,
+        Err(_) => return HashMap::new(),
+    };
+    let entries = match parsed {
+        serde_json::Value::Array(values) => values,
+        value => vec![value],
+    };
+
+    let mut processes = HashMap::new();
+    for entry in entries {
+        let Some(pid) = entry.get("ProcessId").and_then(|value| value.as_u64()) else {
+            continue;
+        };
+        let Some(parent_pid) = entry
+            .get("ParentProcessId")
+            .and_then(|value| value.as_u64())
+        else {
+            continue;
+        };
+        let name = entry
+            .get("Name")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown")
+            .to_owned();
+        processes.insert(pid as u32, ProcessInfoSnapshot {
+            parent_pid: parent_pid as u32,
+            name,
+        });
+    }
+    processes
+}
+
+#[cfg(unix)]
+fn parse_unix_lsof_ports(output: &str, pid_set: &HashSet<u32>) -> Vec<ScannedPortInfo> {
+    let mut ports = Vec::new();
+    for line in output.lines().skip(1) {
+        let columns = line.split_whitespace().collect::<Vec<_>>();
+        if columns.len() < 10 {
+            continue;
+        }
+        let Some(pid) = columns.get(1).and_then(|value| value.parse::<u32>().ok()) else {
+            continue;
+        };
+        if !pid_set.contains(&pid) {
+            continue;
+        }
+        let Some(name_field) = columns.get(columns.len().saturating_sub(2)).copied() else {
+            continue;
+        };
+        let Some((address, port)) = parse_socket_address_port(name_field) else {
+            continue;
+        };
+        ports.push(ScannedPortInfo {
+            port,
+            pid,
+            address,
+            process_name: columns[0].to_owned(),
+        });
+    }
+    ports
+}
+
+#[cfg(windows)]
+fn parse_windows_netstat_ports(
+    output: &str,
+    pid_set: &HashSet<u32>,
+    process_snapshot: &HashMap<u32, ProcessInfoSnapshot>,
+) -> Vec<ScannedPortInfo> {
+    let mut ports = Vec::new();
+    for line in output.lines() {
+        if !line.contains("LISTENING") {
+            continue;
+        }
+        let columns = line.split_whitespace().collect::<Vec<_>>();
+        if columns.len() < 5 {
+            continue;
+        }
+        let Some(pid) = columns.last().and_then(|value| value.parse::<u32>().ok()) else {
+            continue;
+        };
+        if !pid_set.contains(&pid) {
+            continue;
+        }
+        let Some((address, port)) = parse_socket_address_port(columns[1]) else {
+            continue;
+        };
+        let process_name = process_snapshot
+            .get(&pid)
+            .map(|process| process.name.clone())
+            .unwrap_or_else(|| "unknown".to_owned());
+        ports.push(ScannedPortInfo {
+            port,
+            pid,
+            address,
+            process_name,
+        });
+    }
+    ports
+}
+
+fn parse_socket_address_port(value: &str) -> Option<(String, u16)> {
+    if let Some((address, port_text)) = value.rsplit_once(':')
+        && let Ok(port) = port_text.parse::<u16>()
+    {
+        let normalized = address
+            .trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_owned();
+        let normalized = if normalized == "*" {
+            "0.0.0.0".to_owned()
+        } else {
+            normalized
+        };
+        return Some((normalized, port));
+    }
+    None
+}
+
+fn extract_ports_from_terminal_output(output: &str) -> Vec<DetectedPort> {
+    const ADDRESS_MARKERS: [(&str, &str); 10] = [
+        ("http://127.0.0.1:", "127.0.0.1"),
+        ("https://127.0.0.1:", "127.0.0.1"),
+        ("http://localhost:", "127.0.0.1"),
+        ("https://localhost:", "127.0.0.1"),
+        ("http://0.0.0.0:", "0.0.0.0"),
+        ("https://0.0.0.0:", "0.0.0.0"),
+        ("127.0.0.1:", "127.0.0.1"),
+        ("localhost:", "127.0.0.1"),
+        ("0.0.0.0:", "0.0.0.0"),
+        ("[::]:", "::"),
+    ];
+    const PHRASE_MARKERS: [(&str, &str); 5] = [
+        ("listening on port ", "127.0.0.1"),
+        ("listening at port ", "127.0.0.1"),
+        ("running on port ", "127.0.0.1"),
+        ("ready on port ", "127.0.0.1"),
+        ("server started on port ", "127.0.0.1"),
+    ];
+
+    let mut ports = Vec::new();
+    for (marker, address) in ADDRESS_MARKERS {
+        collect_port_markers(&mut ports, output, marker, address);
+    }
+
+    let lowercase = output.to_ascii_lowercase();
+    for (marker, address) in PHRASE_MARKERS {
+        collect_port_markers(&mut ports, &lowercase, marker, address);
+    }
+
+    ports.sort_by(|left, right| {
+        left.port
+            .cmp(&right.port)
+            .then(left.address.cmp(&right.address))
+            .then(left.label.cmp(&right.label))
+    });
+    ports.dedup_by(|left, right| {
+        left.port == right.port && left.address == right.address && left.label == right.label
+    });
+    ports
+}
+
+fn collect_port_markers(
+    ports: &mut Vec<DetectedPort>,
+    haystack: &str,
+    marker: &str,
+    address: &str,
+) {
+    let mut remainder = haystack;
+    while let Some(index) = remainder.find(marker) {
+        let after_marker = &remainder[index + marker.len()..];
+        let digits: String = after_marker
+            .chars()
+            .take_while(|character| character.is_ascii_digit())
+            .collect();
+        if let Ok(port) = digits.parse::<u16>() {
+            ports.push(DetectedPort {
+                port,
+                pid: None,
+                address: address.to_owned(),
+                process_name: "hint".to_owned(),
+                label: None,
+            });
+        }
+        remainder = after_marker;
+    }
+}
+
+fn output_contains_port_hint(output: &str) -> bool {
+    if !extract_ports_from_terminal_output(output).is_empty() {
+        return true;
+    }
+
+    let lowercase = output.to_ascii_lowercase();
+    [
+        "listening on port",
+        "listening at port",
+        "server started on",
+        "server running on",
+        "ready on",
+    ]
+    .iter()
+    .any(|marker| lowercase.contains(marker))
+}
+
+#[derive(Clone, Copy)]
+struct WorktreeAttentionIndicator {
+    label: &'static str,
+    short_label: &'static str,
+    color: u32,
+}
+
+fn worktree_attention_indicator(worktree: &WorktreeSummary) -> WorktreeAttentionIndicator {
+    if worktree.stuck_turn_count >= 2 {
+        return WorktreeAttentionIndicator {
+            label: "Stuck",
+            short_label: "Stuck",
+            color: 0xeb6f92,
+        };
+    }
+    if worktree.agent_state == Some(AgentState::Working) {
+        return WorktreeAttentionIndicator {
+            label: "Working",
+            short_label: "Run",
+            color: 0xe5c07b,
+        };
+    }
+    if worktree.agent_state == Some(AgentState::Waiting)
+        && worktree
+            .recent_turns
+            .first()
+            .and_then(|snapshot| snapshot.diff_summary)
+            .is_some_and(|summary| summary.additions > 0 || summary.deletions > 0)
+    {
+        return WorktreeAttentionIndicator {
+            label: "Needs review",
+            short_label: "Review",
+            color: 0x61afef,
+        };
+    }
+    if worktree.agent_state == Some(AgentState::Waiting) {
+        return WorktreeAttentionIndicator {
+            label: "Waiting",
+            short_label: "Wait",
+            color: 0x61afef,
+        };
+    }
+    if !worktree.detected_ports.is_empty() {
+        return WorktreeAttentionIndicator {
+            label: "Serving",
+            short_label: "Ports",
+            color: 0x72d69c,
+        };
+    }
+    if worktree.last_activity_unix_ms.is_some_and(|timestamp| {
+        current_unix_timestamp_millis()
+            .unwrap_or(0)
+            .saturating_sub(timestamp)
+            <= 15 * 60 * 1000
+    }) {
+        return WorktreeAttentionIndicator {
+            label: "Recent",
+            short_label: "Recent",
+            color: 0xc0caf5,
+        };
+    }
+
+    WorktreeAttentionIndicator {
+        label: "Idle",
+        short_label: "Idle",
+        color: 0x7f8490,
+    }
+}
+
+fn worktree_activity_sparkline(worktree: &WorktreeSummary) -> String {
+    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    if worktree.recent_turns.is_empty() {
+        return String::new();
+    }
+
+    let values: Vec<usize> = worktree
+        .recent_turns
+        .iter()
+        .take(5)
+        .rev()
+        .map(|snapshot| {
+            snapshot
+                .diff_summary
+                .map(|summary| summary.additions + summary.deletions)
+                .unwrap_or(0)
+        })
+        .collect();
+    let max_value = values.iter().copied().max().unwrap_or(0);
+    if max_value == 0 {
+        return "▁▁▁".to_owned();
+    }
+
+    values
+        .into_iter()
+        .map(|value| {
+            let index = value.saturating_mul(BARS.len() - 1) / max_value.max(1);
+            BARS[index]
+        })
+        .collect()
+}
+
+fn worktree_port_url(port: &DetectedPort) -> String {
+    let host = match port.address.as_str() {
+        "" | "*" | "0.0.0.0" | "::" => "127.0.0.1",
+        other => other,
+    };
+    format!("http://{host}:{}", port.port)
+}
+
+fn worktree_port_badge_text(port: &DetectedPort) -> String {
+    format!(":{}", port.port)
+}
+
+fn worktree_port_detail_text(port: &DetectedPort) -> String {
+    if let Some(label) = port
+        .label
+        .as_deref()
+        .filter(|label| !label.trim().is_empty())
+    {
+        return format!("{label} :{}", port.port);
+    }
+    if port.process_name != "hint"
+        && port.process_name != "configured"
+        && !port.process_name.trim().is_empty()
+    {
+        return format!("{} :{}", port.process_name, port.port);
+    }
+    format!(":{}", port.port)
+}
+
 fn extract_repo_name_from_url(url: &str) -> String {
     let url = url.trim();
     // Strip trailing .git
@@ -6090,6 +6983,54 @@ fn derive_branch_name(worktree_name: &str) -> String {
     }
 }
 
+fn derive_branch_name_with_repo_config(
+    repo_root: &Path,
+    worktree_name: &str,
+    github_login: Option<&str>,
+) -> String {
+    let base_name = derive_branch_name(worktree_name);
+    let Some(config) = arbor_core::repo_config::load_repo_config(repo_root) else {
+        return base_name;
+    };
+
+    let prefix = match config.branch.prefix_mode {
+        Some(arbor_core::repo_config::RepoBranchPrefixMode::None) | None => None,
+        Some(arbor_core::repo_config::RepoBranchPrefixMode::GitAuthor) => {
+            git_branch_prefix_from_author(repo_root)
+        },
+        Some(arbor_core::repo_config::RepoBranchPrefixMode::GithubUser) => github_login
+            .map(sanitize_worktree_name)
+            .filter(|value| !value.is_empty()),
+        Some(arbor_core::repo_config::RepoBranchPrefixMode::Custom) => config
+            .branch
+            .prefix
+            .as_deref()
+            .map(sanitize_worktree_name)
+            .filter(|value| !value.is_empty()),
+    };
+
+    match prefix {
+        Some(prefix) => format!("{prefix}/{base_name}"),
+        None => base_name,
+    }
+}
+
+fn git_branch_prefix_from_author(repo_root: &Path) -> Option<String> {
+    let mut command = create_command("git");
+    command
+        .arg("-C")
+        .arg(repo_root)
+        .args(["config", "--get", "user.name"]);
+    let output = run_command_output(&mut command, "read git author").ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let author = String::from_utf8_lossy(&output.stdout);
+    let sanitized = sanitize_worktree_name(author.trim());
+    (!sanitized.is_empty()).then_some(sanitized)
+}
+
 fn build_managed_worktree_path(repo_name: &str, worktree_name: &str) -> Result<PathBuf, String> {
     let home_dir = user_home_dir()?;
     Ok(home_dir
@@ -6100,7 +7041,7 @@ fn build_managed_worktree_path(repo_name: &str, worktree_name: &str) -> Result<P
 }
 
 fn load_task_templates_for_repo(repo_root: &Path) -> Vec<TaskTemplate> {
-    let tasks_dir = repo_root.join(".arbor/tasks");
+    let tasks_dir = repo_task_templates_dir(repo_root);
     let Ok(entries) = fs::read_dir(&tasks_dir) else {
         return Vec::new();
     };
@@ -6117,6 +7058,17 @@ fn load_task_templates_for_repo(repo_root: &Path) -> Vec<TaskTemplate> {
     }
     tasks.sort_by(|left, right| left.name.cmp(&right.name));
     tasks
+}
+
+fn repo_task_templates_dir(repo_root: &Path) -> PathBuf {
+    let relative_dir = arbor_core::repo_config::load_repo_config(repo_root)
+        .and_then(|config| config.tasks.directory)
+        .unwrap_or_else(|| ".arbor/tasks".to_owned());
+    repo_root.join(relative_dir)
+}
+
+fn worktree_notes_storage_path(worktree_path: &Path) -> PathBuf {
+    worktree_path.join(".arbor").join("notes.md")
 }
 
 fn parse_task_template(path: &Path, repo_root: &Path) -> Option<TaskTemplate> {
@@ -6343,7 +7295,13 @@ mod tests {
             daemon,
         },
         gpui::{Keystroke, point, px},
-        std::{collections::HashMap, path::Path, sync::Arc, time::Instant},
+        std::{
+            collections::HashMap,
+            env, fs,
+            path::{Path, PathBuf},
+            sync::Arc,
+            time::{Instant, SystemTime},
+        },
     };
 
     fn session_with_styled_line(
@@ -6355,7 +7313,7 @@ mod tests {
         TerminalSession {
             id: 1,
             daemon_session_id: "daemon-test-1".to_owned(),
-            worktree_path: std::path::PathBuf::from("/tmp/worktree"),
+            worktree_path: PathBuf::from("/tmp/worktree"),
             title: "term-1".to_owned(),
             last_command: None,
             pending_command: String::new(),
@@ -6365,6 +7323,7 @@ mod tests {
             state: TerminalState::Running,
             exit_code: None,
             updated_at_unix_ms: None,
+            root_pid: None,
             cols: 120,
             rows: 35,
             generation: 0,
@@ -6410,6 +7369,7 @@ mod tests {
                 additions: 3,
                 deletions: 1,
             }),
+            detected_ports: vec![],
             recent_turns: vec![],
             stuck_turn_count: 0,
             recent_agent_sessions: vec![],
@@ -6437,6 +7397,18 @@ mod tests {
         }
     }
 
+    fn create_temp_test_dir(prefix: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_else(|error| panic!("system clock before unix epoch: {error}"))
+            .as_nanos();
+        let path = env::temp_dir().join(format!("arbor-gui-{prefix}-{unique}"));
+        fs::create_dir_all(&path).unwrap_or_else(|error| {
+            panic!("failed to create temp dir `{}`: {error}", path.display())
+        });
+        path
+    }
+
     #[test]
     fn sanitizes_worktree_name_for_branch_and_path() {
         let sanitized = crate::sanitize_worktree_name("  Remote SSH / Demo  ");
@@ -6447,6 +7419,65 @@ mod tests {
     fn derives_default_branch_name_when_empty() {
         let branch = crate::derive_branch_name(" !!! ");
         assert_eq!(branch, "worktree");
+    }
+
+    #[test]
+    fn derive_branch_name_uses_custom_repo_prefix_mode() {
+        let dir = create_temp_test_dir("branch-prefix");
+        fs::write(
+            dir.join("arbor.toml"),
+            "[branch]\nprefix_mode = \"custom\"\nprefix = \"team\"\n",
+        )
+        .unwrap_or_else(|error| panic!("failed to write repo config: {error}"));
+
+        assert_eq!(
+            crate::derive_branch_name_with_repo_config(&dir, "Auth Fix", None),
+            "team/auth-fix"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repo_task_templates_dir_honors_repo_config_override() {
+        let dir = create_temp_test_dir("task-dir");
+        fs::write(dir.join("arbor.toml"), "[tasks]\ndirectory = \"prompts\"\n")
+            .unwrap_or_else(|error| panic!("failed to write repo config: {error}"));
+
+        assert_eq!(crate::repo_task_templates_dir(&dir), dir.join("prompts"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_ports_from_terminal_output_detects_common_local_urls() {
+        let mut ports = crate::extract_ports_from_terminal_output(
+            "ready on http://localhost:3000 and http://127.0.0.1:5173",
+        );
+        ports.sort_by_key(|port| port.port);
+        ports.dedup_by_key(|port| port.port);
+
+        assert_eq!(
+            ports.into_iter().map(|port| port.port).collect::<Vec<_>>(),
+            vec![3000, 5173]
+        );
+    }
+
+    #[test]
+    fn output_contains_port_hint_detects_phrase_without_url() {
+        assert!(crate::output_contains_port_hint(
+            "Server started on port 4173 in 220ms"
+        ));
+    }
+
+    #[test]
+    fn attention_indicator_prefers_stuck_state() {
+        let mut worktree = sample_worktree_summary();
+        worktree.agent_state = Some(AgentState::Waiting);
+        worktree.stuck_turn_count = 2;
+
+        let attention = crate::worktree_attention_indicator(&worktree);
+        assert_eq!(attention.label, "Stuck");
     }
 
     #[test]
@@ -7057,7 +8088,7 @@ mod tests {
     #[test]
     fn auto_commit_subject_uses_filename_for_single_change() {
         let changed_files = vec![ChangedFile {
-            path: std::path::PathBuf::from("src/main.rs"),
+            path: PathBuf::from("src/main.rs"),
             kind: ChangeKind::Modified,
             additions: 4,
             deletions: 1,
@@ -7071,7 +8102,7 @@ mod tests {
     fn auto_commit_body_includes_stats_and_overflow_line() {
         let changed_files = (0..13)
             .map(|index| ChangedFile {
-                path: std::path::PathBuf::from(format!("src/file-{index}.rs")),
+                path: PathBuf::from(format!("src/file-{index}.rs")),
                 kind: ChangeKind::Modified,
                 additions: index + 1,
                 deletions: index,

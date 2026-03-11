@@ -494,6 +494,9 @@ impl ArborWindow {
                                                 let pr_details = worktree.pr_details.clone();
                                                 let is_stuck = worktree.stuck_turn_count >= 2;
                                                 let is_primary = worktree.is_primary_checkout;
+                                                let attention = worktree_attention_indicator(&worktree);
+                                                let activity_sparkline = worktree_activity_sparkline(&worktree);
+                                                let detected_ports = worktree.detected_ports.clone();
                                                 let agent_dot_color = match worktree.agent_state {
                                                     Some(AgentState::Working) => Some(0xe5c07b_u32),
                                                     Some(AgentState::Waiting) => Some(0x61afef_u32),
@@ -651,6 +654,15 @@ impl ArborWindow {
                                                                     .items_center()
                                                                     .gap_1();
 
+                                                                if compact_sidebar {
+                                                                    right = right.child(
+                                                                        div()
+                                                                            .text_xs()
+                                                                            .text_color(rgb(attention.color))
+                                                                            .child(attention.short_label),
+                                                                    );
+                                                                }
+
                                                                 if self.worktree_stats_loading
                                                                     && diff_summary.is_none()
                                                                     && !compact_sidebar
@@ -734,6 +746,17 @@ impl ArborWindow {
                                                                     }
                                                                 }
 
+                                                                if !compact_sidebar && !detected_ports.is_empty() {
+                                                                    right = right.child(
+                                                                        div()
+                                                                            .text_xs()
+                                                                            .text_color(rgb(0x72d69c))
+                                                                            .child(worktree_port_badge_text(
+                                                                                &detected_ports[0],
+                                                                            )),
+                                                                    );
+                                                                }
+
                                                                 right
                                                             }),
                                                     )
@@ -752,12 +775,26 @@ impl ArborWindow {
                                                                     .text_ellipsis()
                                                                     .text_xs()
                                                                     .text_color(rgb(theme.text_disabled))
-                                                                    .child(
-                                                                        worktree
+                                                                    .child({
+                                                                        let task_or_label = worktree
                                                                             .agent_task
                                                                             .clone()
-                                                                            .unwrap_or_else(|| worktree.label.clone()),
-                                                                    ),
+                                                                            .unwrap_or_else(|| worktree.label.clone());
+                                                                        if activity_sparkline.is_empty() {
+                                                                            format!(
+                                                                                "{} · {}",
+                                                                                attention.label,
+                                                                                task_or_label
+                                                                            )
+                                                                        } else {
+                                                                            format!(
+                                                                                "{} {} · {}",
+                                                                                attention.label,
+                                                                                activity_sparkline,
+                                                                                task_or_label
+                                                                            )
+                                                                        }
+                                                                    }),
                                                             )
                                                             .when_some(pr_details.clone(), |this, pr| {
                                                                 let (checks_icon, checks_color) = match pr.checks_status {
@@ -804,6 +841,36 @@ impl ArborWindow {
                                                                     );
                                                                 }
 
+                                                                let mut badges = badges;
+                                                                for port in detected_ports.iter().take(2) {
+                                                                    let port_url = worktree_port_url(port);
+                                                                    let port_id = format!(
+                                                                        "worktree-port-link-{index}-{}",
+                                                                        port.port
+                                                                    );
+                                                                    badges = badges.child(
+                                                                        div()
+                                                                            .id(ElementId::Name(
+                                                                                port_id.into(),
+                                                                            ))
+                                                                            .cursor_pointer()
+                                                                            .flex_none()
+                                                                            .text_xs()
+                                                                            .text_color(rgb(0x72d69c))
+                                                                            .hover(|this| this.text_color(rgb(theme.text_primary)))
+                                                                            .child(worktree_port_badge_text(port))
+                                                                            .on_click(cx.listener(
+                                                                                move |this, _, _, cx| {
+                                                                                    this.open_external_url(
+                                                                                        &port_url,
+                                                                                        cx,
+                                                                                    );
+                                                                                    cx.stop_propagation();
+                                                                                },
+                                                                            )),
+                                                                    );
+                                                                }
+
                                                                 badges
                                                             })
                                                             .when_some(pr_number, |this, pr_num| {
@@ -837,6 +904,36 @@ impl ArborWindow {
                                                                             .child(pr_text),
                                                                     )
                                                                 }
+                                                            })
+                                                            .when(pr_details.is_none() && !detected_ports.is_empty(), |this| {
+                                                                detected_ports.iter().take(2).fold(this, |this, port| {
+                                                                    let port_url = worktree_port_url(port);
+                                                                    let port_id = format!(
+                                                                        "worktree-port-link-{index}-{}",
+                                                                        port.port
+                                                                    );
+                                                                    this.child(
+                                                                        div()
+                                                                            .id(ElementId::Name(
+                                                                                port_id.into(),
+                                                                            ))
+                                                                            .cursor_pointer()
+                                                                            .flex_none()
+                                                                            .text_xs()
+                                                                            .text_color(rgb(0x72d69c))
+                                                                            .hover(|this| this.text_color(rgb(theme.text_primary)))
+                                                                            .child(worktree_port_badge_text(port))
+                                                                            .on_click(cx.listener(
+                                                                                move |this, _, _, cx| {
+                                                                                    this.open_external_url(
+                                                                                        &port_url,
+                                                                                        cx,
+                                                                                    );
+                                                                                    cx.stop_propagation();
+                                                                                },
+                                                                            )),
+                                                                    )
+                                                                })
                                                             }),
                                                     ))
                                                     ) // text column
@@ -1734,6 +1831,8 @@ impl ArborWindow {
         let checks_expanded = popover.checks_expanded;
         let popover_zone_bounds =
             worktree_hover_popover_zone_bounds(self.left_pane_width, popover, worktree);
+        let attention = worktree_attention_indicator(worktree);
+        let activity_sparkline = worktree_activity_sparkline(worktree);
 
         // Build popover card content
         let popover_wt_index = popover.worktree_index;
@@ -1820,49 +1919,85 @@ impl ArborWindow {
         }
 
         // Agent section
-        if let Some(state) = worktree.agent_state {
-            let (dot_color, state_label) = match state {
-                AgentState::Working => (0xe5c07b_u32, "Working"),
-                AgentState::Waiting => (0x61afef_u32, "Waiting"),
-            };
+        let mut agent_row = div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(
+                div()
+                    .flex_none()
+                    .size(px(6.))
+                    .rounded_full()
+                    .bg(rgb(attention.color)),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme.text_primary))
+                    .child(attention.label),
+            );
 
-            let mut agent_row = div()
-                .flex()
-                .items_center()
-                .gap_1()
-                .child(
-                    div()
-                        .flex_none()
-                        .size(px(6.))
-                        .rounded_full()
-                        .bg(rgb(dot_color)),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(theme.text_primary))
-                        .child(state_label),
-                );
+        if !activity_sparkline.is_empty() {
+            agent_row = agent_row.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme.text_disabled))
+                    .child(activity_sparkline),
+            );
+        }
 
-            if let Some(ref task) = worktree.agent_task {
-                agent_row = agent_row.child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(theme.text_muted))
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .child(task.clone()),
-                );
-            }
+        if let Some(ref task) = worktree.agent_task {
+            agent_row = agent_row.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme.text_muted))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(task.clone()),
+            );
+        }
+        card = card.child(agent_row);
 
-            card = card.child(agent_row);
+        if !worktree.detected_ports.is_empty() {
+            let ports = worktree.detected_ports.clone();
+            card = card.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(theme.text_muted))
+                            .child("Ports"),
+                    )
+                    .children(ports.into_iter().take(3).map(|port| {
+                        let url = worktree_port_url(&port);
+                        let detail = worktree_port_detail_text(&port);
+                        div()
+                            .id(ElementId::Name(
+                                format!("hover-port-link-{popover_wt_index}-{}", port.port).into(),
+                            ))
+                            .cursor_pointer()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(rgb(theme.border))
+                            .px_1()
+                            .text_xs()
+                            .text_color(rgb(0x72d69c))
+                            .hover(|this| this.bg(rgb(theme.panel_active_bg)))
+                            .child(detail)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.open_external_url(&url, cx);
+                                cx.stop_propagation();
+                            }))
+                    })),
+            );
         }
 
         if !worktree.recent_turns.is_empty() {
-            if worktree.agent_state.is_some() {
-                card = card.child(div().h(px(1.)).bg(rgb(theme.border)).my_1());
-            }
+            card = card.child(div().h(px(1.)).bg(rgb(theme.border)).my_1());
 
             let heading = if worktree.stuck_turn_count >= 2 {
                 format!("Recent turns · stuck for {} turns", worktree.stuck_turn_count + 1)

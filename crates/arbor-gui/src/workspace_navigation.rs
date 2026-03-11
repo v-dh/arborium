@@ -567,6 +567,7 @@ impl ArborWindow {
             .position(|worktree| worktree.group_key == repository.group_key);
         self.refresh_worktrees(cx);
         self.refresh_repo_config_if_changed(cx);
+        self.sync_selected_worktree_notes();
         self.focus_terminal_on_next_render = true;
         cx.notify();
     }
@@ -657,6 +658,45 @@ impl ArborWindow {
             .as_deref()
             .and_then(non_empty_trimmed_str)
             .is_some()
+    }
+
+    fn refresh_github_auth_identity(&mut self, cx: &mut Context<Self>) {
+        let Some(token) = self.github_access_token() else {
+            return;
+        };
+        if self.github_auth_in_progress
+            || (self.github_auth_state.user_login.is_some()
+                && self.github_auth_state.user_avatar_url.is_some())
+        {
+            return;
+        }
+
+        cx.spawn(async move |this, cx| {
+            let identity = cx
+                .background_spawn(async move { github_authenticated_user(Some(&token)) })
+                .await;
+
+            let _ = this.update(cx, |this, cx| {
+                let Some((login, avatar_url)) = identity else {
+                    return;
+                };
+                if this.github_auth_state.user_login.as_deref() == Some(login.as_str())
+                    && this.github_auth_state.user_avatar_url == avatar_url
+                {
+                    return;
+                }
+
+                this.github_auth_state.user_login = Some(login);
+                this.github_auth_state.user_avatar_url = avatar_url;
+                if let Err(error) = this.persist_github_auth_state() {
+                    this.notice = Some(format!(
+                        "GitHub identity refreshed, but failed to persist auth state: {error}"
+                    ));
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn github_access_token(&self) -> Option<String> {
@@ -772,12 +812,14 @@ impl ArborWindow {
                 this.github_auth_copy_feedback_active = false;
                 match poll_result {
                     Ok(token) => {
+                        let identity =
+                            github_authenticated_user(Some(token.access_token.as_str()));
                         this.github_auth_state = github_auth_store::GithubAuthState {
                             access_token: Some(token.access_token),
                             token_type: token.token_type,
                             scope: token.scope,
-                            user_login: None,
-                            user_avatar_url: None,
+                            user_login: identity.as_ref().map(|(login, _)| login.clone()),
+                            user_avatar_url: identity.and_then(|(_, avatar_url)| avatar_url),
                         };
 
                         this.notice = match this.persist_github_auth_state() {
@@ -929,7 +971,9 @@ impl ArborWindow {
         self.active_outpost_index = None;
         self.active_diff_session_id = None;
         self.sync_active_repository_from_selected_worktree();
+        self.refresh_repo_config_if_changed(cx);
         let _ = self.reload_changed_files();
+        self.sync_selected_worktree_notes();
         self.expanded_dirs.clear();
         self.selected_file_tree_entry = None;
         self.file_tree_entries.clear();
@@ -1058,6 +1102,7 @@ impl ArborWindow {
         self.active_worktree_index = None;
         self.changed_files.clear();
         self.selected_changed_file = None;
+        self.sync_selected_worktree_notes();
         self.refresh_remote_changed_files(cx);
         cx.notify();
     }
@@ -1345,6 +1390,252 @@ impl ArborWindow {
         if tab == RightPaneTab::FileTree && self.file_tree_entries.is_empty() {
             self.rebuild_file_tree();
         }
+        if tab != RightPaneTab::Notes {
+            self.worktree_notes_active = false;
+        }
         cx.notify();
+    }
+
+    fn sync_selected_worktree_notes(&mut self) {
+        let Some(worktree_path) = self.selected_local_worktree_path().map(Path::to_path_buf) else {
+            if self.worktree_notes_path.is_none() {
+                return;
+            }
+            self.worktree_notes_active = false;
+            self.worktree_notes_error = None;
+            self.worktree_notes_cursor = FileViewCursor { line: 0, col: 0 };
+            self.worktree_notes_lines = vec![String::new()];
+            self.worktree_notes_path = None;
+            return;
+        };
+
+        let notes_path = worktree_notes_storage_path(&worktree_path);
+        if self.worktree_notes_path.as_ref() == Some(&notes_path) {
+            return;
+        }
+
+        self.worktree_notes_active = false;
+        self.worktree_notes_error = None;
+        self.worktree_notes_cursor = FileViewCursor { line: 0, col: 0 };
+        self.worktree_notes_path = Some(notes_path.clone());
+
+        match fs::read_to_string(&notes_path) {
+            Ok(content) => {
+                let mut lines: Vec<String> = content.lines().map(ToOwned::to_owned).collect();
+                if lines.is_empty() {
+                    lines.push(String::new());
+                }
+                let last_line = lines.len().saturating_sub(1);
+                let last_col = lines[last_line].chars().count();
+                self.worktree_notes_lines = lines;
+                self.worktree_notes_cursor = FileViewCursor {
+                    line: last_line,
+                    col: last_col,
+                };
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.worktree_notes_lines = vec![String::new()];
+            },
+            Err(error) => {
+                self.worktree_notes_lines = vec![String::new()];
+                self.worktree_notes_error = Some(format!("failed to load notes: {error}"));
+            },
+        }
+    }
+
+    fn save_selected_worktree_notes(&mut self) {
+        let Some(path) = self.worktree_notes_path.clone() else {
+            return;
+        };
+        let content = self.worktree_notes_lines.join("\n");
+        if let Some(parent) = path.parent()
+            && let Err(error) = fs::create_dir_all(parent)
+        {
+            self.worktree_notes_error = Some(format!("failed to create notes directory: {error}"));
+            return;
+        }
+
+        match fs::write(&path, content) {
+            Ok(()) => {
+                self.worktree_notes_error = None;
+            },
+            Err(error) => {
+                self.worktree_notes_error = Some(format!("failed to save notes: {error}"));
+            },
+        }
+    }
+
+    fn insert_text_into_selected_worktree_notes(&mut self, text: &str) {
+        if self.worktree_notes_lines.is_empty() {
+            self.worktree_notes_lines.push(String::new());
+        }
+
+        for character in text.chars() {
+            if character == '\n' {
+                let line = &self.worktree_notes_lines[self.worktree_notes_cursor.line];
+                let byte_pos = char_to_byte_offset(line, self.worktree_notes_cursor.col);
+                let trailing = line[byte_pos..].to_owned();
+                self.worktree_notes_lines[self.worktree_notes_cursor.line].truncate(byte_pos);
+                self.worktree_notes_cursor.line += 1;
+                self.worktree_notes_cursor.col = 0;
+                self.worktree_notes_lines
+                    .insert(self.worktree_notes_cursor.line, trailing);
+                continue;
+            }
+
+            let line = &mut self.worktree_notes_lines[self.worktree_notes_cursor.line];
+            let byte_pos = char_to_byte_offset(line, self.worktree_notes_cursor.col);
+            line.insert(byte_pos, character);
+            self.worktree_notes_cursor.col += 1;
+        }
+
+        self.save_selected_worktree_notes();
+    }
+
+    fn handle_worktree_notes_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.worktree_notes_active || self.right_pane_tab != RightPaneTab::Notes {
+            return false;
+        }
+        if self.worktree_notes_lines.is_empty() {
+            self.worktree_notes_lines.push(String::new());
+        }
+        if event.keystroke.modifiers.platform {
+            return false;
+        }
+
+        match event.keystroke.key.as_str() {
+            "escape" => {
+                self.worktree_notes_active = false;
+                cx.notify();
+                return true;
+            },
+            "backspace" => {
+                if self.worktree_notes_cursor.col > 0 {
+                    let line = &mut self.worktree_notes_lines[self.worktree_notes_cursor.line];
+                    let byte_pos = char_to_byte_offset(line, self.worktree_notes_cursor.col);
+                    let prev_byte =
+                        char_to_byte_offset(line, self.worktree_notes_cursor.col.saturating_sub(1));
+                    line.replace_range(prev_byte..byte_pos, "");
+                    self.worktree_notes_cursor.col -= 1;
+                } else if self.worktree_notes_cursor.line > 0 {
+                    let removed = self.worktree_notes_lines.remove(self.worktree_notes_cursor.line);
+                    self.worktree_notes_cursor.line -= 1;
+                    let previous = &mut self.worktree_notes_lines[self.worktree_notes_cursor.line];
+                    self.worktree_notes_cursor.col = previous.chars().count();
+                    previous.push_str(&removed);
+                }
+                self.save_selected_worktree_notes();
+                cx.notify();
+                return true;
+            },
+            "delete" => {
+                let line_len = self.worktree_notes_lines[self.worktree_notes_cursor.line]
+                    .chars()
+                    .count();
+                if self.worktree_notes_cursor.col < line_len {
+                    let line = &mut self.worktree_notes_lines[self.worktree_notes_cursor.line];
+                    let byte_pos = char_to_byte_offset(line, self.worktree_notes_cursor.col);
+                    let next_byte = char_to_byte_offset(line, self.worktree_notes_cursor.col + 1);
+                    line.replace_range(byte_pos..next_byte, "");
+                } else if self.worktree_notes_cursor.line + 1 < self.worktree_notes_lines.len() {
+                    let next = self
+                        .worktree_notes_lines
+                        .remove(self.worktree_notes_cursor.line + 1);
+                    self.worktree_notes_lines[self.worktree_notes_cursor.line].push_str(&next);
+                }
+                self.save_selected_worktree_notes();
+                cx.notify();
+                return true;
+            },
+            "enter" | "return" => {
+                self.insert_text_into_selected_worktree_notes("\n");
+                cx.notify();
+                return true;
+            },
+            "left" => {
+                if self.worktree_notes_cursor.col > 0 {
+                    self.worktree_notes_cursor.col -= 1;
+                } else if self.worktree_notes_cursor.line > 0 {
+                    self.worktree_notes_cursor.line -= 1;
+                    self.worktree_notes_cursor.col = self.worktree_notes_lines
+                        [self.worktree_notes_cursor.line]
+                        .chars()
+                        .count();
+                }
+                cx.notify();
+                return true;
+            },
+            "right" => {
+                let line_len = self.worktree_notes_lines[self.worktree_notes_cursor.line]
+                    .chars()
+                    .count();
+                if self.worktree_notes_cursor.col < line_len {
+                    self.worktree_notes_cursor.col += 1;
+                } else if self.worktree_notes_cursor.line + 1 < self.worktree_notes_lines.len() {
+                    self.worktree_notes_cursor.line += 1;
+                    self.worktree_notes_cursor.col = 0;
+                }
+                cx.notify();
+                return true;
+            },
+            "up" => {
+                if self.worktree_notes_cursor.line > 0 {
+                    self.worktree_notes_cursor.line -= 1;
+                    self.worktree_notes_cursor.col = self.worktree_notes_cursor.col.min(
+                        self.worktree_notes_lines[self.worktree_notes_cursor.line]
+                            .chars()
+                            .count(),
+                    );
+                }
+                cx.notify();
+                return true;
+            },
+            "down" => {
+                if self.worktree_notes_cursor.line + 1 < self.worktree_notes_lines.len() {
+                    self.worktree_notes_cursor.line += 1;
+                    self.worktree_notes_cursor.col = self.worktree_notes_cursor.col.min(
+                        self.worktree_notes_lines[self.worktree_notes_cursor.line]
+                            .chars()
+                            .count(),
+                    );
+                }
+                cx.notify();
+                return true;
+            },
+            "home" => {
+                self.worktree_notes_cursor.col = 0;
+                cx.notify();
+                return true;
+            },
+            "end" => {
+                self.worktree_notes_cursor.col = self.worktree_notes_lines
+                    [self.worktree_notes_cursor.line]
+                    .chars()
+                    .count();
+                cx.notify();
+                return true;
+            },
+            "tab" => {
+                self.insert_text_into_selected_worktree_notes("    ");
+                cx.notify();
+                return true;
+            },
+            _ => {},
+        }
+
+        if event.keystroke.modifiers.control || event.keystroke.modifiers.alt {
+            return false;
+        }
+        if let Some(text) = event.keystroke.key_char.as_deref() {
+            self.insert_text_into_selected_worktree_notes(text);
+            cx.notify();
+            return true;
+        }
+
+        false
     }
 }

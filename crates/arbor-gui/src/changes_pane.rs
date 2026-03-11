@@ -4,9 +4,11 @@ impl ArborWindow {
         let content: Div = match self.right_pane_tab {
             RightPaneTab::Changes => self.render_changes_content(cx),
             RightPaneTab::FileTree => self.render_file_tree(cx),
+            RightPaneTab::Notes => self.render_notes_content(cx),
         };
         let search_active = self.right_pane_search_active;
         let search_text = self.right_pane_search.clone();
+        let show_search = self.right_pane_tab != RightPaneTab::Notes;
 
         div()
             .w(px(self.right_pane_width))
@@ -16,7 +18,7 @@ impl ArborWindow {
             .flex()
             .flex_col()
             .child(self.render_right_pane_tabs(cx))
-            .child(
+            .when(show_search, |this| this.child(
                 div()
                     .id("right-pane-search")
                     .h(px(28.))
@@ -83,7 +85,7 @@ impl ArborWindow {
                                     .into_any_element()
                             }),
                     ),
-            )
+            ))
             .child(content)
     }
 
@@ -141,6 +143,7 @@ impl ArborWindow {
             .border_color(rgb(theme.border))
             .child(tab_button("Changes", RightPaneTab::Changes))
             .child(tab_button("Files", RightPaneTab::FileTree))
+            .child(tab_button("Notes", RightPaneTab::Notes))
     }
 
     fn render_changes_content(&mut self, cx: &mut Context<Self>) -> Div {
@@ -357,6 +360,155 @@ impl ArborWindow {
                                     }),
                             )
                     })),
+            )
+    }
+
+    fn render_notes_content(&mut self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme();
+
+        let Some(notes_path) = self.worktree_notes_path.clone() else {
+            return div()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(theme.text_muted))
+                        .child("Notes are available for local worktrees."),
+                );
+        };
+
+        let cursor_line = self
+            .worktree_notes_cursor
+            .line
+            .min(self.worktree_notes_lines.len().saturating_sub(1));
+        let cursor_col = self.worktree_notes_cursor.col;
+        let notes_active = self.worktree_notes_active;
+        let notes_error = self.worktree_notes_error.clone();
+        let notes_path_label = notes_path
+            .strip_prefix(self.selected_local_worktree_path().unwrap_or(notes_path.as_path()))
+            .unwrap_or(notes_path.as_path())
+            .display()
+            .to_string();
+
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .flex_none()
+                    .px_2()
+                    .py_1()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(rgb(theme.border))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(theme.text_muted))
+                            .child(notes_path_label),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(if notes_error.is_some() {
+                                0xeb6f92
+                            } else {
+                                theme.text_disabled
+                            }))
+                            .child(notes_error.unwrap_or_else(|| "Autosaves on edit".to_owned())),
+                    ),
+            )
+            .child(
+                div()
+                    .id("worktree-notes-editor")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .cursor_text()
+                    .bg(rgb(theme.panel_bg))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                            this.worktree_notes_active = true;
+                            if this.worktree_notes_lines.is_empty() {
+                                this.worktree_notes_lines.push(String::new());
+                            }
+                            let last_line = this.worktree_notes_lines.len().saturating_sub(1);
+                            this.worktree_notes_cursor.line =
+                                this.worktree_notes_cursor.line.min(last_line);
+                            this.worktree_notes_cursor.col = this.worktree_notes_cursor.col.min(
+                                this.worktree_notes_lines[this.worktree_notes_cursor.line]
+                                    .chars()
+                                    .count(),
+                            );
+                            cx.notify();
+                        }),
+                    )
+                    .child(
+                        div()
+                            .min_h_full()
+                            .px_2()
+                            .py_2()
+                            .font_family(FONT_MONO)
+                            .text_xs()
+                            .children(self.worktree_notes_lines.iter().enumerate().map(
+                                |(line_index, line)| {
+                                    let is_cursor_line = notes_active && line_index == cursor_line;
+                                    let line_len = line.chars().count();
+                                    let cursor_col = cursor_col.min(line_len);
+                                    let before = if is_cursor_line {
+                                        line.chars().take(cursor_col).collect::<String>()
+                                    } else {
+                                        String::new()
+                                    };
+                                    let after = if is_cursor_line {
+                                        line.chars().skip(cursor_col).collect::<String>()
+                                    } else {
+                                        String::new()
+                                    };
+
+                                    div()
+                                        .min_h(px(18.))
+                                        .flex()
+                                        .items_start()
+                                        .child(
+                                            div()
+                                                .w(px(28.))
+                                                .flex_none()
+                                                .text_color(rgb(theme.text_disabled))
+                                                .child(format!("{:>2}", line_index + 1)),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .text_color(rgb(theme.text_primary))
+                                                .when(is_cursor_line, |this| {
+                                                    this.flex()
+                                                        .items_center()
+                                                        .child(before)
+                                                        .child(input_caret(theme).flex_none())
+                                                        .child(after)
+                                                })
+                                                .when(!is_cursor_line, |this| {
+                                                    if line.is_empty() {
+                                                        this.child(" ")
+                                                    } else {
+                                                        this.child(line.clone())
+                                                    }
+                                                }),
+                                        )
+                                },
+                            )),
+                    ),
             )
     }
 

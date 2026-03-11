@@ -85,6 +85,7 @@ impl ArborWindow {
                 state: TerminalState::Running,
                 exit_code: None,
                 updated_at_unix_ms: current_unix_timestamp_millis(),
+                root_pid: None,
                 cols: 120,
                 rows: 35,
                 generation: 0,
@@ -120,6 +121,7 @@ impl ArborWindow {
                     session.state = terminal_state_from_daemon_record(&daemon_session);
                     session.exit_code = daemon_session.exit_code;
                     session.updated_at_unix_ms = daemon_session.updated_at_unix_ms;
+                    session.root_pid = daemon_session.root_pid;
                     session.cols = daemon_session.cols.max(2);
                     session.rows = daemon_session.rows.max(1);
                     session.runtime = Some(local_daemon_runtime(

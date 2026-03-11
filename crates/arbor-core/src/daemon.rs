@@ -137,6 +137,7 @@ pub struct DaemonSessionRecord {
     pub workspace_id: WorkspaceId,
     pub cwd: PathBuf,
     pub shell: String,
+    pub root_pid: Option<u32>,
     pub cols: u16,
     pub rows: u16,
     pub title: Option<String>,
@@ -331,6 +332,7 @@ mod tests {
             exit_code: None,
             state: Some(crate::daemon::TerminalSessionState::Running),
             updated_at_unix_ms: Some(1_700_000_000_000),
+            root_pid: None,
         }];
 
         store.save(&sessions)?;
@@ -358,6 +360,7 @@ mod tests {
             exit_code: None,
             state: Some(crate::daemon::TerminalSessionState::Running),
             updated_at_unix_ms: Some(1_700_000_000_000),
+            root_pid: None,
         };
         store.upsert(session.clone())?;
         store.remove(&"session-1".into())?;

@@ -21,6 +21,7 @@ struct WorktreeSummary {
     pr_details: Option<github_service::PrDetails>,
     branch_divergence: Option<BranchDivergenceSummary>,
     diff_summary: Option<changes::DiffLineSummary>,
+    detected_ports: Vec<DetectedPort>,
     recent_turns: Vec<AgentTurnSnapshot>,
     stuck_turn_count: usize,
     recent_agent_sessions: Vec<arbor_core::session::AgentSessionSummary>,
@@ -33,6 +34,15 @@ struct WorktreeSummary {
 struct BranchDivergenceSummary {
     ahead: usize,
     behind: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DetectedPort {
+    port: u16,
+    pid: Option<u32>,
+    address: String,
+    process_name: String,
+    label: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +77,7 @@ struct TerminalSession {
     state: TerminalState,
     exit_code: Option<i32>,
     updated_at_unix_ms: Option<u64>,
+    root_pid: Option<u32>,
     cols: u16,
     rows: u16,
     generation: u64,
@@ -747,6 +758,7 @@ enum CenterTab {
 enum RightPaneTab {
     Changes,
     FileTree,
+    Notes,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1580,6 +1592,7 @@ struct ArborWindow {
     notification_service: Box<dyn notifications::NotificationService>,
     notifications_enabled: bool,
     last_agent_finished_notifications: HashMap<PathBuf, u64>,
+    auto_checkpoint_in_flight: HashSet<PathBuf>,
     window_is_active: bool,
     notice: Option<String>,
     theme_toast: Option<String>,
@@ -1588,6 +1601,11 @@ struct ArborWindow {
     right_pane_search: String,
     right_pane_search_cursor: usize,
     right_pane_search_active: bool,
+    worktree_notes_lines: Vec<String>,
+    worktree_notes_cursor: FileViewCursor,
+    worktree_notes_path: Option<PathBuf>,
+    worktree_notes_active: bool,
+    worktree_notes_error: Option<String>,
     file_tree_entries: Vec<FileTreeEntry>,
     expanded_dirs: HashSet<PathBuf>,
     selected_file_tree_entry: Option<PathBuf>,

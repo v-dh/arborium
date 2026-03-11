@@ -372,7 +372,7 @@ impl ArborWindow {
 
         let preset = task
             .agent
-            .unwrap_or_else(|| self.active_preset_tab.unwrap_or(AgentPresetKind::Codex));
+            .unwrap_or_else(|| self.selected_agent_preset_or_default());
         let command = self.preset_command_for_kind(preset).trim().to_owned();
         if command.is_empty() {
             self.notice = Some(format!("{} preset command is empty", preset.label()));

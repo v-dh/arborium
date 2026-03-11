@@ -283,6 +283,7 @@ impl ArborWindow {
         }
 
         if self.right_pane_search_active
+            || self.worktree_notes_active
             || self.create_modal.is_some()
             || self.settings_modal.is_some()
             || self.github_auth_modal.is_some()

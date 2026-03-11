@@ -14,6 +14,34 @@ fn github_repo_url(repo_slug: &str) -> String {
     format!("https://github.com/{repo_slug}")
 }
 
+fn github_authenticated_user(saved_token: Option<&str>) -> Option<(String, Option<String>)> {
+    let token = resolve_github_access_token(saved_token)?;
+    let response = ureq::get("https://api.github.com/user")
+        .header("Authorization", &format!("Bearer {token}"))
+        .header("User-Agent", "Arbor")
+        .call()
+        .ok()?;
+
+    if response.status() != 200 {
+        return None;
+    }
+
+    let body = response.into_body().read_to_string().ok()?;
+    let payload = serde_json::from_str::<serde_json::Value>(&body).ok()?;
+    let login = payload
+        .get("login")
+        .and_then(|value| value.as_str())
+        .and_then(non_empty_trimmed_str)
+        .map(str::to_owned)?;
+    let avatar_url = payload
+        .get("avatar_url")
+        .and_then(|value| value.as_str())
+        .and_then(non_empty_trimmed_str)
+        .map(str::to_owned);
+
+    Some((login, avatar_url))
+}
+
 fn git_origin_remote_url(repo_root: &Path) -> Option<String> {
     let repo = gix::open(repo_root).ok()?;
     let remote = repo.find_remote("origin").ok()?;

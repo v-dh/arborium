@@ -369,6 +369,7 @@ impl ArborWindow {
     }
 
     fn submit_create_worktree_modal(&mut self, cx: &mut Context<Self>) {
+        let github_login = self.branch_prefix_github_login();
         let Some(modal) = self.create_modal.as_mut() else {
             return;
         };
@@ -380,7 +381,6 @@ impl ArborWindow {
         let repository_input = modal.repository_path.trim().to_owned();
         let worktree_input = modal.worktree_name.trim().to_owned();
         let checkout_kind = modal.checkout_kind;
-
         if repository_input.is_empty() {
             modal.error = Some("Repository path is required.".to_owned());
             cx.notify();
@@ -399,7 +399,12 @@ impl ArborWindow {
         cx.spawn(async move |this, cx| {
             let creation = cx
                 .background_spawn(async move {
-                    create_managed_worktree(repository_input, worktree_input, checkout_kind)
+                    create_managed_worktree(
+                        repository_input,
+                        worktree_input,
+                        checkout_kind,
+                        github_login,
+                    )
                 })
                 .await;
 
@@ -468,6 +473,7 @@ impl ArborWindow {
 
     fn submit_create_review_pr_modal(&mut self, cx: &mut Context<Self>) {
         let github_token = self.github_access_token();
+        let github_login = self.branch_prefix_github_login();
         let Some(modal) = self.create_modal.as_mut() else {
             return;
         };
@@ -480,7 +486,6 @@ impl ArborWindow {
         let pr_reference = modal.pr_reference.trim().to_owned();
         let worktree_input = modal.worktree_name.trim().to_owned();
         let checkout_kind = modal.checkout_kind;
-
         if repository_input.is_empty() {
             modal.error = Some("Repository path is required.".to_owned());
             cx.notify();
@@ -506,6 +511,7 @@ impl ArborWindow {
                         worktree_input,
                         checkout_kind,
                         github_token,
+                        github_login,
                     )
                 })
                 .await;
@@ -670,6 +676,8 @@ impl ArborWindow {
     }
 
     fn submit_create_outpost_modal(&mut self, cx: &mut Context<Self>) {
+        let repo_root = self.repo_root.clone();
+        let github_login = self.branch_prefix_github_login();
         let Some(modal) = self.create_modal.as_mut() else {
             return;
         };
@@ -698,7 +706,8 @@ impl ArborWindow {
             return;
         };
 
-        let branch = derive_branch_name(&outpost_name);
+        let branch =
+            derive_branch_name_with_repo_config(&repo_root, &outpost_name, github_login.as_deref());
 
         modal.is_creating = true;
         modal.creating_status = Some("Connecting over SSH…".to_owned());
@@ -929,7 +938,10 @@ impl ArborWindow {
         let is_outpost_tab = modal.tab == CreateModalTab::RemoteOutpost;
 
         // Worktree tab data
-        let branch_name = derive_branch_name(&modal.worktree_name);
+        let branch_name = self.derive_branch_name_for_repo(
+            Path::new(modal.repository_path.trim()),
+            &modal.worktree_name,
+        );
         let target_path_preview =
             preview_managed_worktree_path(modal.repository_path.trim(), modal.worktree_name.trim())
                 .unwrap_or_else(|_| "-".to_owned());
@@ -951,7 +963,7 @@ impl ArborWindow {
             review_worktree_name_preview(modal.pr_reference.trim(), modal.worktree_name.trim());
         let review_branch_preview = review_name_preview
             .as_deref()
-            .map(derive_branch_name)
+            .map(|name| self.derive_branch_name_for_repo(Path::new(modal.repository_path.trim()), name))
             .unwrap_or_else(|| "Will derive from pull request".to_owned());
         let review_path_preview = review_name_preview
             .as_deref()
@@ -987,7 +999,7 @@ impl ArborWindow {
         let selected_host_index = modal.host_index;
         let clone_url_active = modal.outpost_active_field == CreateOutpostField::CloneUrl;
         let outpost_name_active = modal.outpost_active_field == CreateOutpostField::OutpostName;
-        let outpost_branch_preview = derive_branch_name(&modal.outpost_name);
+        let outpost_branch_preview = self.derive_branch_name_for_repo(&self.repo_root, &modal.outpost_name);
         let outpost_create_disabled = modal.is_creating
             || modal.clone_url.trim().is_empty()
             || modal.outpost_name.trim().is_empty()
@@ -2038,6 +2050,7 @@ fn create_managed_worktree(
     repository_path_input: String,
     worktree_name_input: String,
     checkout_kind: CheckoutKind,
+    github_login: Option<String>,
 ) -> Result<CreatedWorktree, String> {
     let repository_path = expand_home_path(&repository_path_input)?;
     if !repository_path.exists() {
@@ -2059,7 +2072,11 @@ fn create_managed_worktree(
         return Err("worktree name contains no usable characters".to_owned());
     }
 
-    let branch_name = derive_branch_name(&worktree_name_input);
+    let branch_name = derive_branch_name_with_repo_config(
+        &repository_root,
+        &worktree_name_input,
+        github_login.as_deref(),
+    );
     let worktree_path = build_managed_worktree_path(repository_name, &sanitized_worktree_name)?;
     if worktree_path.exists() {
         return Err(format!(
@@ -2127,6 +2144,7 @@ fn create_review_worktree(
     worktree_name_input: String,
     checkout_kind: CheckoutKind,
     github_token: Option<String>,
+    github_login: Option<String>,
 ) -> Result<CreatedWorktree, String> {
     let repository_path = expand_home_path(&repository_path_input)?;
     if !repository_path.exists() {
@@ -2164,7 +2182,11 @@ fn create_review_worktree(
         return Err("worktree name contains no usable characters".to_owned());
     }
 
-    let branch_name = derive_branch_name(&requested_name);
+    let branch_name = derive_branch_name_with_repo_config(
+        &repository_root,
+        &requested_name,
+        github_login.as_deref(),
+    );
     let worktree_path = build_managed_worktree_path(repository_name, &sanitized_worktree_name)?;
     if worktree_path.exists() {
         return Err(format!(

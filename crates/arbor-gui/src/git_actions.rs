@@ -270,7 +270,7 @@ impl ArborWindow {
             return;
         };
         let changed_files = self.changed_files.clone();
-        let preset = self.active_preset_tab.unwrap_or(AgentPresetKind::Codex);
+        let preset = self.selected_agent_preset_or_default();
         let command = self.preset_command_for_kind(preset);
         let execution_mode = self.execution_mode;
 

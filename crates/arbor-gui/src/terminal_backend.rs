@@ -49,6 +49,7 @@ pub struct EmbeddedTerminal {
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     emulator: Arc<Mutex<TerminalEmulator>>,
     exit_code: Arc<Mutex<Option<i32>>>,
+    root_pid: Option<u32>,
     generation: Arc<AtomicU64>,
     killer: Arc<Mutex<Option<Box<dyn ChildKiller + Send + Sync>>>>,
     size: Arc<Mutex<(u16, u16, u16, u16)>>,
@@ -109,6 +110,7 @@ impl EmbeddedTerminal {
             .slave
             .spawn_command(command)
             .map_err(|error| format!("failed to spawn shell in PTY: {error}"))?;
+        let root_pid = child.process_id();
         let killer = child.clone_killer();
 
         let reader = pair
@@ -143,6 +145,7 @@ impl EmbeddedTerminal {
             master: Arc::new(Mutex::new(master)),
             emulator,
             exit_code,
+            root_pid,
             generation,
             killer,
             size,
@@ -252,6 +255,10 @@ impl EmbeddedTerminal {
 
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Relaxed)
+    }
+
+    pub fn root_pid(&self) -> Option<u32> {
+        self.root_pid
     }
 
     pub fn close(&self) {

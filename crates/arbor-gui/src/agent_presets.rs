@@ -39,7 +39,7 @@ impl ArborWindow {
     }
 
     fn open_manage_presets_modal(&mut self, cx: &mut Context<Self>) {
-        let active_preset = self.active_preset_tab.unwrap_or(AgentPresetKind::Codex);
+        let active_preset = self.selected_agent_preset_or_default();
         let command = self.preset_command_for_kind(active_preset);
         self.manage_presets_modal = Some(ManagePresetsModal {
             active_preset,

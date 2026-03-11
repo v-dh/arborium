@@ -13,6 +13,9 @@ pub struct RepoConfig {
     pub presets: Vec<RepoPresetConfig>,
     pub processes: Vec<ProcessConfig>,
     pub scripts: RepoScriptsConfig,
+    pub tasks: RepoTasksConfig,
+    pub branch: RepoBranchConfig,
+    pub agent: RepoAgentConfig,
     pub notifications: RepoNotificationsConfig,
 }
 
@@ -40,6 +43,35 @@ pub struct ProcessConfig {
 pub struct RepoScriptsConfig {
     pub setup: Vec<String>,
     pub teardown: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RepoTasksConfig {
+    pub directory: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RepoBranchConfig {
+    pub prefix_mode: Option<RepoBranchPrefixMode>,
+    pub prefix: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RepoBranchPrefixMode {
+    None,
+    GitAuthor,
+    GithubUser,
+    Custom,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RepoAgentConfig {
+    pub default_preset: Option<String>,
+    pub auto_checkpoint: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
@@ -109,6 +141,17 @@ auto_start = true
 setup = ["cp .env.example .env"]
 teardown = ["rm -f .env"]
 
+[tasks]
+directory = ".arbor/tasks"
+
+[branch]
+prefix_mode = "custom"
+prefix = "penso"
+
+[agent]
+default_preset = "claude"
+auto_checkpoint = true
+
 [notifications]
 desktop = true
 events = ["agent_finished"]
@@ -128,6 +171,14 @@ webhook_urls = ["https://example.com/hook"]
         assert_eq!(config.processes.len(), 1);
         assert_eq!(config.scripts.setup, vec!["cp .env.example .env"]);
         assert_eq!(config.scripts.teardown, vec!["rm -f .env"]);
+        assert_eq!(config.tasks.directory.as_deref(), Some(".arbor/tasks"));
+        assert_eq!(
+            config.branch.prefix_mode,
+            Some(RepoBranchPrefixMode::Custom)
+        );
+        assert_eq!(config.branch.prefix.as_deref(), Some("penso"));
+        assert_eq!(config.agent.default_preset.as_deref(), Some("claude"));
+        assert_eq!(config.agent.auto_checkpoint, Some(true));
         assert_eq!(config.notifications.desktop, Some(true));
         assert_eq!(config.notifications.events, vec!["agent_finished"]);
         assert_eq!(config.notifications.webhook_urls, vec![

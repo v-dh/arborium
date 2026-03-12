@@ -15,7 +15,7 @@ use {
         process_manager::ProcessManager, routes::*, task_scheduler::TaskScheduler,
         terminal_daemon::LocalTerminalDaemon,
     },
-    arbor_core::daemon::JsonDaemonSessionStore,
+    arbor_core::{daemon::JsonDaemonSessionStore, process::ProcessStatus},
     axum::{
         Router,
         handler::HandlerWithoutStateExt,
@@ -203,9 +203,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut ticks_since_reap: u32 = 0;
             loop {
                 interval.tick().await;
-                let restart_schedule = {
+                let (restart_schedule, crashed_processes, process_repo_root) = {
                     let mut pm = state.process_manager.lock().await;
                     let mut daemon = state.daemon.lock().await;
+                    let previous = pm.list_processes();
 
                     // Periodically reap exited terminal sessions to free memory
                     // (~23 MB per dead session from scrollback buffers).
@@ -216,8 +217,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ticks_since_reap = 0;
                     }
 
-                    pm.check_and_update(&mut *daemon)
+                    let restart_schedule = pm.check_and_update(&mut *daemon);
+                    let current = pm.list_processes();
+                    let crashed_processes = current
+                        .into_iter()
+                        .filter(|process| {
+                            process.status == ProcessStatus::Crashed
+                                && previous
+                                    .iter()
+                                    .find(|candidate| candidate.name == process.name)
+                                    .map(|candidate| candidate.status)
+                                    != Some(ProcessStatus::Crashed)
+                        })
+                        .collect::<Vec<_>>();
+
+                    (
+                        restart_schedule,
+                        crashed_processes,
+                        pm.repo_root().to_path_buf(),
+                    )
                 };
+                for process in crashed_processes {
+                    spawn_notification_webhooks(
+                        process_repo_root.clone(),
+                        "agent_error",
+                        serde_json::json!({
+                            "event": "agent_error",
+                            "repo_root": process_repo_root.clone(),
+                            "process_name": process.name,
+                            "command": process.command,
+                            "exit_code": process.exit_code,
+                            "timestamp_unix_ms": std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64,
+                        }),
+                    );
+                }
                 for (name, delay) in restart_schedule {
                     let state = state.clone();
                     tokio::spawn(async move {

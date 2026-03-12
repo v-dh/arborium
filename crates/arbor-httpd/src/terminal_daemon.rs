@@ -60,6 +60,7 @@ struct LiveSession {
     workspace_id: WorkspaceId,
     cwd: PathBuf,
     shell: String,
+    root_pid: Option<u32>,
     cols: Arc<Mutex<u16>>,
     rows: Arc<Mutex<u16>>,
     title: Arc<Mutex<Option<String>>>,
@@ -119,6 +120,7 @@ impl LiveSession {
                 request.session_id
             ))
         })?;
+        let root_pid = child.process_id();
 
         let killer = child.clone_killer();
         let reader = pair.master.try_clone_reader().map_err(|error| {
@@ -143,6 +145,7 @@ impl LiveSession {
             workspace_id: request.workspace_id,
             cwd: request.cwd,
             shell,
+            root_pid,
             cols: Arc::new(Mutex::new(cols)),
             rows: Arc::new(Mutex::new(rows)),
             title: Arc::new(Mutex::new(request.title)),
@@ -279,6 +282,7 @@ impl LiveSession {
             workspace_id: self.workspace_id.clone(),
             cwd: self.cwd.clone(),
             shell: self.shell.clone(),
+            root_pid: self.root_pid,
             cols: *lock_or_recover(&self.cols),
             rows: *lock_or_recover(&self.rows),
             title: lock_or_recover(&self.title).clone(),

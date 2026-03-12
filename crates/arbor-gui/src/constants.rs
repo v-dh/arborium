@@ -77,18 +77,15 @@ pub(crate) const DIFF_ZONEMAP_MARKER_HEIGHT_PX: f32 = 2.;
 pub(crate) const DIFF_ZONEMAP_MIN_THUMB_HEIGHT_PX: f32 = 12.;
 pub(crate) const DIFF_FONT_SIZE_PX: f32 = 12.0;
 pub(crate) const DIFF_HUNK_CONTEXT_LINES: usize = 3;
-// Review comment colors (used across all themes)
-pub(crate) const DIFF_COMMENT_BG: u32 = 0x2d3548;
-pub(crate) const DIFF_COMMENT_RESOLVED_BG: u32 = 0x252b38;
-pub(crate) const DIFF_COMMENT_AUTHOR_COLOR: u32 = 0x7daedb;
-pub(crate) const DIFF_COMMENT_TEXT_COLOR: u32 = 0xb8c4d0;
-pub(crate) const DIFF_COMMENT_RESOLVED_TEXT_COLOR: u32 = 0x6b7585;
 
 pub(crate) const TAB_ICON_DIFF: &str = "\u{f440}";
 pub(crate) const TAB_ICON_FILE: &str = "\u{f15c}";
 pub(crate) const GIT_ACTION_ICON_COMMIT: &str = "\u{f417}";
 pub(crate) const GIT_ACTION_ICON_PUSH: &str = "\u{f093}";
 pub(crate) const GIT_ACTION_ICON_PR: &str = "\u{f126}";
+pub(crate) const COMMAND_PALETTE_MAX_HEIGHT_PX: f32 = 360.;
+pub(crate) const COMMAND_PALETTE_ROW_ESTIMATE_PX: f32 = 52.;
+pub(crate) const COMMAND_PALETTE_SCROLLBAR_TRACK_HEIGHT_PX: f32 = 336.;
 pub(crate) const LOG_POLLER_INTERVAL: Duration = Duration::from_millis(200);
 pub(crate) const THEME_TOAST_DURATION: Duration = Duration::from_millis(1600);
 pub(crate) const WORKTREE_HOVER_POPOVER_HIDE_DELAY: Duration = Duration::from_millis(300);

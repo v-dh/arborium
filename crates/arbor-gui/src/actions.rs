@@ -21,6 +21,7 @@ actions!(arbor, [
     NavigateWorktreeForward,
     CollapseAllRepositories,
     ViewLogs,
+    OpenCommandPalette,
     OpenThemePicker,
     OpenSettings,
     OpenManageHosts,

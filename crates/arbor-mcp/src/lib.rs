@@ -486,6 +486,7 @@ mod tests {
                 exit_code: None,
                 state: Some(TerminalSessionState::Running),
                 updated_at_unix_ms: None,
+                root_pid: None,
             }])
         }
 
@@ -517,6 +518,7 @@ mod tests {
                     exit_code: None,
                     state: Some(TerminalSessionState::Running),
                     updated_at_unix_ms: None,
+                    root_pid: None,
                 },
             })
         }

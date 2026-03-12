@@ -15,8 +15,10 @@ use {
             WriteRequest,
         },
         process::ProcessInfo,
+        repo_config,
         task::{TaskExecution, TaskInfo},
         worktree,
+        worktree_scripts::{WorktreeScriptContext, WorktreeScriptPhase, run_worktree_scripts},
     },
     arbor_daemon_client::{
         AgentSessionDto, ChangedFileDto, CommitWorktreeRequest, CreateTerminalRequest,
@@ -41,7 +43,7 @@ use {
         path::{Path, PathBuf},
         process::Command,
         sync::Arc,
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     },
     tokio::sync::Mutex,
 };
@@ -287,6 +289,19 @@ pub(crate) async fn create_worktree(
     .map_err(|error| internal_error(format!("failed to create worktree: {error}")))?;
 
     let resolved_branch = git_branch_name_for_worktree(&worktree_path).ok();
+    let script_context =
+        WorktreeScriptContext::new(&repo_root, &worktree_path, resolved_branch.as_deref());
+    if let Err(error) =
+        run_worktree_scripts(&repo_root, WorktreeScriptPhase::Setup, &script_context)
+    {
+        rollback_created_worktree_http(&repo_root, &worktree_path, branch.as_deref()).map_err(
+            |rollback_error| {
+                internal_error(format!("{error}. rollback also failed: {rollback_error}"))
+            },
+        )?;
+        return Err(internal_error(error.to_string()));
+    }
+
     Ok(Json(WorktreeMutationResponse {
         repo_root: repo_root.display().to_string(),
         path: worktree_path.display().to_string(),
@@ -307,6 +322,9 @@ pub(crate) async fn delete_worktree(
     }
 
     let branch = git_branch_name_for_worktree(&worktree_path).ok();
+    let script_context = WorktreeScriptContext::new(&repo_root, &worktree_path, branch.as_deref());
+    run_worktree_scripts(&repo_root, WorktreeScriptPhase::Teardown, &script_context)
+        .map_err(|error| internal_error(error.to_string()))?;
     worktree::remove(&repo_root, &worktree_path, request.force.unwrap_or(false))
         .map_err(|error| internal_error(format!("failed to delete worktree: {error}")))?;
 
@@ -329,6 +347,19 @@ pub(crate) async fn delete_worktree(
         deleted_branch,
         message: format!("deleted worktree at {}", worktree_path.display()),
     }))
+}
+
+fn rollback_created_worktree_http(
+    repo_root: &Path,
+    worktree_path: &Path,
+    created_branch: Option<&str>,
+) -> Result<(), String> {
+    worktree::remove(repo_root, worktree_path, true).map_err(|error| error.to_string())?;
+    if let Some(branch_name) = created_branch.filter(|value| !value.trim().is_empty()) {
+        worktree::delete_branch(repo_root, branch_name)
+            .map_err(|error| format!("failed to delete branch `{branch_name}`: {error}"))?;
+    }
+    Ok(())
 }
 
 pub(crate) async fn list_worktree_changes(
@@ -818,13 +849,19 @@ pub(crate) async fn agent_notify(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
+    let session_id = request.session_id.clone();
+    let cwd_path = PathBuf::from(&request.cwd);
 
-    let dto = {
+    let (dto, previous_state) = {
         let mut sessions = state.agent_sessions.lock().await;
 
         // Expire stale sessions
         let cutoff = now_ms.saturating_sub(AGENT_SESSION_EXPIRY_SECS * 1000);
         sessions.retain(|_, session| session.updated_at_unix_ms > cutoff);
+
+        let previous_state = sessions
+            .get(&request.session_id)
+            .map(|session| session.state);
 
         sessions.insert(request.session_id, AgentSession {
             cwd: request.cwd.clone(),
@@ -832,14 +869,14 @@ pub(crate) async fn agent_notify(
             updated_at_unix_ms: now_ms,
         });
 
-        AgentSessionDto {
-            cwd: request.cwd,
-            state: match agent_state {
-                AgentState::Working => "working".to_owned(),
-                AgentState::Waiting => "waiting".to_owned(),
+        (
+            AgentSessionDto {
+                cwd: request.cwd,
+                state: agent_state_label(agent_state).to_owned(),
+                updated_at_unix_ms: now_ms,
             },
-            updated_at_unix_ms: now_ms,
-        }
+            previous_state,
+        )
     };
 
     tracing::info!(
@@ -847,6 +884,27 @@ pub(crate) async fn agent_notify(
         state = dto.state.as_str(),
         "agent session updated, broadcasting"
     );
+    if let Some(event_name) =
+        notification_event_name_for_agent_transition(previous_state, agent_state)
+        && let Ok(repo_root) = worktree::repo_root(&cwd_path)
+    {
+        let branch = git_branch_name_for_worktree(&cwd_path).ok();
+        spawn_notification_webhooks(
+            repo_root.clone(),
+            event_name,
+            serde_json::json!({
+                "event": event_name,
+                "repo_root": repo_root,
+                "worktree_path": cwd_path,
+                "cwd": dto.cwd.clone(),
+                "branch": branch,
+                "session_id": session_id,
+                "state": agent_state_label(agent_state),
+                "previous_state": previous_state.map(agent_state_label),
+                "timestamp_unix_ms": now_ms,
+            }),
+        );
+    }
     let _ = state
         .agent_broadcast
         .send(AgentWsEvent::Update { session: dto });
@@ -913,6 +971,259 @@ pub(crate) async fn send_ws_json(socket: &mut WebSocket, value: &impl Serialize)
         .send(Message::Text(payload.into()))
         .await
         .map_err(|_| ())
+}
+
+fn repo_webhook_urls_for_event(repo_root: &Path, event_name: &str) -> Vec<String> {
+    let Some(config) = repo_config::load_repo_config(repo_root) else {
+        return Vec::new();
+    };
+
+    let notifications = config.notifications;
+    if !notifications.events.is_empty()
+        && !notifications.events.iter().any(|event| event == event_name)
+    {
+        return Vec::new();
+    }
+
+    notifications
+        .webhook_urls
+        .into_iter()
+        .map(|url| url.trim().to_owned())
+        .filter(|url| !url.is_empty())
+        .collect()
+}
+
+pub(crate) fn spawn_notification_webhooks(
+    repo_root: PathBuf,
+    event_name: &'static str,
+    payload: serde_json::Value,
+) {
+    let urls = repo_webhook_urls_for_event(&repo_root, event_name);
+    if urls.is_empty() {
+        return;
+    }
+
+    tokio::spawn(async move {
+        let _ = tokio::task::spawn_blocking(move || {
+            let http: ureq::Agent = ureq::Agent::config_builder()
+                .timeout_global(Some(Duration::from_secs(10)))
+                .build()
+                .into();
+            for url in urls {
+                let body = match notification_webhook_request_body(&url, event_name, &payload) {
+                    Ok(body) => body,
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            %url,
+                            event = event_name,
+                            "failed to serialize notification webhook request"
+                        );
+                        continue;
+                    },
+                };
+
+                send_notification_webhook_with_retries(&http, &url, event_name, &body);
+            }
+        })
+        .await;
+    });
+}
+
+const NOTIFICATION_WEBHOOK_MAX_ATTEMPTS: usize = 3;
+const NOTIFICATION_WEBHOOK_RETRY_DELAYS_MS: [u64; NOTIFICATION_WEBHOOK_MAX_ATTEMPTS - 1] =
+    [300, 1_000];
+
+fn send_notification_webhook_with_retries(
+    http: &ureq::Agent,
+    url: &str,
+    event_name: &str,
+    body: &str,
+) {
+    for attempt in 0..NOTIFICATION_WEBHOOK_MAX_ATTEMPTS {
+        match send_notification_webhook_request(http, url, body) {
+            Ok(()) => return,
+            Err(error) => {
+                let Some(delay) = notification_webhook_retry_delay(attempt, &error) else {
+                    tracing::warn!(
+                        %error,
+                        %url,
+                        event = event_name,
+                        attempt = attempt + 1,
+                        "notification webhook failed"
+                    );
+                    return;
+                };
+
+                tracing::warn!(
+                    %error,
+                    %url,
+                    event = event_name,
+                    attempt = attempt + 1,
+                    retry_in_ms = delay.as_millis() as u64,
+                    "notification webhook failed; retrying"
+                );
+                std::thread::sleep(delay);
+            },
+        }
+    }
+}
+
+fn send_notification_webhook_request(
+    http: &ureq::Agent,
+    url: &str,
+    body: &str,
+) -> Result<(), ureq::Error> {
+    http.post(url)
+        .header("content-type", "application/json")
+        .send(body)
+        .map(|_| ())
+}
+
+fn notification_webhook_retry_delay(attempt: usize, error: &ureq::Error) -> Option<Duration> {
+    if !should_retry_notification_webhook(error) {
+        return None;
+    }
+
+    NOTIFICATION_WEBHOOK_RETRY_DELAYS_MS
+        .get(attempt)
+        .copied()
+        .map(Duration::from_millis)
+}
+
+fn should_retry_notification_webhook(error: &ureq::Error) -> bool {
+    match error {
+        ureq::Error::StatusCode(status) => {
+            *status == 408 || *status == 409 || *status == 425 || *status == 429 || *status >= 500
+        },
+        ureq::Error::Timeout(_)
+        | ureq::Error::Io(_)
+        | ureq::Error::HostNotFound
+        | ureq::Error::Protocol(_)
+        | ureq::Error::ConnectionFailed => true,
+        _ => false,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotificationWebhookFormat {
+    GenericJson,
+    SlackIncomingWebhook,
+    DiscordWebhook,
+}
+
+fn notification_webhook_format(url: &str) -> NotificationWebhookFormat {
+    let url = url.to_ascii_lowercase();
+    if url.contains("hooks.slack.com/") {
+        NotificationWebhookFormat::SlackIncomingWebhook
+    } else if url.contains("discord.com/api/webhooks/")
+        || url.contains("discordapp.com/api/webhooks/")
+    {
+        NotificationWebhookFormat::DiscordWebhook
+    } else {
+        NotificationWebhookFormat::GenericJson
+    }
+}
+
+fn notification_webhook_request_body(
+    url: &str,
+    event_name: &str,
+    payload: &serde_json::Value,
+) -> Result<String, serde_json::Error> {
+    match notification_webhook_format(url) {
+        NotificationWebhookFormat::GenericJson => serde_json::to_string(payload),
+        NotificationWebhookFormat::SlackIncomingWebhook => serde_json::to_string(
+            &serde_json::json!({ "text": notification_webhook_text(event_name, payload) }),
+        ),
+        NotificationWebhookFormat::DiscordWebhook => serde_json::to_string(
+            &serde_json::json!({ "content": notification_webhook_text(event_name, payload) }),
+        ),
+    }
+}
+
+fn notification_webhook_text(event_name: &str, payload: &serde_json::Value) -> String {
+    let repo_root = notification_payload_field(payload, "repo_root");
+    let worktree_path = notification_payload_field(payload, "worktree_path");
+    let branch = notification_payload_field(payload, "branch");
+    let cwd = notification_payload_field(payload, "cwd");
+    let process_name = notification_payload_field(payload, "process_name");
+    let command = notification_payload_field(payload, "command");
+    let exit_code = payload.get("exit_code").and_then(serde_json::Value::as_i64);
+
+    match event_name {
+        "agent_started" => {
+            let mut parts = vec!["Arbor agent started".to_owned()];
+            if let Some(branch) = branch {
+                parts.push(format!("branch `{branch}`"));
+            }
+            if let Some(worktree_path) = worktree_path.or(cwd) {
+                parts.push(format!("worktree `{worktree_path}`"));
+            }
+            if let Some(repo_root) = repo_root {
+                parts.push(format!("repo `{repo_root}`"));
+            }
+            parts.join(" · ")
+        },
+        "agent_finished" => {
+            let mut parts = vec!["Arbor agent finished".to_owned()];
+            if let Some(branch) = branch {
+                parts.push(format!("branch `{branch}`"));
+            }
+            if let Some(worktree_path) = worktree_path.or(cwd) {
+                parts.push(format!("worktree `{worktree_path}`"));
+            }
+            if let Some(repo_root) = repo_root {
+                parts.push(format!("repo `{repo_root}`"));
+            }
+            parts.join(" · ")
+        },
+        "agent_error" => {
+            let mut parts = vec!["Arbor process error".to_owned()];
+            if let Some(process_name) = process_name {
+                parts.push(format!("process `{process_name}`"));
+            }
+            if let Some(command) = command {
+                parts.push(format!("command `{command}`"));
+            }
+            if let Some(exit_code) = exit_code {
+                parts.push(format!("exit {exit_code}"));
+            }
+            if let Some(repo_root) = repo_root {
+                parts.push(format!("repo `{repo_root}`"));
+            }
+            parts.join(" · ")
+        },
+        _ => {
+            let mut parts = vec![format!("Arbor event `{event_name}`")];
+            if let Some(repo_root) = repo_root {
+                parts.push(format!("repo `{repo_root}`"));
+            }
+            parts.join(" · ")
+        },
+    }
+}
+
+fn notification_payload_field<'a>(payload: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    payload.get(key).and_then(serde_json::Value::as_str)
+}
+
+fn notification_event_name_for_agent_transition(
+    previous_state: Option<AgentState>,
+    current_state: AgentState,
+) -> Option<&'static str> {
+    match (previous_state, current_state) {
+        (Some(AgentState::Working), AgentState::Working)
+        | (Some(AgentState::Waiting), AgentState::Waiting) => None,
+        (_, AgentState::Working) => Some("agent_started"),
+        (_, AgentState::Waiting) => Some("agent_finished"),
+    }
+}
+
+fn agent_state_label(state: AgentState) -> &'static str {
+    match state {
+        AgentState::Working => "working",
+        AgentState::Waiting => "waiting",
+    }
 }
 
 fn agent_session_snapshot(sessions: &mut HashMap<String, AgentSession>) -> Vec<AgentSessionDto> {
@@ -1675,4 +1986,142 @@ async fn lookup_pr_cached(
     }
 
     (pr_number, pr_url)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notification_webhook_format_detects_provider_specific_urls() {
+        assert_eq!(
+            notification_webhook_format("https://hooks.slack.com/services/T000/B000/abc"),
+            NotificationWebhookFormat::SlackIncomingWebhook
+        );
+        assert_eq!(
+            notification_webhook_format("https://discord.com/api/webhooks/123/abc"),
+            NotificationWebhookFormat::DiscordWebhook
+        );
+        assert_eq!(
+            notification_webhook_format("https://example.com/hooks/arbor"),
+            NotificationWebhookFormat::GenericJson
+        );
+    }
+
+    #[test]
+    fn notification_webhook_request_body_uses_slack_text_payload() {
+        let payload = serde_json::json!({
+            "event": "agent_finished",
+            "repo_root": "/tmp/repo",
+            "worktree_path": "/tmp/repo-feature",
+            "branch": "feature/test"
+        });
+        let body = notification_webhook_request_body(
+            "https://hooks.slack.com/services/T000/B000/abc",
+            "agent_finished",
+            &payload,
+        )
+        .unwrap_or_else(|error| panic!("request body should serialize: {error}"));
+        let json: serde_json::Value = serde_json::from_str(&body)
+            .unwrap_or_else(|error| panic!("request body should parse: {error}"));
+
+        assert_eq!(
+            json.get("text").and_then(serde_json::Value::as_str),
+            Some(
+                "Arbor agent finished · branch `feature/test` · worktree `/tmp/repo-feature` · repo `/tmp/repo`"
+            )
+        );
+    }
+
+    #[test]
+    fn notification_webhook_request_body_uses_discord_content_payload() {
+        let payload = serde_json::json!({
+            "event": "agent_error",
+            "repo_root": "/tmp/repo",
+            "process_name": "web",
+            "command": "npm test",
+            "exit_code": 1
+        });
+        let body = notification_webhook_request_body(
+            "https://discord.com/api/webhooks/123/abc",
+            "agent_error",
+            &payload,
+        )
+        .unwrap_or_else(|error| panic!("request body should serialize: {error}"));
+        let json: serde_json::Value = serde_json::from_str(&body)
+            .unwrap_or_else(|error| panic!("request body should parse: {error}"));
+
+        assert_eq!(
+            json.get("content").and_then(serde_json::Value::as_str),
+            Some(
+                "Arbor process error · process `web` · command `npm test` · exit 1 · repo `/tmp/repo`"
+            )
+        );
+    }
+
+    #[test]
+    fn notification_webhook_text_formats_agent_started() {
+        let payload = serde_json::json!({
+            "event": "agent_started",
+            "repo_root": "/tmp/repo",
+            "worktree_path": "/tmp/repo-feature",
+            "branch": "feature/test"
+        });
+
+        assert_eq!(
+            notification_webhook_text("agent_started", &payload),
+            "Arbor agent started · branch `feature/test` · worktree `/tmp/repo-feature` · repo `/tmp/repo`"
+        );
+    }
+
+    #[test]
+    fn notification_event_name_tracks_agent_state_transitions() {
+        assert_eq!(
+            notification_event_name_for_agent_transition(None, AgentState::Working),
+            Some("agent_started")
+        );
+        assert_eq!(
+            notification_event_name_for_agent_transition(
+                Some(AgentState::Working),
+                AgentState::Waiting,
+            ),
+            Some("agent_finished")
+        );
+        assert_eq!(
+            notification_event_name_for_agent_transition(
+                Some(AgentState::Waiting),
+                AgentState::Waiting,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn notification_webhook_retry_policy_retries_transient_status_codes() {
+        assert!(should_retry_notification_webhook(&ureq::Error::StatusCode(
+            429
+        )));
+        assert!(should_retry_notification_webhook(&ureq::Error::StatusCode(
+            503
+        )));
+        assert!(!should_retry_notification_webhook(
+            &ureq::Error::StatusCode(400)
+        ));
+    }
+
+    #[test]
+    fn notification_webhook_retry_delay_is_bounded() {
+        assert_eq!(
+            notification_webhook_retry_delay(0, &ureq::Error::StatusCode(503)),
+            Some(Duration::from_millis(300))
+        );
+        assert_eq!(
+            notification_webhook_retry_delay(1, &ureq::Error::StatusCode(503)),
+            Some(Duration::from_millis(1_000))
+        );
+        assert_eq!(
+            notification_webhook_retry_delay(2, &ureq::Error::StatusCode(503)),
+            None
+        );
+    }
 }

@@ -1,14 +1,12 @@
 mod actions;
 mod app_config;
+mod assets;
 mod checkout;
 mod connection_history;
 mod constants;
 mod github_auth_store;
 mod github_service;
-mod graphql;
-mod helpers;
 mod log_layer;
-#[cfg(feature = "mdns")]
 mod mdns_browser;
 mod notifications;
 mod repository_store;
@@ -16,309 +14,85 @@ mod simple_http_client;
 mod terminal_backend;
 mod terminal_daemon_http;
 mod terminal_keys;
-mod terminal_runtime;
 mod theme;
-mod types;
 mod ui_state_store;
 
-pub(crate) use {actions::*, constants::*, helpers::*, terminal_runtime::*, types::*};
+pub(crate) use {actions::*, assets::*, constants::*};
 use {
     arbor_core::{
-        SessionId,
         agent::AgentState,
         changes::{self, ChangeKind, ChangedFile},
-        daemon::{self, CreateOrAttachRequest, DaemonSessionRecord},
+        daemon::{
+            self, CreateOrAttachRequest, DaemonSessionRecord, DetachRequest, KillRequest,
+            ResizeRequest, SignalRequest, SnapshotRequest, TerminalSessionState, TerminalSignal,
+            WriteRequest,
+        },
         worktree,
+        worktree_scripts::{WorktreeScriptContext, WorktreeScriptPhase, run_worktree_scripts},
     },
     checkout::CheckoutKind,
     gix_diff::blob::v2::{
         Algorithm as DiffAlgorithm, Diff as BlobDiff, InternedInput as BlobInternedInput,
     },
     gpui::{
-        Animation, AnimationExt, AnyElement, App, Application, AssetSource, Bounds, ClipboardItem,
-        Context, Div, DragMoveEvent, ElementId, ElementInputHandler, EntityInputHandler,
-        FocusHandle, FontWeight, Image, ImageFormat, KeyBinding, KeyDownEvent, Keystroke, Menu,
-        MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions,
-        Pixels, ScrollHandle, ScrollStrategy, SharedString, Stateful, SystemMenuType, TextRun,
-        TitlebarOptions, UTF16Selection, UniformListScrollHandle, Window, WindowBounds,
-        WindowControlArea, WindowDecorations, WindowOptions, canvas, div, ease_in_out, fill, img,
-        point, prelude::*, px, rgb, size, svg, uniform_list,
+        Animation, AnimationExt, AnyElement, App, Application, Bounds, ClipboardItem, Context, Div,
+        DragMoveEvent, ElementId, ElementInputHandler, EntityInputHandler, FocusHandle, FontWeight,
+        Image, ImageFormat, KeyBinding, KeyDownEvent, Keystroke, Menu, MenuItem, MouseButton,
+        MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, ScrollHandle,
+        ScrollStrategy, Stateful, SystemMenuType, TextRun, TitlebarOptions, UTF16Selection,
+        UniformListScrollHandle, Window, WindowBounds, WindowControlArea, WindowDecorations,
+        WindowOptions, canvas, div, ease_in_out, fill, img, point, prelude::*, px, rgb, size,
+        uniform_list,
     },
+    ropey::Rope,
     std::{
-        borrow::Cow,
         collections::{HashMap, HashSet},
         env, fs,
+        net::TcpListener,
         path::{Path, PathBuf},
-        process::{Command, Stdio},
-        sync::{Arc, OnceLock},
+        process::{Child, Command, Stdio},
+        sync::{Arc, Mutex, OnceLock},
         time::{Duration, Instant, SystemTime},
     },
+    syntect::{easy::HighlightLines, highlighting::ThemeSet, parsing::SyntaxSet},
     terminal_backend::{
-        EMBEDDED_TERMINAL_DEFAULT_BG, EMBEDDED_TERMINAL_DEFAULT_FG, TerminalBackendKind,
-        TerminalLaunch, TerminalModes,
+        EMBEDDED_TERMINAL_DEFAULT_BG, EMBEDDED_TERMINAL_DEFAULT_FG, EmbeddedTerminal,
+        TerminalBackendKind, TerminalCursor, TerminalLaunch, TerminalModes, TerminalStyledCell,
+        TerminalStyledLine, TerminalStyledRun,
     },
     theme::{ThemeKind, ThemePalette},
 };
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-enum TopBarIconKind {
-    RemoteControl,
-    GitHub,
-    WorktreeActions,
-    ReportIssue,
-}
+include!("types.rs");
+include!("theme_picker.rs");
+include!("repo_presets.rs");
+include!("prompt_runner.rs");
+include!("command_palette.rs");
+include!("git_actions.rs");
+include!("worktree_lifecycle.rs");
+include!("welcome_ui.rs");
+include!("manage_hosts.rs");
+include!("agent_presets.rs");
+include!("daemon_connection_ui.rs");
+include!("settings_ui.rs");
+include!("top_bar.rs");
+include!("sidebar.rs");
+include!("changes_pane.rs");
+include!("log_view.rs");
+include!("center_panel.rs");
+include!("workspace_layout.rs");
+include!("workspace_navigation.rs");
+include!("file_view.rs");
+include!("diff_view.rs");
+include!("terminal_interaction.rs");
+include!("daemon_runtime.rs");
+include!("terminal_rendering.rs");
+include!("external_launchers.rs");
+include!("github_auth_modal.rs");
+include!("github_helpers.rs");
+include!("github_oauth.rs");
+include!("app_bootstrap.rs");
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-enum TopBarIconTone {
-    Muted,
-    Disabled,
-    Connected,
-    Busy,
-}
-
-fn find_assets_root_dir() -> Option<PathBuf> {
-    if let Ok(exe) = env::current_exe() {
-        let exe_dir = exe.parent()?;
-
-        let macos_bundle = exe_dir.parent().map(|p| p.join("Resources"));
-        if let Some(dir) = macos_bundle
-            && dir.is_dir()
-        {
-            return Some(dir);
-        }
-
-        let share_dir = exe_dir.parent().map(|p| p.join("share").join("arbor"));
-        if let Some(dir) = share_dir
-            && dir.is_dir()
-        {
-            return Some(dir);
-        }
-    }
-
-    let dev_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets");
-    if dev_dir.is_dir() {
-        return Some(dev_dir);
-    }
-
-    None
-}
-
-fn find_asset_dir(relative_subdir: &str) -> Option<PathBuf> {
-    let dir = find_assets_root_dir()?.join(relative_subdir);
-    dir.is_dir().then_some(dir)
-}
-
-fn find_top_bar_icons_dir() -> Option<PathBuf> {
-    static TOP_BAR_ICONS_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
-
-    TOP_BAR_ICONS_DIR
-        .get_or_init(|| find_asset_dir("icons/top-bar"))
-        .clone()
-}
-
-fn find_ui_icons_dir() -> Option<PathBuf> {
-    static UI_ICONS_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
-
-    UI_ICONS_DIR
-        .get_or_init(|| find_asset_dir("icons/ui"))
-        .clone()
-}
-
-fn resolve_embedded_terminal_engine(
-    configured: Option<&str>,
-    notices: &mut Vec<String>,
-) -> arbor_terminal_emulator::TerminalEngineKind {
-    let requested = env::var("ARBOR_TERMINAL_ENGINE").ok();
-    match arbor_terminal_emulator::parse_terminal_engine_kind(requested.as_deref().or(configured)) {
-        Ok(engine) => {
-            arbor_terminal_emulator::set_default_terminal_engine(engine);
-            engine
-        },
-        Err(error) => {
-            notices.push(error);
-            let engine = arbor_terminal_emulator::TerminalEngineKind::default();
-            arbor_terminal_emulator::set_default_terminal_engine(engine);
-            engine
-        },
-    }
-}
-
-struct ArborAssets {
-    base: PathBuf,
-}
-
-impl AssetSource for ArborAssets {
-    fn load(&self, path: &str) -> anyhow::Result<Option<Cow<'static, [u8]>>> {
-        fs::read(self.base.join(path))
-            .map(|data| Some(Cow::Owned(data)))
-            .map_err(Into::into)
-    }
-
-    fn list(&self, path: &str) -> anyhow::Result<Vec<SharedString>> {
-        fs::read_dir(self.base.join(path))
-            .map(|entries| {
-                entries
-                    .filter_map(|entry| {
-                        entry
-                            .ok()
-                            .and_then(|entry| entry.file_name().into_string().ok())
-                            .map(SharedString::from)
-                    })
-                    .collect()
-            })
-            .map_err(Into::into)
-    }
-}
-
-struct ArborWindow {
-    app_config_store: Box<dyn app_config::AppConfigStore>,
-    repository_store: Box<dyn repository_store::RepositoryStore>,
-    daemon_session_store: Box<dyn daemon::DaemonSessionStore>,
-    terminal_daemon: Option<terminal_daemon_http::SharedTerminalDaemonClient>,
-    daemon_base_url: String,
-    ui_state_store: Box<dyn ui_state_store::UiStateStore>,
-    github_auth_store: Box<dyn github_auth_store::GithubAuthStore>,
-    github_service: Arc<dyn github_service::GitHubService>,
-    review_service: Arc<dyn github_service::GitHubReviewService>,
-    github_token_shared: Arc<std::sync::RwLock<Option<String>>>,
-    review_threads: HashMap<PathBuf, Vec<github_service::ReviewThread>>,
-    review_threads_loading: bool,
-    github_auth_state: github_auth_store::GithubAuthState,
-    github_auth_in_progress: bool,
-    github_auth_copy_feedback_active: bool,
-    github_auth_copy_feedback_generation: u64,
-    config_last_modified: Option<SystemTime>,
-    repositories: Vec<RepositorySummary>,
-    active_repository_index: Option<usize>,
-    repo_root: PathBuf,
-    github_repo_slug: Option<String>,
-    worktrees: Vec<WorktreeSummary>,
-    worktree_stats_loading: bool,
-    worktree_prs_loading: bool,
-    active_worktree_index: Option<usize>,
-    worktree_selection_epoch: usize,
-    changed_files: Vec<ChangedFile>,
-    selected_changed_file: Option<PathBuf>,
-    changes_view_mode: ChangesViewMode,
-    pr_changed_files: Vec<PrChangedFile>,
-    pr_merge_base: Option<String>,
-    pr_changed_files_loading: bool,
-    terminals: Vec<TerminalSession>,
-    terminal_poll_tx: std::sync::mpsc::Sender<()>,
-    terminal_poll_rx: Option<std::sync::mpsc::Receiver<()>>,
-    diff_sessions: Vec<DiffSession>,
-    active_diff_session_id: Option<u64>,
-    pending_comment: Option<PendingComment>,
-    file_view_sessions: Vec<FileViewSession>,
-    active_file_view_session_id: Option<u64>,
-    next_file_view_session_id: u64,
-    file_view_scroll_handle: UniformListScrollHandle,
-    file_view_editing: bool,
-    active_terminal_by_worktree: HashMap<PathBuf, u64>,
-    next_terminal_id: u64,
-    next_diff_session_id: u64,
-    active_backend_kind: TerminalBackendKind,
-    configured_embedded_shell: Option<String>,
-    theme_kind: ThemeKind,
-    left_pane_width: f32,
-    right_pane_width: f32,
-    terminal_focus: FocusHandle,
-    welcome_clone_focus: FocusHandle,
-    welcome_local_path_focus: FocusHandle,
-    terminal_scroll_handle: ScrollHandle,
-    last_terminal_grid_size: Option<(u16, u16)>,
-    center_tabs_scroll_handle: ScrollHandle,
-    diff_scroll_handle: UniformListScrollHandle,
-    terminal_selection: Option<TerminalSelection>,
-    terminal_selection_drag_anchor: Option<TerminalGridPosition>,
-    create_modal: Option<CreateModal>,
-    preferred_checkout_kind: CheckoutKind,
-    github_auth_modal: Option<GitHubAuthModal>,
-    delete_modal: Option<DeleteModal>,
-    outposts: Vec<OutpostSummary>,
-    outpost_store: Box<dyn arbor_core::outpost_store::OutpostStore>,
-    active_outpost_index: Option<usize>,
-    remote_hosts: Vec<arbor_core::outpost::RemoteHost>,
-    ssh_connection_pool: Arc<arbor_ssh::connection::SshConnectionPool>,
-    ssh_daemon_tunnel: Option<SshDaemonTunnel>,
-    manage_hosts_modal: Option<ManageHostsModal>,
-    manage_presets_modal: Option<ManagePresetsModal>,
-    agent_presets: Vec<AgentPreset>,
-    active_preset_tab: Option<AgentPresetKind>,
-    repo_presets: Vec<RepoPreset>,
-    manage_repo_presets_modal: Option<ManageRepoPresetsModal>,
-    show_about: bool,
-    show_theme_picker: bool,
-    settings_modal: Option<SettingsModal>,
-    daemon_auth_modal: Option<DaemonAuthModal>,
-    /// When set, a successful auth submission should retry fetching for this remote daemon index.
-    pending_remote_daemon_auth: Option<usize>,
-    start_daemon_modal: bool,
-    connect_to_host_modal: Option<ConnectToHostModal>,
-    connection_history: Vec<connection_history::ConnectionHistoryEntry>,
-    daemon_auth_tokens: HashMap<String, String>,
-    connected_daemon_label: Option<String>,
-    pending_diff_scroll_to_file: Option<PathBuf>,
-    focus_terminal_on_next_render: bool,
-    git_action_in_flight: Option<GitActionKind>,
-    top_bar_quick_actions_open: bool,
-    top_bar_quick_actions_submenu: Option<QuickActionSubmenu>,
-    ide_launchers: Vec<ExternalLauncher>,
-    terminal_launchers: Vec<ExternalLauncher>,
-    last_persisted_ui_state: ui_state_store::UiState,
-    last_ui_state_error: Option<String>,
-    notification_service: Box<dyn notifications::NotificationService>,
-    notifications_enabled: bool,
-    window_is_active: bool,
-    notice: Option<String>,
-    theme_toast: Option<String>,
-    theme_toast_generation: u64,
-    right_pane_tab: RightPaneTab,
-    right_pane_search: String,
-    right_pane_search_cursor: usize,
-    right_pane_search_active: bool,
-    file_tree_entries: Vec<FileTreeEntry>,
-    expanded_dirs: HashSet<PathBuf>,
-    selected_file_tree_entry: Option<PathBuf>,
-    left_pane_visible: bool,
-    collapsed_repositories: HashSet<usize>,
-    sidebar_order: HashMap<String, Vec<SidebarItemId>>,
-    repository_context_menu: Option<RepositoryContextMenu>,
-    worktree_context_menu: Option<WorktreeContextMenu>,
-    worktree_hover_popover: Option<WorktreeHoverPopover>,
-    _hover_show_task: Option<gpui::Task<()>>,
-    _hover_dismiss_task: Option<gpui::Task<()>>,
-    last_mouse_position: gpui::Point<Pixels>,
-    outpost_context_menu: Option<OutpostContextMenu>,
-    discovered_daemons: Vec<mdns_browser::DiscoveredDaemon>,
-    mdns_browser: Option<Box<dyn mdns_browser::MdnsDiscovery>>,
-    active_discovered_daemon: Option<usize>,
-    worktree_nav_back: Vec<usize>,
-    worktree_nav_forward: Vec<usize>,
-    log_buffer: log_layer::LogBuffer,
-    log_entries: Vec<log_layer::LogEntry>,
-    log_generation: u64,
-    log_scroll_handle: ScrollHandle,
-    log_auto_scroll: bool,
-    logs_tab_open: bool,
-    logs_tab_active: bool,
-    quit_overlay_until: Option<Instant>,
-    ime_marked_text: Option<String>,
-    welcome_clone_url: String,
-    welcome_clone_url_cursor: usize,
-    welcome_clone_url_active: bool,
-    welcome_cloning: bool,
-    welcome_clone_error: Option<String>,
-    welcome_local_path: String,
-    welcome_local_path_cursor: usize,
-    welcome_local_path_active: bool,
-    welcome_local_path_error: Option<String>,
-    /// Remote daemons that have been expanded in the sidebar.
-    remote_daemon_states: HashMap<usize, RemoteDaemonState>,
-    /// Currently selected remote worktree (if any). The window stays connected
-    /// to the local daemon; only terminal sessions use the remote client.
-    active_remote_worktree: Option<ActiveRemoteWorktree>,
-}
 impl ArborWindow {
     fn load_with_daemon_store<S>(
         startup_ui_state: ui_state_store::UiState,
@@ -342,15 +116,6 @@ impl ArborWindow {
         let ui_state_store = ui_state_store::default_ui_state_store();
         let github_auth_store = github_auth_store::default_github_auth_store();
         let github_service = github_service::default_github_service();
-        let github_token_shared: Arc<std::sync::RwLock<Option<String>>> =
-            Arc::new(std::sync::RwLock::new(None));
-        let token_shared_clone = github_token_shared.clone();
-        let review_service = github_service::default_review_service(Arc::new(move || {
-            token_shared_clone
-                .read()
-                .ok()
-                .and_then(|guard| guard.clone())
-        }));
         let notification_service = notifications::default_notification_service();
         let loaded_github_auth_state = github_auth_store.load();
         let config_path = app_config_store.config_path();
@@ -436,7 +201,6 @@ impl ArborWindow {
                 let outpost_store = Box::new(arbor_core::outpost_store::default_outpost_store());
                 let outposts = load_outpost_summaries(outpost_store.as_ref(), &remote_hosts);
                 let (terminal_poll_tx, terminal_poll_rx) = std::sync::mpsc::channel();
-                let startup_sidebar_order = startup_ui_state.sidebar_order.clone();
 
                 let app = Self {
                     app_config_store,
@@ -447,10 +211,6 @@ impl ArborWindow {
                     ui_state_store,
                     github_auth_store,
                     github_service,
-                    review_service: review_service.clone(),
-                    github_token_shared: github_token_shared.clone(),
-                    review_threads: HashMap::new(),
-                    review_threads_loading: false,
                     github_auth_state,
                     github_auth_in_progress: false,
                     github_auth_copy_feedback_active: false,
@@ -467,16 +227,11 @@ impl ArborWindow {
                     worktree_selection_epoch: 0,
                     changed_files: Vec::new(),
                     selected_changed_file: None,
-                    changes_view_mode: ChangesViewMode::Local,
-                    pr_changed_files: Vec::new(),
-                    pr_merge_base: None,
-                    pr_changed_files_loading: false,
                     terminals: Vec::new(),
                     terminal_poll_tx,
                     terminal_poll_rx: Some(terminal_poll_rx),
                     diff_sessions: Vec::new(),
                     active_diff_session_id: None,
-                    pending_comment: None,
                     file_view_sessions: Vec::new(),
                     active_file_view_session_id: None,
                     next_file_view_session_id: 1,
@@ -496,7 +251,6 @@ impl ArborWindow {
                         .map_or(DEFAULT_RIGHT_PANE_WIDTH, |width| width as f32),
                     terminal_focus: cx.focus_handle(),
                     welcome_clone_focus: cx.focus_handle(),
-                    welcome_local_path_focus: cx.focus_handle(),
                     terminal_scroll_handle: ScrollHandle::new(),
                     last_terminal_grid_size: None,
                     center_tabs_scroll_handle: ScrollHandle::new(),
@@ -509,6 +263,7 @@ impl ArborWindow {
                         .unwrap_or_default(),
                     github_auth_modal: None,
                     delete_modal: None,
+                    commit_modal: None,
                     outposts,
                     outpost_store,
                     active_outpost_index: None,
@@ -523,11 +278,19 @@ impl ArborWindow {
                     manage_repo_presets_modal: None,
                     show_about: false,
                     show_theme_picker: false,
+                    theme_picker_selected_index: theme_picker_index_for_kind(theme_kind),
                     settings_modal: None,
                     daemon_auth_modal: None,
                     pending_remote_daemon_auth: None,
                     start_daemon_modal: false,
                     connect_to_host_modal: None,
+                    command_palette_modal: None,
+                    command_palette_scroll_handle: ScrollHandle::new(),
+                    command_palette_recent_actions: Vec::new(),
+                    compact_sidebar: startup_ui_state.compact_sidebar.unwrap_or(false),
+                    execution_mode: startup_ui_state
+                        .execution_mode
+                        .unwrap_or(ExecutionMode::Build),
                     connection_history: connection_history::load_history(),
                     daemon_auth_tokens: connection_history::load_tokens(),
                     connected_daemon_label: None,
@@ -542,6 +305,8 @@ impl ArborWindow {
                     last_ui_state_error: None,
                     notification_service,
                     notifications_enabled,
+                    last_agent_finished_notifications: HashMap::new(),
+                    auto_checkpoint_in_flight: HashSet::new(),
                     window_is_active: true,
                     notice: (!notice_parts.is_empty()).then_some(notice_parts.join(" | ")),
                     theme_toast: None,
@@ -550,12 +315,16 @@ impl ArborWindow {
                     right_pane_search: String::new(),
                     right_pane_search_cursor: 0,
                     right_pane_search_active: false,
+                    worktree_notes_lines: vec![String::new()],
+                    worktree_notes_cursor: FileViewCursor { line: 0, col: 0 },
+                    worktree_notes_path: None,
+                    worktree_notes_active: false,
+                    worktree_notes_error: None,
                     file_tree_entries: Vec::new(),
                     expanded_dirs: HashSet::new(),
                     selected_file_tree_entry: None,
                     left_pane_visible: true,
                     collapsed_repositories: HashSet::new(),
-                    sidebar_order: startup_sidebar_order,
                     repository_context_menu: None,
                     worktree_context_menu: None,
                     worktree_hover_popover: None,
@@ -582,10 +351,6 @@ impl ArborWindow {
                     welcome_clone_url_active: false,
                     welcome_cloning: false,
                     welcome_clone_error: None,
-                    welcome_local_path: String::new(),
-                    welcome_local_path_cursor: 0,
-                    welcome_local_path_active: false,
-                    welcome_local_path_error: None,
                     remote_daemon_states: HashMap::new(),
                     active_remote_worktree: None,
                 };
@@ -784,10 +549,6 @@ impl ArborWindow {
             ui_state_store,
             github_auth_store,
             github_service,
-            review_service,
-            github_token_shared: github_token_shared.clone(),
-            review_threads: HashMap::new(),
-            review_threads_loading: false,
             github_auth_state,
             github_auth_in_progress: false,
             github_auth_copy_feedback_active: false,
@@ -808,16 +569,11 @@ impl ArborWindow {
             worktree_selection_epoch: 0,
             changed_files: Vec::new(),
             selected_changed_file: None,
-            changes_view_mode: ChangesViewMode::Local,
-            pr_changed_files: Vec::new(),
-            pr_merge_base: None,
-            pr_changed_files_loading: false,
             terminals: Vec::new(),
             terminal_poll_tx,
             terminal_poll_rx: Some(terminal_poll_rx),
             diff_sessions: Vec::new(),
             active_diff_session_id: None,
-            pending_comment: None,
             file_view_sessions: Vec::new(),
             active_file_view_session_id: None,
             next_file_view_session_id: 1,
@@ -837,7 +593,6 @@ impl ArborWindow {
                 .map_or(DEFAULT_RIGHT_PANE_WIDTH, |width| width as f32),
             terminal_focus: cx.focus_handle(),
             welcome_clone_focus: cx.focus_handle(),
-            welcome_local_path_focus: cx.focus_handle(),
             terminal_scroll_handle: ScrollHandle::new(),
             last_terminal_grid_size: None,
             center_tabs_scroll_handle: ScrollHandle::new(),
@@ -848,6 +603,7 @@ impl ArborWindow {
             preferred_checkout_kind: startup_ui_state.preferred_checkout_kind.unwrap_or_default(),
             github_auth_modal: None,
             delete_modal: None,
+            commit_modal: None,
             outposts,
             outpost_store,
             active_outpost_index: None,
@@ -862,11 +618,19 @@ impl ArborWindow {
             manage_repo_presets_modal: None,
             show_about: false,
             show_theme_picker: false,
+            theme_picker_selected_index: theme_picker_index_for_kind(theme_kind),
             settings_modal: None,
             daemon_auth_modal: None,
             pending_remote_daemon_auth: None,
             start_daemon_modal: false,
             connect_to_host_modal: None,
+            command_palette_modal: None,
+            command_palette_scroll_handle: ScrollHandle::new(),
+            command_palette_recent_actions: Vec::new(),
+            compact_sidebar: startup_ui_state.compact_sidebar.unwrap_or(false),
+            execution_mode: startup_ui_state
+                .execution_mode
+                .unwrap_or(ExecutionMode::Build),
             connection_history: connection_history::load_history(),
             daemon_auth_tokens: connection_history::load_tokens(),
             connected_daemon_label: None,
@@ -879,7 +643,6 @@ impl ArborWindow {
             terminal_launchers: Vec::new(),
             left_pane_visible: startup_ui_state.left_pane_visible.unwrap_or(true),
             collapsed_repositories: HashSet::new(),
-            sidebar_order: startup_ui_state.sidebar_order.clone(),
             repository_context_menu: None,
             worktree_context_menu: None,
             worktree_hover_popover: None,
@@ -896,6 +659,8 @@ impl ArborWindow {
             last_ui_state_error: None,
             notification_service,
             notifications_enabled,
+            last_agent_finished_notifications: HashMap::new(),
+            auto_checkpoint_in_flight: HashSet::new(),
             window_is_active: true,
             notice: (!notice_parts.is_empty()).then_some(notice_parts.join(" | ")),
             theme_toast: None,
@@ -904,6 +669,11 @@ impl ArborWindow {
             right_pane_search: String::new(),
             right_pane_search_cursor: 0,
             right_pane_search_active: false,
+            worktree_notes_lines: vec![String::new()],
+            worktree_notes_cursor: FileViewCursor { line: 0, col: 0 },
+            worktree_notes_path: None,
+            worktree_notes_active: false,
+            worktree_notes_error: None,
             file_tree_entries: Vec::new(),
             expanded_dirs: HashSet::new(),
             selected_file_tree_entry: None,
@@ -921,16 +691,13 @@ impl ArborWindow {
             welcome_clone_url_active: false,
             welcome_cloning: false,
             welcome_clone_error: None,
-            welcome_local_path: String::new(),
-            welcome_local_path_cursor: 0,
-            welcome_local_path_active: false,
-            welcome_local_path_error: None,
             remote_daemon_states: HashMap::new(),
             active_remote_worktree: None,
         };
 
         app.refresh_worktrees(cx);
         app.refresh_repo_config_if_changed(cx);
+        app.refresh_github_auth_identity(cx);
         app.restore_terminal_sessions_from_records(initial_daemon_records, attach_daemon_runtime);
         let _ = app.ensure_selected_worktree_terminal();
         app.sync_daemon_session_store(cx);
@@ -941,7 +708,6 @@ impl ArborWindow {
         app.start_config_auto_refresh(cx);
         app.start_agent_activity_ws(cx);
         app.start_daemon_log_ws(cx);
-        #[cfg(feature = "mdns")]
         app.start_mdns_browser(cx);
         app.ensure_claude_code_hooks(cx);
         app.ensure_pi_agent_extension(cx);
@@ -1029,6 +795,7 @@ impl ArborWindow {
                     }
 
                     this.refresh_worktree_diff_summaries(cx);
+                    this.refresh_worktree_ports(cx);
                     if this.active_outpost_index.is_some() {
                         this.refresh_remote_changed_files(cx);
                     } else if this.reload_changed_files() {
@@ -1080,7 +847,6 @@ impl ArborWindow {
         .detach();
     }
 
-    #[cfg(feature = "mdns")]
     fn start_mdns_browser(&mut self, cx: &mut Context<Self>) {
         match mdns_browser::start_browsing() {
             Ok(browser) => {
@@ -1210,18 +976,14 @@ impl ArborWindow {
             Err(error) => notices.push(error),
         }
 
-        let previous_engine = arbor_terminal_emulator::default_terminal_engine();
         let next_engine = resolve_embedded_terminal_engine(
             loaded.config.embedded_terminal_engine.as_deref(),
             &mut notices,
         );
-        if previous_engine != next_engine {
-            tracing::info!(
-                terminal_engine = next_engine.as_str(),
-                "updated embedded terminal engine",
-            );
-            changed = true;
-        }
+        tracing::info!(
+            terminal_engine = next_engine.as_str(),
+            "reloaded embedded terminal engine",
+        );
 
         if self.configured_embedded_shell != loaded.config.embedded_shell {
             self.configured_embedded_shell = loaded.config.embedded_shell.clone();
@@ -1318,9 +1080,24 @@ impl ArborWindow {
     }
 
     fn refresh_repo_config_if_changed(&mut self, cx: &mut Context<Self>) {
+        let mut changed = false;
         let next_presets = self.load_all_repo_presets();
         if self.repo_presets != next_presets {
             self.repo_presets = next_presets;
+            changed = true;
+        }
+
+        if self.active_preset_tab.is_none()
+            && let Some(preset) = self
+                .active_repo_config()
+                .and_then(|config| config.agent.default_preset)
+                .and_then(|value| AgentPresetKind::from_key(&value))
+        {
+            self.active_preset_tab = Some(preset);
+            changed = true;
+        }
+
+        if changed {
             cx.notify();
         }
     }
@@ -1347,6 +1124,176 @@ impl ArborWindow {
             .unwrap_or_else(|| self.repo_root.clone())
     }
 
+    fn active_repo_config(&self) -> Option<app_config::RepoConfig> {
+        self.app_config_store.load_repo_config(&self.repo_root)
+    }
+
+    fn selected_agent_preset_or_default(&self) -> AgentPresetKind {
+        self.active_preset_tab.unwrap_or_else(|| {
+            self.active_repo_config()
+                .and_then(|config| config.agent.default_preset)
+                .and_then(|value| AgentPresetKind::from_key(&value))
+                .unwrap_or(AgentPresetKind::Codex)
+        })
+    }
+
+    fn branch_prefix_github_login(&self) -> Option<String> {
+        self.github_auth_state
+            .user_login
+            .clone()
+            .or_else(|| env::var("ARBOR_GITHUB_USER").ok())
+            .or_else(|| env::var("GITHUB_USER").ok())
+            .and_then(|value| non_empty_trimmed_str(&value).map(str::to_owned))
+    }
+
+    fn derive_branch_name_for_repo(&self, repo_root: &Path, worktree_name: &str) -> String {
+        if repo_root.as_os_str().is_empty() || !repo_root.exists() {
+            return derive_branch_name(worktree_name);
+        }
+        let repo_root = worktree::repo_root(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+        derive_branch_name_with_repo_config(
+            &repo_root,
+            worktree_name,
+            self.branch_prefix_github_login().as_deref(),
+        )
+    }
+
+    fn repo_auto_checkpoint_enabled(&self, worktree: &WorktreeSummary) -> bool {
+        self.app_config_store
+            .load_repo_config(&worktree.repo_root)
+            .and_then(|config| config.agent.auto_checkpoint)
+            .unwrap_or(false)
+    }
+
+    fn refresh_worktree_ports(&mut self, cx: &mut Context<Self>) {
+        let worktree_paths: Vec<PathBuf> = self
+            .worktrees
+            .iter()
+            .map(|worktree| worktree.path.clone())
+            .collect();
+        if worktree_paths.is_empty() {
+            return;
+        }
+
+        let scan_targets: Vec<PortScanTarget> = self
+            .terminals
+            .iter()
+            .filter(|session| {
+                session.state == TerminalState::Running
+                    && session
+                        .runtime
+                        .as_ref()
+                        .is_some_and(|runtime| runtime.kind() == TerminalRuntimeKind::Local)
+            })
+            .filter_map(|session| {
+                session.root_pid.map(|root_pid| PortScanTarget {
+                    worktree_path: session.worktree_path.clone(),
+                    root_pid,
+                })
+            })
+            .collect();
+        let terminal_output_hints: HashMap<PathBuf, String> = worktree_paths
+            .iter()
+            .map(|worktree_path| {
+                let mut combined = String::new();
+                for session in self
+                    .terminals
+                    .iter()
+                    .filter(|session| session.worktree_path == *worktree_path)
+                {
+                    if !combined.is_empty() {
+                        combined.push('\n');
+                    }
+                    combined.push_str(&terminal_output_tail_for_metadata(session, 48, 8_000));
+                }
+                (worktree_path.clone(), combined)
+            })
+            .collect();
+
+        cx.spawn(async move |this, cx| {
+            let detected = cx
+                .background_spawn(async move {
+                    detect_ports_for_worktrees(
+                        &worktree_paths,
+                        &scan_targets,
+                        &terminal_output_hints,
+                    )
+                })
+                .await;
+
+            let _ = this.update(cx, |this, cx| {
+                let mut changed = false;
+                for worktree in &mut this.worktrees {
+                    let next_ports = detected.get(&worktree.path).cloned().unwrap_or_default();
+                    if worktree.detected_ports != next_ports {
+                        worktree.detected_ports = next_ports;
+                        changed = true;
+                    }
+                }
+
+                if changed {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn maybe_run_auto_checkpoint(&mut self, worktree: &WorktreeSummary) {
+        if !self.repo_auto_checkpoint_enabled(worktree) {
+            return;
+        }
+        if self.active_outpost_index.is_some() {
+            return;
+        }
+        if !self.auto_checkpoint_in_flight.insert(worktree.path.clone()) {
+            return;
+        }
+
+        let changed_files = match changes::changed_files(&worktree.path) {
+            Ok(files) => files,
+            Err(error) => {
+                self.auto_checkpoint_in_flight.remove(&worktree.path);
+                self.notice = Some(format!(
+                    "failed to inspect auto-checkpoint changes: {error}"
+                ));
+                return;
+            },
+        };
+        if changed_files.is_empty() {
+            self.auto_checkpoint_in_flight.remove(&worktree.path);
+            return;
+        }
+
+        let message =
+            auto_checkpoint_commit_message(&changed_files, worktree.agent_task.as_deref());
+        match run_git_commit_for_worktree(&worktree.path, &changed_files, &message) {
+            Ok(summary) => {
+                if let Some(target) = self
+                    .worktrees
+                    .iter_mut()
+                    .find(|candidate| candidate.path == worktree.path)
+                {
+                    target.diff_summary = changes::diff_line_summary(&target.path).ok();
+                    target.branch_divergence = branch_divergence_summary(&target.path);
+                }
+                if self
+                    .selected_local_worktree_path()
+                    .is_some_and(|selected| selected == worktree.path.as_path())
+                {
+                    let _ = self.reload_changed_files();
+                }
+                self.notice = Some(summary);
+            },
+            Err(error) if error == "nothing to commit" => {},
+            Err(error) => {
+                self.notice = Some(format!("auto-checkpoint failed: {error}"));
+            },
+        }
+
+        self.auto_checkpoint_in_flight.remove(&worktree.path);
+    }
+
     fn sync_daemon_session_store(&mut self, cx: &mut Context<Self>) {
         let shell = self.embedded_shell();
         let updated_at_unix_ms = current_unix_timestamp_millis();
@@ -1355,7 +1302,7 @@ impl ArborWindow {
             .terminals
             .iter()
             .map(|session| DaemonSessionRecord {
-                session_id: session.daemon_session_id.clone(),
+                session_id: session.daemon_session_id.clone().into(),
                 workspace_id: session.worktree_path.display().to_string().into(),
                 cwd: session.worktree_path.clone(),
                 shell: if session.command.trim().is_empty() {
@@ -1363,6 +1310,7 @@ impl ArborWindow {
                 } else {
                     session.command.clone()
                 },
+                root_pid: session.root_pid,
                 cols: session.cols.max(2),
                 rows: session.rows.max(1),
                 title: Some(session.title.clone()),
@@ -1432,7 +1380,7 @@ impl ArborWindow {
             if let Some(session) = self
                 .terminals
                 .iter_mut()
-                .find(|session| session.daemon_session_id == record.session_id)
+                .find(|session| session.daemon_session_id == record.session_id.as_str())
             {
                 if session.worktree_path != worktree_path {
                     session.worktree_path = worktree_path.clone();
@@ -1465,6 +1413,10 @@ impl ArborWindow {
                     session.updated_at_unix_ms = record.updated_at_unix_ms;
                     changed = true;
                 }
+                if session.root_pid != record.root_pid {
+                    session.root_pid = record.root_pid;
+                    changed = true;
+                }
                 if session.cols != cols || session.rows != rows {
                     session.cols = cols;
                     session.rows = rows;
@@ -1473,7 +1425,7 @@ impl ArborWindow {
                 if attach_runtime && let Some(daemon) = self.terminal_daemon.as_ref() {
                     session.runtime = Some(local_daemon_runtime(
                         daemon.clone(),
-                        session.daemon_session_id.to_string(),
+                        session.daemon_session_id.clone(),
                         Some(self.terminal_poll_tx.clone()),
                     ));
                     changed = true;
@@ -1483,15 +1435,18 @@ impl ArborWindow {
                 self.next_terminal_id += 1;
                 self.terminals.push(TerminalSession {
                     id: session_id,
-                    daemon_session_id: record.session_id.clone(),
+                    daemon_session_id: record.session_id.to_string(),
                     worktree_path: worktree_path.clone(),
                     title,
                     last_command: record.last_command.clone(),
                     pending_command: String::new(),
                     command,
+                    agent_preset: None,
+                    execution_mode: None,
                     state: session_state,
                     exit_code: record.exit_code,
                     updated_at_unix_ms: record.updated_at_unix_ms,
+                    root_pid: record.root_pid,
                     cols,
                     rows,
                     generation: 0,
@@ -1518,7 +1473,7 @@ impl ArborWindow {
             let mapped_terminal_id = self
                 .terminals
                 .iter()
-                .find(|session| session.daemon_session_id == record.session_id)
+                .find(|session| session.daemon_session_id == record.session_id.as_str())
                 .map(|session| session.id);
             if let Some(mapped_terminal_id) = mapped_terminal_id {
                 self.active_terminal_by_worktree
@@ -1535,7 +1490,7 @@ impl ArborWindow {
             return Some(path);
         }
 
-        let workspace_path = PathBuf::from(record.workspace_id.as_str());
+        let workspace_path = PathBuf::from(record.workspace_id.to_string());
         self.match_worktree_path(workspace_path.as_path())
     }
 
@@ -1552,8 +1507,53 @@ impl ArborWindow {
         }
     }
 
+    fn repo_allows_desktop_notification(
+        &self,
+        worktree: &WorktreeSummary,
+        event_name: &str,
+    ) -> bool {
+        let Some(config) = self.app_config_store.load_repo_config(&worktree.repo_root) else {
+            return true;
+        };
+
+        let notifications = config.notifications;
+        if notifications.desktop == Some(false) {
+            return false;
+        }
+
+        notifications.events.is_empty()
+            || notifications.events.iter().any(|event| event == event_name)
+    }
+
+    fn maybe_notify_agent_finished(&mut self, worktree: &WorktreeSummary, updated_at: Option<u64>) {
+        if !self.repo_allows_desktop_notification(worktree, "agent_finished") {
+            return;
+        }
+
+        if !should_emit_agent_finished_notification(
+            &mut self.last_agent_finished_notifications,
+            &worktree.path,
+            updated_at.or(worktree.last_activity_unix_ms),
+        ) {
+            return;
+        }
+
+        let repo_name = repository_display_name(&worktree.repo_root);
+        let branch = worktree::short_branch(&worktree.branch);
+        let body = if let Some(task) = worktree.agent_task.as_deref() {
+            format!(
+                "{} · {} · {} is waiting: {task}",
+                repo_name, worktree.label, branch
+            )
+        } else {
+            format!("{} · {} · {} is waiting", repo_name, worktree.label, branch)
+        };
+        self.maybe_notify("Agent finished", &body, true);
+    }
+
     fn sync_running_terminals(&mut self, cx: &mut Context<Self>) {
         let mut changed = false;
+        let mut should_refresh_ports = false;
         let follow_output = terminal_scroll_is_near_bottom(&self.terminal_scroll_handle);
         let active_terminal_id = self.active_terminal_id_for_selected_worktree();
         let target_grid_size =
@@ -1587,6 +1587,13 @@ impl ArborWindow {
             self.terminals[index].last_runtime_sync_at = Some(now);
 
             changed |= outcome.changed;
+            if outcome.changed {
+                let recent_output =
+                    terminal_output_tail_for_metadata(&self.terminals[index], 24, 4_000);
+                if output_contains_port_hint(&recent_output) {
+                    should_refresh_ports = true;
+                }
+            }
 
             if outcome.clear_global_daemon {
                 self.terminal_daemon = None;
@@ -1616,6 +1623,9 @@ impl ArborWindow {
 
         if changed {
             self.sync_daemon_session_store(cx);
+            if should_refresh_ports {
+                self.refresh_worktree_ports(cx);
+            }
             if should_auto_follow_terminal_output(changed, follow_output) {
                 self.terminal_scroll_handle.scroll_to_bottom();
             }
@@ -1683,6 +1693,34 @@ impl ArborWindow {
                     .map(|task| (worktree.path.clone(), task.clone()))
             })
             .collect();
+        let previous_recent_turns: HashMap<PathBuf, Vec<AgentTurnSnapshot>> = self
+            .worktrees
+            .iter()
+            .map(|worktree| (worktree.path.clone(), worktree.recent_turns.clone()))
+            .collect();
+        let previous_detected_ports: HashMap<PathBuf, Vec<DetectedPort>> = self
+            .worktrees
+            .iter()
+            .map(|worktree| (worktree.path.clone(), worktree.detected_ports.clone()))
+            .collect();
+        let previous_recent_agent_sessions: HashMap<
+            PathBuf,
+            Vec<arbor_core::session::AgentSessionSummary>,
+        > = self
+            .worktrees
+            .iter()
+            .map(|worktree| {
+                (
+                    worktree.path.clone(),
+                    worktree.recent_agent_sessions.clone(),
+                )
+            })
+            .collect();
+        let previous_stuck_turn_counts: HashMap<PathBuf, usize> = self
+            .worktrees
+            .iter()
+            .map(|worktree| (worktree.path.clone(), worktree.stuck_turn_count))
+            .collect();
         let previous_activity: HashMap<PathBuf, u64> = self
             .worktrees
             .iter()
@@ -1737,6 +1775,22 @@ impl ArborWindow {
             worktree.pr_details = previous_pr_details.get(&worktree.path).cloned();
             worktree.agent_state = previous_agent_states.get(&worktree.path).copied();
             worktree.agent_task = previous_agent_tasks.get(&worktree.path).cloned();
+            worktree.detected_ports = previous_detected_ports
+                .get(&worktree.path)
+                .cloned()
+                .unwrap_or_default();
+            worktree.recent_turns = previous_recent_turns
+                .get(&worktree.path)
+                .cloned()
+                .unwrap_or_default();
+            worktree.recent_agent_sessions = previous_recent_agent_sessions
+                .get(&worktree.path)
+                .cloned()
+                .unwrap_or_default();
+            worktree.stuck_turn_count = previous_stuck_turn_counts
+                .get(&worktree.path)
+                .copied()
+                .unwrap_or_default();
             // Take the max of fresh git-based timestamp and previous value
             // (which may include agent activity).
             let prev = previous_activity.get(&worktree.path).copied();
@@ -1809,11 +1863,13 @@ impl ArborWindow {
             ));
         }
 
-        self.sync_github_token_shared();
         self.refresh_worktree_diff_summaries(cx);
+        self.refresh_worktree_ports(cx);
         self.refresh_agent_tasks(cx);
+        self.refresh_agent_sessions(cx);
         self.refresh_worktree_pull_requests(cx);
         let changed_files_changed = self.reload_changed_files();
+        self.sync_selected_worktree_notes();
         let created_terminal = self.ensure_selected_worktree_terminal();
         if created_terminal {
             self.sync_daemon_session_store(cx);
@@ -1903,6 +1959,51 @@ impl ArborWindow {
                         && let Some(wt) = this.worktrees.iter_mut().find(|wt| wt.path == path)
                     {
                         wt.agent_task = Some(task);
+                        changed = true;
+                    }
+                }
+                if changed {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn refresh_agent_sessions(&mut self, cx: &mut Context<Self>) {
+        let worktree_paths: Vec<PathBuf> = self
+            .worktrees
+            .iter()
+            .filter(|worktree| worktree.recent_agent_sessions.is_empty())
+            .map(|worktree| worktree.path.clone())
+            .collect();
+        if worktree_paths.is_empty() {
+            return;
+        }
+
+        cx.spawn(async move |this, cx| {
+            let results = cx
+                .background_spawn(async move {
+                    worktree_paths
+                        .into_iter()
+                        .map(|path| {
+                            let sessions = arbor_core::session::recent_agent_sessions(&path, 6);
+                            (path, sessions)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+
+            let _ = this.update(cx, |this, cx| {
+                let mut changed = false;
+                for (path, sessions) in results {
+                    if let Some(worktree) = this
+                        .worktrees
+                        .iter_mut()
+                        .find(|worktree| worktree.path == path)
+                        && worktree.recent_agent_sessions != sessions
+                    {
+                        worktree.recent_agent_sessions = sessions;
                         changed = true;
                     }
                 }
@@ -2168,12 +2269,9 @@ impl ArborWindow {
                     tracked_branches
                         .into_iter()
                         .map(|(path, branch, repo_slug)| {
+                            // Try gh CLI first for rich details
                             let details = repo_slug.as_ref().and_then(|slug| {
-                                github_service::pull_request_details(
-                                    slug,
-                                    &branch,
-                                    github_token.as_deref(),
-                                )
+                                github_service::pull_request_details(slug, &branch)
                             });
 
                             let (pr_number, pr_url) = if let Some(ref d) = details {
@@ -2236,2892 +2334,10 @@ impl ArborWindow {
 
                 if changed {
                     cx.notify();
-                    // Auto-fetch review comments for the active worktree after PR refresh
-                    this.refresh_review_threads_for_worktree(cx);
                 }
             });
         })
         .detach();
-    }
-
-    fn refresh_review_threads_for_worktree(&mut self, cx: &mut Context<Self>) {
-        if self.review_threads_loading {
-            return;
-        }
-
-        let worktree = match self.active_worktree() {
-            Some(w) => w,
-            None => return,
-        };
-
-        let pr_number = match worktree.pr_number {
-            Some(n) => n,
-            None => return,
-        };
-
-        let repo_slug = match self.github_repo_slug.clone() {
-            Some(s) => s,
-            None => return,
-        };
-
-        let worktree_path = worktree.path.clone();
-        let pr_url = worktree
-            .pr_url
-            .clone()
-            .unwrap_or_else(|| format!("https://github.com/{repo_slug}/pull/{pr_number}"));
-        let review_service = self.review_service.clone();
-
-        self.review_threads_loading = true;
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_spawn(async move {
-                    review_service.fetch_review_threads(&repo_slug, pr_number)
-                })
-                .await;
-
-            let _ = this.update(cx, |this, cx| {
-                this.review_threads_loading = false;
-
-                match result {
-                    Ok(threads) => {
-                        // Write markdown export
-                        write_pr_comments_markdown(&worktree_path, &threads, pr_number, &pr_url);
-
-                        this.review_threads.insert(worktree_path.clone(), threads);
-
-                        // Re-inject comments into any open diff session for this worktree
-                        this.rebuild_diff_sessions_for_worktree(&worktree_path, cx);
-                    },
-                    Err(error) => {
-                        tracing::warn!(
-                            "failed to fetch review threads for PR #{pr_number}: {error}"
-                        );
-                    },
-                }
-
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    fn rebuild_diff_sessions_for_worktree(&mut self, worktree_path: &Path, cx: &mut Context<Self>) {
-        let sessions_to_rebuild: Vec<u64> = self
-            .diff_sessions
-            .iter()
-            .filter(|s| s.worktree_path == worktree_path && !s.is_loading)
-            .map(|s| s.id)
-            .collect();
-
-        for session_id in sessions_to_rebuild {
-            let Some(session) = self.diff_sessions.iter_mut().find(|s| s.id == session_id) else {
-                continue;
-            };
-
-            // Re-build from raw_lines with comment injection
-            let mut lines: Vec<DiffLine> = session.raw_lines.to_vec();
-            let mut file_row_indices = session.raw_file_row_indices.clone();
-
-            // Strip any existing comment rows from raw_lines (they shouldn't be there,
-            // but be defensive)
-            lines.retain(|l| l.kind != DiffLineKind::Comment);
-
-            if let Some(threads) = self.review_threads.get(worktree_path) {
-                inject_review_comments(&mut lines, &mut file_row_indices, threads);
-            }
-
-            let cell_width = diff_cell_width_px(cx);
-            let wrap_columns = self
-                .live_diff_list_width_px()
-                .map(|list_width| {
-                    self.estimated_diff_wrap_columns_for_list_width(list_width, cell_width)
-                })
-                .unwrap_or_else(|| self.estimated_diff_wrap_columns(cell_width));
-
-            let raw_lines = Arc::<[DiffLine]>::from(lines);
-            let (wrapped_lines, wrapped_indices) =
-                wrap_diff_document_lines(raw_lines.as_ref(), &file_row_indices, wrap_columns);
-
-            // Re-borrow the session mutably after self methods
-            let Some(session) = self.diff_sessions.iter_mut().find(|s| s.id == session_id) else {
-                continue;
-            };
-            session.raw_lines = raw_lines;
-            session.raw_file_row_indices = file_row_indices;
-            session.lines = Arc::<[DiffLine]>::from(wrapped_lines);
-            session.file_row_indices = wrapped_indices;
-            session.wrapped_columns = wrap_columns;
-        }
-    }
-
-    fn start_inline_comment(
-        &mut self,
-        session_id: u64,
-        row_index: usize,
-        side: usize,
-        cx: &mut Context<Self>,
-    ) {
-        let session = match self.diff_sessions.iter().find(|s| s.id == session_id) {
-            Some(s) => s,
-            None => return,
-        };
-
-        let line = match session.lines.get(row_index) {
-            Some(l) => l,
-            None => return,
-        };
-
-        let line_number = if side == 1 {
-            line.right_line_number
-        } else {
-            line.left_line_number
-        };
-
-        let Some(line_number) = line_number else {
-            return;
-        };
-
-        let file_path = match file_path_for_diff_row(&session.file_row_indices, row_index) {
-            Some(p) => p,
-            None => return,
-        };
-
-        let diff_side = if side == 1 {
-            github_service::DiffSide::Right
-        } else {
-            github_service::DiffSide::Left
-        };
-
-        self.pending_comment = Some(PendingComment {
-            session_id,
-            file_path,
-            line: line_number,
-            side: diff_side,
-            text: String::new(),
-            text_cursor: 0,
-            submitting: false,
-        });
-        cx.notify();
-    }
-
-    fn submit_inline_comment(&mut self, cx: &mut Context<Self>) {
-        // Check preconditions and extract values before mutating
-        let pc = match self.pending_comment.as_ref() {
-            Some(pc) if !pc.text.trim().is_empty() && !pc.submitting => pc,
-            _ => return,
-        };
-        let file_path = pc.file_path.display().to_string();
-        let line = pc.line;
-        let side = pc.side;
-        let body = pc.text.clone();
-
-        let worktree = match self.active_worktree() {
-            Some(w) => w,
-            None => return,
-        };
-        let pr_number = match worktree.pr_number {
-            Some(n) => n,
-            None => return,
-        };
-        let repo_slug = match self.github_repo_slug.clone() {
-            Some(s) => s,
-            None => return,
-        };
-        let worktree_path = worktree.path.clone();
-
-        let commit_sha = match head_commit_sha(&worktree_path) {
-            Ok(sha) => sha,
-            Err(error) => {
-                self.notice = Some(format!("failed to get HEAD SHA: {error}"));
-                cx.notify();
-                return;
-            },
-        };
-
-        // Now mark as submitting
-        if let Some(pc) = self.pending_comment.as_mut() {
-            pc.submitting = true;
-        }
-        let review_service = self.review_service.clone();
-
-        cx.spawn(async move |this, cx| {
-            // Keep copies for optimistic injection after the API call
-            let inject_file_path = file_path.clone();
-            let inject_worktree_path = worktree_path.clone();
-            let inject_line = line;
-            let inject_side = side;
-
-            let result = cx
-                .background_spawn(async move {
-                    review_service.post_review_comment(
-                        &repo_slug,
-                        pr_number,
-                        &file_path,
-                        line,
-                        side,
-                        &body,
-                        &commit_sha,
-                    )
-                })
-                .await;
-
-            let _ = this.update(cx, |this, cx| {
-                match result {
-                    Ok(posted_comment) => {
-                        this.pending_comment = None;
-
-                        // Optimistically inject the new comment into local
-                        // review threads so it appears immediately without
-                        // waiting for a GraphQL round-trip.
-                        let thread = github_service::ReviewThread {
-                            id: format!("local-{}", posted_comment.id),
-                            path: inject_file_path,
-                            line: Some(inject_line),
-                            start_line: None,
-                            side: inject_side,
-                            is_resolved: false,
-                            is_outdated: false,
-                            comments: vec![posted_comment],
-                        };
-                        this.review_threads
-                            .entry(inject_worktree_path.clone())
-                            .or_default()
-                            .push(thread);
-                        this.rebuild_diff_sessions_for_worktree(&inject_worktree_path, cx);
-
-                        // Also refresh from the server to reconcile
-                        this.refresh_review_threads_for_worktree(cx);
-                    },
-                    Err(error) => {
-                        this.notice = Some(format!("failed to post comment: {error}"));
-                        if let Some(pc) = this.pending_comment.as_mut() {
-                            pc.submitting = false;
-                        }
-                    },
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-        cx.notify();
-    }
-
-    fn cancel_inline_comment(&mut self, cx: &mut Context<Self>) {
-        self.pending_comment = None;
-        cx.notify();
-    }
-
-    fn refresh_pr_changed_files(&mut self, cx: &mut Context<Self>) {
-        if self.pr_changed_files_loading {
-            return;
-        }
-
-        let worktree = match self.active_worktree() {
-            Some(w) => w,
-            None => return,
-        };
-
-        let pr_number = match worktree
-            .pr_details
-            .as_ref()
-            .map(|d| d.number)
-            .or(worktree.pr_number)
-        {
-            Some(n) => n,
-            None => return,
-        };
-
-        let base_ref_name = worktree
-            .pr_details
-            .as_ref()
-            .map(|d| d.base_ref_name.clone())
-            .unwrap_or_else(|| "main".to_owned());
-
-        let repo_slug = match self.github_repo_slug.clone() {
-            Some(s) => s,
-            None => return,
-        };
-
-        let worktree_path = worktree.path.clone();
-        let token = self.github_access_token();
-
-        self.pr_changed_files_loading = true;
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_spawn(async move {
-                    let files = fetch_pr_changed_files(&repo_slug, pr_number, token.as_deref())?;
-                    let merge_base = compute_merge_base(&worktree_path, &base_ref_name)?;
-                    Ok::<_, String>((files, merge_base))
-                })
-                .await;
-
-            let _ = this.update(cx, |this, cx| {
-                this.pr_changed_files_loading = false;
-
-                match result {
-                    Ok((files, merge_base)) => {
-                        this.pr_changed_files = files;
-                        this.pr_merge_base = Some(merge_base);
-                    },
-                    Err(error) => {
-                        tracing::warn!("failed to fetch PR changed files: {error}");
-                        this.pr_changed_files.clear();
-                        this.pr_merge_base = None;
-                    },
-                }
-
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    fn open_pr_diff_tab_for_selected_file(&mut self, cx: &mut Context<Self>) {
-        let Some(worktree_path) = self.selected_worktree_path().map(Path::to_path_buf) else {
-            self.notice = Some("select a worktree before opening a PR diff".to_owned());
-            return;
-        };
-        let Some(merge_base) = self.pr_merge_base.clone() else {
-            self.notice = Some("PR merge-base not available yet".to_owned());
-            return;
-        };
-        let Some(selected_file_path) = self
-            .selected_changed_file
-            .clone()
-            .or_else(|| self.pr_changed_files.first().map(|f| f.path.clone()))
-        else {
-            self.notice = Some("select a PR changed file before opening a diff".to_owned());
-            return;
-        };
-
-        let pr_files = self.pr_changed_files.clone();
-        let (session_id, should_rebuild) = match self
-            .diff_sessions
-            .iter_mut()
-            .find(|session| session.worktree_path == worktree_path)
-        {
-            Some(existing) => {
-                self.active_diff_session_id = Some(existing.id);
-                (
-                    existing.id,
-                    !existing.is_loading
-                        && (existing.lines.is_empty()
-                            || !existing.file_row_indices.contains_key(&selected_file_path)),
-                )
-            },
-            None => {
-                let session_id = self.next_diff_session_id;
-                self.next_diff_session_id = self.next_diff_session_id.saturating_add(1);
-                self.diff_sessions.push(DiffSession {
-                    id: session_id,
-                    worktree_path: worktree_path.clone(),
-                    title: "PR Diff".to_owned(),
-                    raw_lines: Arc::<[DiffLine]>::from(Vec::<DiffLine>::new()),
-                    raw_file_row_indices: HashMap::new(),
-                    lines: Arc::<[DiffLine]>::from(Vec::<DiffLine>::new()),
-                    file_row_indices: HashMap::new(),
-                    wrapped_columns: 0,
-                    is_loading: true,
-                });
-                self.active_diff_session_id = Some(session_id);
-                (session_id, true)
-            },
-        };
-
-        self.pending_diff_scroll_to_file = Some(selected_file_path.clone());
-        if !should_rebuild {
-            let _ = self.scroll_diff_to_file(selected_file_path.as_path());
-            cx.notify();
-            return;
-        }
-
-        if let Some(session) = self
-            .diff_sessions
-            .iter_mut()
-            .find(|session| session.id == session_id)
-        {
-            session.is_loading = true;
-            session.title = "PR Diff".to_owned();
-            session.raw_lines = Arc::<[DiffLine]>::from(Vec::<DiffLine>::new());
-            session.raw_file_row_indices.clear();
-            session.lines = Arc::<[DiffLine]>::from(Vec::<DiffLine>::new());
-            session.file_row_indices.clear();
-            session.wrapped_columns = 0;
-        }
-        cx.notify();
-
-        cx.spawn(async move |this, cx| {
-            let diff_document = cx
-                .background_spawn(async move {
-                    build_pr_diff_document(&worktree_path, &pr_files, &merge_base)
-                })
-                .await;
-
-            let _ = this.update(cx, |this, cx| {
-                let cell_width = diff_cell_width_px(cx);
-                let wrap_columns = this
-                    .live_diff_list_width_px()
-                    .map(|list_width| {
-                        this.estimated_diff_wrap_columns_for_list_width(list_width, cell_width)
-                    })
-                    .unwrap_or_else(|| this.estimated_diff_wrap_columns(cell_width));
-                let Some(session) = this
-                    .diff_sessions
-                    .iter_mut()
-                    .find(|session| session.id == session_id)
-                else {
-                    return;
-                };
-
-                match diff_document {
-                    Ok((mut lines, mut file_row_indices)) => {
-                        let worktree_path_key = session.worktree_path.clone();
-                        if let Some(threads) = this.review_threads.get(&worktree_path_key) {
-                            inject_review_comments(&mut lines, &mut file_row_indices, threads);
-                        }
-
-                        let raw_lines = Arc::<[DiffLine]>::from(lines);
-                        let raw_file_row_indices = file_row_indices;
-                        let (wrapped_lines, wrapped_indices) = wrap_diff_document_lines(
-                            raw_lines.as_ref(),
-                            &raw_file_row_indices,
-                            wrap_columns,
-                        );
-                        session.raw_lines = raw_lines;
-                        session.raw_file_row_indices = raw_file_row_indices;
-                        session.lines = Arc::<[DiffLine]>::from(wrapped_lines);
-                        session.file_row_indices = wrapped_indices;
-                        session.wrapped_columns = wrap_columns;
-                        session.is_loading = false;
-
-                        if let Some(target_path) = this.pending_diff_scroll_to_file.clone()
-                            && this.scroll_diff_to_file(target_path.as_path())
-                        {
-                            this.pending_diff_scroll_to_file = None;
-                        }
-                    },
-                    Err(error) => {
-                        let fallback_lines = Arc::<[DiffLine]>::from(vec![DiffLine {
-                            left_line_number: None,
-                            right_line_number: None,
-                            left_text: format!("failed to build PR diff: {error}"),
-                            right_text: String::new(),
-                            kind: DiffLineKind::FileHeader,
-                            comment_meta: None,
-                        }]);
-                        let fallback_indices = HashMap::new();
-                        let (wrapped_lines, wrapped_indices) = wrap_diff_document_lines(
-                            fallback_lines.as_ref(),
-                            &fallback_indices,
-                            wrap_columns,
-                        );
-                        session.raw_lines = fallback_lines;
-                        session.raw_file_row_indices = fallback_indices;
-                        session.lines = Arc::<[DiffLine]>::from(wrapped_lines);
-                        session.file_row_indices = wrapped_indices;
-                        session.wrapped_columns = wrap_columns;
-                        session.is_loading = false;
-                    },
-                }
-
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    fn selected_worktree_path(&self) -> Option<&Path> {
-        if let Some(ref arw) = self.active_remote_worktree {
-            return Some(arw.worktree_path.as_path());
-        }
-        if let Some(outpost_index) = self.active_outpost_index {
-            return self
-                .outposts
-                .get(outpost_index)
-                .map(|outpost| outpost.repo_root.as_path());
-        }
-        self.active_worktree_index
-            .and_then(|index| self.worktrees.get(index))
-            .map(|worktree| worktree.path.as_path())
-    }
-
-    fn selected_local_worktree_path(&self) -> Option<&Path> {
-        self.active_worktree()
-            .map(|worktree| worktree.path.as_path())
-    }
-
-    fn can_run_local_git_actions(&self) -> bool {
-        self.active_outpost_index.is_none() && self.selected_worktree_path().is_some()
-    }
-
-    fn active_worktree(&self) -> Option<&WorktreeSummary> {
-        self.active_worktree_index
-            .and_then(|index| self.worktrees.get(index))
-    }
-
-    fn active_terminal_id_for_worktree(&self, worktree_path: &Path) -> Option<u64> {
-        self.active_terminal_by_worktree
-            .get(worktree_path)
-            .copied()
-            .filter(|session_id| {
-                self.terminals.iter().any(|session| {
-                    session.id == *session_id && session.worktree_path.as_path() == worktree_path
-                })
-            })
-            .or_else(|| {
-                self.terminals
-                    .iter()
-                    .find(|session| session.worktree_path.as_path() == worktree_path)
-                    .map(|session| session.id)
-            })
-    }
-
-    fn active_terminal_id_for_selected_worktree(&self) -> Option<u64> {
-        let worktree_path = self.selected_worktree_path()?;
-        let is_outpost = self.active_outpost_index.is_some();
-
-        self.active_terminal_by_worktree
-            .get(worktree_path)
-            .copied()
-            .filter(|session_id| {
-                self.terminals.iter().any(|session| {
-                    session.id == *session_id
-                        && session.worktree_path.as_path() == worktree_path
-                        && is_outpost
-                            == session
-                                .runtime
-                                .as_ref()
-                                .is_some_and(|rt| rt.kind() == TerminalRuntimeKind::Outpost)
-                })
-            })
-            .or_else(|| {
-                self.terminals
-                    .iter()
-                    .find(|session| {
-                        session.worktree_path.as_path() == worktree_path
-                            && is_outpost
-                                == session
-                                    .runtime
-                                    .as_ref()
-                                    .is_some_and(|rt| rt.kind() == TerminalRuntimeKind::Outpost)
-                    })
-                    .map(|session| session.id)
-            })
-    }
-
-    fn selected_worktree_terminals(&self) -> Vec<&TerminalSession> {
-        let Some(worktree_path) = self.selected_worktree_path() else {
-            return Vec::new();
-        };
-
-        let is_outpost = self.active_outpost_index.is_some();
-
-        self.terminals
-            .iter()
-            .filter(|session| {
-                session.worktree_path.as_path() == worktree_path
-                    && is_outpost
-                        == session
-                            .runtime
-                            .as_ref()
-                            .is_some_and(|rt| rt.kind() == TerminalRuntimeKind::Outpost)
-            })
-            .collect()
-    }
-
-    fn selected_worktree_diff_sessions(&self) -> Vec<&DiffSession> {
-        let Some(worktree_path) = self.selected_worktree_path() else {
-            return Vec::new();
-        };
-
-        self.diff_sessions
-            .iter()
-            .filter(|session| session.worktree_path.as_path() == worktree_path)
-            .collect()
-    }
-
-    fn active_center_tab_for_selected_worktree(&self) -> Option<CenterTab> {
-        if self.logs_tab_active {
-            return Some(CenterTab::Logs);
-        }
-
-        if let Some(diff_id) = self.active_diff_session_id {
-            let worktree_path = self.selected_worktree_path()?;
-            if self.diff_sessions.iter().any(|session| {
-                session.id == diff_id && session.worktree_path.as_path() == worktree_path
-            }) {
-                return Some(CenterTab::Diff(diff_id));
-            }
-        }
-
-        if let Some(fv_id) = self.active_file_view_session_id {
-            let worktree_path = self.selected_worktree_path()?;
-            if self
-                .file_view_sessions
-                .iter()
-                .any(|s| s.id == fv_id && s.worktree_path.as_path() == worktree_path)
-            {
-                return Some(CenterTab::FileView(fv_id));
-            }
-        }
-
-        self.active_terminal_id_for_selected_worktree()
-            .map(CenterTab::Terminal)
-    }
-
-    fn ensure_selected_worktree_terminal(&mut self) -> bool {
-        // Don't auto-spawn local terminals when an outpost is selected;
-        // outpost terminals are created explicitly via spawn_outpost_terminal.
-        if self.active_outpost_index.is_some() {
-            return false;
-        }
-
-        let Some(worktree_path) = self.selected_worktree_path().map(Path::to_path_buf) else {
-            return false;
-        };
-
-        let has_terminal = self
-            .terminals
-            .iter()
-            .any(|session| session.worktree_path == worktree_path);
-        if !has_terminal {
-            return self.spawn_terminal_session_inner(false);
-        }
-
-        if let Some(session_id) = self.active_terminal_id_for_worktree(&worktree_path) {
-            self.active_terminal_by_worktree
-                .insert(worktree_path, session_id);
-        }
-
-        true
-    }
-
-    fn close_terminal_session_by_id(&mut self, session_id: u64) -> bool {
-        tracing::info!(session_id, "closing terminal session");
-        let Some(index) = self
-            .terminals
-            .iter()
-            .position(|session| session.id == session_id)
-        else {
-            return false;
-        };
-
-        if let Some(session) = self.terminals.get(index)
-            && let Some(runtime) = session.runtime.as_ref()
-            && let Err(error) = runtime.close(session)
-        {
-            self.notice = Some(format!("failed to close terminal session: {error}"));
-        }
-
-        let closed = self.terminals.remove(index);
-        if self
-            .active_terminal_by_worktree
-            .get(&closed.worktree_path)
-            .copied()
-            == Some(closed.id)
-        {
-            let replacement = self
-                .terminals
-                .iter()
-                .rev()
-                .find(|session| session.worktree_path == closed.worktree_path)
-                .map(|session| session.id);
-            if let Some(replacement_id) = replacement {
-                self.active_terminal_by_worktree
-                    .insert(closed.worktree_path, replacement_id);
-            } else {
-                self.active_terminal_by_worktree
-                    .remove(&closed.worktree_path);
-            }
-        }
-
-        if self
-            .terminal_selection
-            .as_ref()
-            .is_some_and(|selection| selection.session_id == session_id)
-        {
-            self.terminal_selection = None;
-            self.terminal_selection_drag_anchor = None;
-        }
-
-        true
-    }
-
-    fn close_diff_session_by_id(&mut self, session_id: u64) -> bool {
-        let Some(index) = self
-            .diff_sessions
-            .iter()
-            .position(|session| session.id == session_id)
-        else {
-            return false;
-        };
-
-        self.diff_sessions.remove(index);
-        if self.active_diff_session_id == Some(session_id) {
-            self.active_diff_session_id = None;
-        }
-        true
-    }
-
-    fn selected_worktree_file_view_sessions(&self) -> Vec<&FileViewSession> {
-        let Some(worktree_path) = self.selected_worktree_path() else {
-            return Vec::new();
-        };
-
-        self.file_view_sessions
-            .iter()
-            .filter(|session| session.worktree_path.as_path() == worktree_path)
-            .collect()
-    }
-
-    fn open_file_view_tab(&mut self, file_path: PathBuf, cx: &mut Context<Self>) {
-        let Some(worktree_path) = self.selected_worktree_path().map(Path::to_path_buf) else {
-            return;
-        };
-
-        // If a session already exists for this file+worktree, just activate it.
-        if let Some(existing) = self
-            .file_view_sessions
-            .iter()
-            .find(|s| s.worktree_path == worktree_path && s.file_path == file_path)
-        {
-            self.active_file_view_session_id = Some(existing.id);
-            self.active_diff_session_id = None;
-            self.logs_tab_active = false;
-            cx.notify();
-            return;
-        }
-
-        let session_id = self.next_file_view_session_id;
-        self.next_file_view_session_id += 1;
-
-        let title = file_path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| file_path.to_string_lossy().into_owned());
-
-        let full_path = worktree_path.join(&file_path);
-        let ext = file_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_lowercase();
-
-        let is_image = matches!(
-            ext.as_str(),
-            "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "ico" | "svg" | "tiff" | "tif"
-        );
-
-        if is_image {
-            self.file_view_sessions.push(FileViewSession {
-                id: session_id,
-                worktree_path: worktree_path.clone(),
-                file_path: file_path.clone(),
-                title,
-                content: FileViewContent::Image(full_path),
-                is_loading: false,
-                cursor: FileViewCursor { line: 0, col: 0 },
-            });
-            self.active_file_view_session_id = Some(session_id);
-            self.active_diff_session_id = None;
-            self.logs_tab_active = false;
-            cx.notify();
-            return;
-        }
-
-        self.file_view_sessions.push(FileViewSession {
-            id: session_id,
-            worktree_path: worktree_path.clone(),
-            file_path: file_path.clone(),
-            title,
-            content: FileViewContent::Text {
-                highlighted: Arc::from([]),
-                raw_lines: Vec::new(),
-                dirty: false,
-            },
-            is_loading: true,
-            cursor: FileViewCursor { line: 0, col: 0 },
-        });
-        self.active_file_view_session_id = Some(session_id);
-        self.active_diff_session_id = None;
-        self.logs_tab_active = false;
-
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_spawn(async move {
-                    let default_color: u32 = 0xc8ccd4;
-                    match fs::read_to_string(&full_path) {
-                        Ok(content) => {
-                            let raw: Vec<String> = content.lines().map(String::from).collect();
-                            let highlighted =
-                                highlight_lines_with_syntect(&raw, &ext, default_color);
-                            (raw, highlighted)
-                        },
-                        Err(error) => {
-                            let msg = format!("Error reading file: {error}");
-                            (vec![msg.clone()], vec![vec![FileViewSpan {
-                                text: msg,
-                                color: default_color,
-                            }]])
-                        },
-                    }
-                })
-                .await;
-
-            let _ = this.update(cx, |this, cx| {
-                if let Some(session) = this
-                    .file_view_sessions
-                    .iter_mut()
-                    .find(|s| s.id == session_id)
-                {
-                    session.content = FileViewContent::Text {
-                        highlighted: Arc::from(result.1),
-                        raw_lines: result.0,
-                        dirty: false,
-                    };
-                    session.is_loading = false;
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
-
-        cx.notify();
-    }
-
-    fn select_file_view_tab(&mut self, session_id: u64, cx: &mut Context<Self>) {
-        if self.active_file_view_session_id == Some(session_id) && !self.logs_tab_active {
-            return;
-        }
-        self.active_file_view_session_id = Some(session_id);
-        self.active_diff_session_id = None;
-        self.logs_tab_active = false;
-        cx.notify();
-    }
-
-    fn close_file_view_session_by_id(&mut self, session_id: u64) -> bool {
-        let Some(index) = self
-            .file_view_sessions
-            .iter()
-            .position(|session| session.id == session_id)
-        else {
-            return false;
-        };
-
-        self.file_view_sessions.remove(index);
-        if self.active_file_view_session_id == Some(session_id) {
-            self.active_file_view_session_id = None;
-            self.file_view_editing = false;
-        }
-        true
-    }
-
-    fn close_active_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.active_center_tab_for_selected_worktree() {
-            Some(CenterTab::Terminal(session_id)) => {
-                if self.close_terminal_session_by_id(session_id) {
-                    self.sync_daemon_session_store(cx);
-                    self.terminal_scroll_handle.scroll_to_bottom();
-                    window.focus(&self.terminal_focus);
-                    self.focus_terminal_on_next_render = false;
-                    cx.notify();
-                }
-            },
-            Some(CenterTab::Diff(diff_session_id)) => {
-                if self.close_diff_session_by_id(diff_session_id) {
-                    cx.notify();
-                }
-            },
-            Some(CenterTab::FileView(session_id)) => {
-                if self.close_file_view_session_by_id(session_id) {
-                    cx.notify();
-                }
-            },
-            Some(CenterTab::Logs) => {
-                self.logs_tab_open = false;
-                self.logs_tab_active = false;
-                cx.notify();
-            },
-            None => {},
-        }
-    }
-
-    fn theme(&self) -> ThemePalette {
-        self.theme_kind.palette()
-    }
-
-    fn embedded_shell(&self) -> String {
-        if let Some(shell) = &self.configured_embedded_shell {
-            return shell.clone();
-        }
-        match env::var("SHELL") {
-            Ok(value) if !value.trim().is_empty() => value,
-            _ => "/bin/zsh".to_owned(),
-        }
-    }
-
-    fn selected_repository(&self) -> Option<&RepositorySummary> {
-        self.active_repository_index
-            .and_then(|index| self.repositories.get(index))
-    }
-
-    fn set_repositories_preserving_state(&mut self, repositories: Vec<RepositorySummary>) {
-        let active_group_key = self
-            .active_repository_index
-            .and_then(|index| self.repositories.get(index))
-            .map(|repository| repository.group_key.clone());
-        let collapsed_group_keys: HashSet<String> = self
-            .collapsed_repositories
-            .iter()
-            .filter_map(|index| self.repositories.get(*index))
-            .map(|repository| repository.group_key.clone())
-            .collect();
-
-        self.repositories = repositories;
-        self.collapsed_repositories = self
-            .repositories
-            .iter()
-            .enumerate()
-            .filter_map(|(index, repository)| {
-                collapsed_group_keys
-                    .contains(&repository.group_key)
-                    .then_some(index)
-            })
-            .collect();
-        self.active_repository_index = active_group_key
-            .as_ref()
-            .and_then(|group_key| {
-                self.repositories
-                    .iter()
-                    .position(|repository| &repository.group_key == group_key)
-            })
-            .or_else(|| (!self.repositories.is_empty()).then_some(0));
-
-        if let Some(repository) = self.selected_repository().cloned() {
-            self.repo_root = repository.root.clone();
-            self.github_repo_slug = repository.github_repo_slug.clone();
-        } else {
-            self.github_repo_slug = None;
-        }
-    }
-
-    fn upsert_repository_checkout_root(
-        &mut self,
-        root: PathBuf,
-        kind: CheckoutKind,
-        group_key: String,
-    ) {
-        let mut entries = repository_store::repository_entries_from_summaries(&self.repositories);
-        entries.push(repository_store::StoredRepositoryEntry {
-            root: root.clone(),
-            group_key: Some(group_key),
-            kind,
-        });
-        let repositories = repository_store::resolve_repositories_from_entries(entries);
-        self.set_repositories_preserving_state(repositories);
-        if let Some(index) = self
-            .repositories
-            .iter()
-            .position(|repository| repository.contains_checkout_root(&root))
-        {
-            self.active_repository_index = Some(index);
-        }
-    }
-
-    fn remove_repository_checkout_root(&mut self, root: &Path) {
-        let entries = repository_store::repository_entries_from_summaries(&self.repositories)
-            .into_iter()
-            .filter(|entry| entry.root != root)
-            .collect();
-        let repositories = repository_store::resolve_repositories_from_entries(entries);
-        self.set_repositories_preserving_state(repositories);
-    }
-
-    fn sync_active_repository_from_selected_worktree(&mut self) {
-        let Some(worktree_group_key) = self
-            .active_worktree()
-            .map(|worktree| worktree.group_key.clone())
-        else {
-            return;
-        };
-
-        let Some(index) = self
-            .repositories
-            .iter()
-            .position(|repository| repository.group_key == worktree_group_key)
-        else {
-            return;
-        };
-
-        self.active_repository_index = Some(index);
-        if let Some(repository) = self.repositories.get(index) {
-            self.repo_root = repository.root.clone();
-            self.github_repo_slug = repository.github_repo_slug.clone();
-        }
-    }
-
-    fn selected_repository_label(&self) -> String {
-        if let Some(worktree) = self.active_worktree() {
-            return self
-                .repositories
-                .iter()
-                .find(|repository| repository.group_key == worktree.group_key)
-                .map(|repository| repository.label.clone())
-                .unwrap_or_else(|| repository_display_name(&worktree.repo_root));
-        }
-
-        self.selected_repository()
-            .map(|repository| repository.label.clone())
-            .unwrap_or_else(|| repository_display_name(&self.repo_root))
-    }
-
-    fn select_repository(&mut self, index: usize, cx: &mut Context<Self>) {
-        self.repository_context_menu = None;
-        self.worktree_context_menu = None;
-        let Some(repository) = self.repositories.get(index).cloned() else {
-            return;
-        };
-        if self.active_repository_index == Some(index) {
-            return;
-        }
-
-        self.active_repository_index = Some(index);
-        self.repo_root = repository.root.clone();
-        self.github_repo_slug = repository.github_repo_slug.clone();
-        self.worktree_stats_loading = false;
-        self.worktree_prs_loading = false;
-        self.active_diff_session_id = None;
-        self.active_file_view_session_id = None;
-        self.active_worktree_index = self
-            .worktrees
-            .iter()
-            .position(|worktree| worktree.group_key == repository.group_key);
-        self.refresh_worktrees(cx);
-        self.refresh_repo_config_if_changed(cx);
-        self.focus_terminal_on_next_render = true;
-        cx.notify();
-    }
-
-    fn persist_repositories(&mut self, cx: &mut Context<Self>) {
-        let entries_to_save =
-            repository_store::repository_entries_from_summaries(&self.repositories);
-        if let Err(error) = self.repository_store.save_entries(&entries_to_save) {
-            self.notice = Some(format!("failed to save repositories: {error}"));
-            cx.notify();
-        }
-    }
-
-    fn add_repository_from_path(&mut self, selected_path: PathBuf, cx: &mut Context<Self>) {
-        let repository_root = match worktree::repo_root(&selected_path) {
-            Ok(path) => path,
-            Err(error) => {
-                self.notice = Some(format!(
-                    "failed to resolve git repository root from `{}`: {error}",
-                    selected_path.display()
-                ));
-                cx.notify();
-                return;
-            },
-        };
-        let repository_root = match repository_root.canonicalize() {
-            Ok(path) => path,
-            Err(_) => repository_root,
-        };
-
-        if let Some(index) = self
-            .repositories
-            .iter()
-            .position(|repository| repository.contains_checkout_root(&repository_root))
-        {
-            self.select_repository(index, cx);
-            self.notice = Some(format!(
-                "repository `{}` is already added",
-                repository_display_name(&repository_root)
-            ));
-            cx.notify();
-            return;
-        }
-
-        let repository = RepositorySummary::from_checkout_roots(
-            repository_root.clone(),
-            repository_store::default_group_key_for_root(&repository_root),
-            vec![repository_store::RepositoryCheckoutRoot {
-                path: repository_root.clone(),
-                kind: CheckoutKind::LinkedWorktree,
-            }],
-        );
-        let repository_label = repository.label.clone();
-        let mut next_repositories = self.repositories.clone();
-        next_repositories.push(repository);
-        self.set_repositories_preserving_state(next_repositories);
-        self.persist_repositories(cx);
-        let index = self
-            .repositories
-            .iter()
-            .position(|entry| entry.contains_checkout_root(&repository_root))
-            .unwrap_or_else(|| self.repositories.len().saturating_sub(1));
-        self.select_repository(index, cx);
-        self.notice = Some(format!("added repository `{repository_label}`"));
-        cx.notify();
-    }
-
-    fn submit_welcome_local_path(&mut self, cx: &mut Context<Self>) {
-        let raw = self.welcome_local_path.trim().to_owned();
-        if raw.is_empty() {
-            self.welcome_local_path_error = Some("Please enter a repository path".to_owned());
-            cx.notify();
-            return;
-        }
-
-        let expanded = if let Some(suffix) = raw.strip_prefix('~') {
-            if let Some(home) = env::var_os("HOME").or_else(|| env::var_os("USERPROFILE")) {
-                PathBuf::from(home).join(suffix.strip_prefix('/').unwrap_or(suffix))
-            } else {
-                PathBuf::from(&raw)
-            }
-        } else {
-            PathBuf::from(&raw)
-        };
-
-        if !expanded.is_dir() {
-            self.welcome_local_path_error = Some(format!("`{raw}` is not a valid directory"));
-            cx.notify();
-            return;
-        }
-
-        self.welcome_local_path.clear();
-        self.welcome_local_path_cursor = 0;
-        self.welcome_local_path_active = false;
-        self.welcome_local_path_error = None;
-        self.add_repository_from_path(expanded, cx);
-    }
-
-    fn open_add_repository_picker(&mut self, cx: &mut Context<Self>) {
-        let picker = cx.prompt_for_paths(PathPromptOptions {
-            files: false,
-            directories: true,
-            multiple: false,
-            prompt: Some("Select Git Repository".into()),
-        });
-
-        cx.spawn(async move |this, cx| {
-            let Ok(selection) = picker.await else {
-                return;
-            };
-
-            let _ = this.update(cx, |this, cx| match selection {
-                Ok(Some(paths)) => {
-                    if let Some(path) = paths.into_iter().next() {
-                        this.add_repository_from_path(path, cx);
-                    }
-                },
-                Ok(None) => {},
-                Err(error) => {
-                    let message = format!(
-                        "File picker unavailable: {error}. \
-                         Type a path in the field above instead."
-                    );
-                    if this.repositories.is_empty() {
-                        this.welcome_local_path_error = Some(message);
-                    } else {
-                        this.notice = Some(message);
-                    }
-                    cx.notify();
-                },
-            });
-        })
-        .detach();
-    }
-
-    fn submit_welcome_clone(&mut self, cx: &mut Context<Self>) {
-        let url = self.welcome_clone_url.trim().to_owned();
-        if url.is_empty() {
-            self.welcome_clone_error = Some("Please enter a repository URL".to_owned());
-            cx.notify();
-            return;
-        }
-        if self.welcome_cloning {
-            return;
-        }
-
-        let repo_name = extract_repo_name_from_url(&url);
-        if repo_name.is_empty() {
-            self.welcome_clone_error =
-                Some("Could not determine repository name from URL".to_owned());
-            cx.notify();
-            return;
-        }
-
-        let clone_dir = match user_home_dir() {
-            Ok(home) => home.join(".arbor").join("repos").join(&repo_name),
-            Err(error) => {
-                self.welcome_clone_error = Some(error);
-                cx.notify();
-                return;
-            },
-        };
-
-        if clone_dir.exists() {
-            self.add_repository_from_path(clone_dir, cx);
-            self.welcome_clone_url.clear();
-            self.welcome_clone_url_active = false;
-            self.welcome_clone_error = None;
-            return;
-        }
-
-        self.welcome_cloning = true;
-        self.welcome_clone_error = None;
-        cx.notify();
-
-        let clone_url = url.clone();
-        let target = clone_dir.clone();
-        cx.spawn(async move |this, cx| {
-            let result = std::thread::spawn(move || {
-                if let Some(parent) = target.parent() {
-                    fs::create_dir_all(parent).map_err(|e| {
-                        format!("failed to create directory `{}`: {e}", parent.display())
-                    })?;
-                }
-                let output = Command::new("git")
-                    .arg("clone")
-                    .arg(&clone_url)
-                    .arg(&target)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .output()
-                    .map_err(|e| format!("failed to run git clone: {e}"))?;
-
-                if output.status.success() {
-                    Ok(target)
-                } else {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    Err(format!("git clone failed: {}", stderr.trim()))
-                }
-            })
-            .join()
-            .unwrap_or_else(|_| Err("git clone thread panicked".to_owned()));
-
-            let _ = this.update(cx, |this, cx| match result {
-                Ok(cloned_path) => {
-                    this.welcome_cloning = false;
-                    this.welcome_clone_url.clear();
-                    this.welcome_clone_url_active = false;
-                    this.welcome_clone_error = None;
-                    this.add_repository_from_path(cloned_path, cx);
-                },
-                Err(error) => {
-                    this.welcome_cloning = false;
-                    this.welcome_clone_error = Some(error);
-                    cx.notify();
-                },
-            });
-        })
-        .detach();
-    }
-
-    fn render_welcome_pane(&mut self, cx: &mut Context<Self>) -> Div {
-        let theme = self.theme();
-        let clone_url_active = self.welcome_clone_url_active;
-        let cloning = self.welcome_cloning;
-        let clone_error = self.welcome_clone_error.clone();
-        let local_path_active = self.welcome_local_path_active;
-        let local_path_error = self.welcome_local_path_error.clone();
-
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .gap_4()
-            .bg(rgb(theme.app_bg))
-            .child(
-                div()
-                    .text_xl()
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(rgb(theme.text_primary))
-                    .child("Welcome to Arbor"),
-            )
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(rgb(theme.text_muted))
-                    .text_center()
-                    .max_w(px(460.))
-                    .child("Get started by adding a repository. You can open a local git repository or clone one from a URL."),
-            )
-            .child(
-                div()
-                    .mt_4()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .w(px(420.))
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(theme.text_muted))
-                            .child("CLONE FROM URL"),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(
-                                single_line_input_field(
-                                    theme,
-                                    "welcome-clone-url",
-                                    &self.welcome_clone_url,
-                                    self.welcome_clone_url_cursor,
-                                    "https://github.com/user/repo or git@github.com:user/repo.git",
-                                    clone_url_active,
-                                )
-                                .track_focus(&self.welcome_clone_focus)
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                                        window.focus(&this.welcome_clone_focus);
-                                        this.welcome_clone_url_active = true;
-                                        this.welcome_clone_url_cursor =
-                                            char_count(&this.welcome_clone_url);
-                                        cx.notify();
-                                    }),
-                                )
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.welcome_clone_url_active = true;
-                                    this.welcome_clone_url_cursor =
-                                        char_count(&this.welcome_clone_url);
-                                    cx.notify();
-                                })),
-                            )
-                            .when_some(clone_error, |this, error| {
-                                this.child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(theme.notice_text))
-                                        .child(error),
-                                )
-                            })
-                            .child(
-                                action_button(
-                                    theme,
-                                    "welcome-clone-button",
-                                    if cloning { "Cloning..." } else { "Clone Repository" },
-                                    ActionButtonStyle::Primary,
-                                    !cloning,
-                                )
-                                .when(!cloning, |this| {
-                                    this.on_click(cx.listener(|this, _, _, cx| {
-                                        this.submit_welcome_clone(cx);
-                                    }))
-                                }),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .mt_2()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .h(px(1.))
-                                    .bg(rgb(theme.border)),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(theme.text_disabled))
-                                    .child("or"),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .h(px(1.))
-                                    .bg(rgb(theme.border)),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .mt_2()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(theme.text_muted))
-                            .child("LOCAL REPOSITORY"),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(
-                                single_line_input_field(
-                                    theme,
-                                    "welcome-local-path",
-                                    &self.welcome_local_path,
-                                    self.welcome_local_path_cursor,
-                                    "/path/to/repository or ~/projects/repo",
-                                    local_path_active,
-                                )
-                                .track_focus(&self.welcome_local_path_focus)
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                                        window.focus(&this.welcome_local_path_focus);
-                                        this.welcome_local_path_active = true;
-                                        this.welcome_local_path_cursor =
-                                            char_count(&this.welcome_local_path);
-                                        cx.notify();
-                                    }),
-                                )
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.welcome_local_path_active = true;
-                                    this.welcome_local_path_cursor =
-                                        char_count(&this.welcome_local_path);
-                                    cx.notify();
-                                })),
-                            )
-                            .when_some(local_path_error, |this, error| {
-                                this.child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(theme.notice_text))
-                                        .child(error),
-                                )
-                            })
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap_2()
-                                    .child(
-                                        action_button(
-                                            theme,
-                                            "welcome-open-local",
-                                            "Open",
-                                            ActionButtonStyle::Primary,
-                                            true,
-                                        )
-                                        .flex_1()
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.submit_welcome_local_path(cx);
-                                        })),
-                                    )
-                                    .when(has_native_file_picker(), |this| {
-                                        this.child(
-                                            action_button(
-                                                theme,
-                                                "welcome-browse-local",
-                                                "Browse\u{2026}",
-                                                ActionButtonStyle::Secondary,
-                                                true,
-                                            )
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.open_add_repository_picker(cx);
-                                            })),
-                                        )
-                                    }),
-                            ),
-                    ),
-            )
-    }
-
-    fn open_external_url(&mut self, url: &str, cx: &mut Context<Self>) {
-        cx.open_url(url);
-    }
-
-    fn close_github_auth_modal(&mut self, cx: &mut Context<Self>) {
-        self.github_auth_copy_feedback_active = false;
-        if self.github_auth_modal.take().is_some() {
-            cx.notify();
-        }
-    }
-
-    fn copy_github_auth_code_to_clipboard(&mut self, cx: &mut Context<Self>) {
-        let Some(modal) = self.github_auth_modal.as_ref() else {
-            return;
-        };
-
-        cx.write_to_clipboard(ClipboardItem::new_string(modal.user_code.clone()));
-        self.github_auth_copy_feedback_active = true;
-        self.github_auth_copy_feedback_generation =
-            self.github_auth_copy_feedback_generation.saturating_add(1);
-        let generation = self.github_auth_copy_feedback_generation;
-        self.notice = Some("GitHub device code copied to clipboard".to_owned());
-        cx.notify();
-
-        cx.spawn(async move |this, cx| {
-            cx.background_spawn(async move {
-                std::thread::sleep(GITHUB_AUTH_COPY_FEEDBACK_DURATION);
-            })
-            .await;
-
-            let _ = this.update(cx, |this, cx| {
-                if this.github_auth_copy_feedback_generation == generation
-                    && this.github_auth_copy_feedback_active
-                {
-                    this.github_auth_copy_feedback_active = false;
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
-    }
-
-    fn copy_settings_daemon_auth_token_to_clipboard(&mut self, cx: &mut Context<Self>) {
-        let Some(modal) = self.settings_modal.as_ref() else {
-            return;
-        };
-        if modal.daemon_auth_token.trim().is_empty() {
-            return;
-        }
-
-        cx.write_to_clipboard(ClipboardItem::new_string(modal.daemon_auth_token.clone()));
-        self.notice = Some("Daemon auth token copied to clipboard".to_owned());
-        cx.notify();
-    }
-
-    fn open_github_auth_verification_page(&mut self, cx: &mut Context<Self>) {
-        let Some(modal) = self.github_auth_modal.as_ref() else {
-            return;
-        };
-
-        let url = modal.verification_url.clone();
-        self.open_external_url(&url, cx);
-    }
-
-    fn has_persisted_github_token(&self) -> bool {
-        self.github_auth_state
-            .access_token
-            .as_deref()
-            .and_then(non_empty_trimmed_str)
-            .is_some()
-    }
-
-    fn github_access_token(&self) -> Option<String> {
-        resolve_github_access_token(self.github_auth_state.access_token.as_deref())
-    }
-
-    fn sync_github_token_shared(&self) {
-        if let Ok(mut guard) = self.github_token_shared.write() {
-            *guard = self.github_access_token();
-        }
-    }
-
-    fn persist_github_auth_state(&self) -> Result<(), String> {
-        self.github_auth_store.save(&self.github_auth_state)
-    }
-
-    fn clear_saved_github_token(&mut self, cx: &mut Context<Self>) {
-        if !self.has_persisted_github_token() {
-            self.notice = Some("no saved GitHub session to disconnect".to_owned());
-            cx.notify();
-            return;
-        }
-
-        self.github_auth_state = github_auth_store::GithubAuthState::default();
-        self.notice = match self.persist_github_auth_state() {
-            Ok(()) => Some("disconnected from GitHub".to_owned()),
-            Err(error) => Some(format!(
-                "disconnected, but failed to persist auth state: {error}"
-            )),
-        };
-        self.sync_github_token_shared();
-        self.refresh_worktree_pull_requests(cx);
-        cx.notify();
-    }
-
-    fn run_github_auth_button_action(&mut self, cx: &mut Context<Self>) {
-        if self.github_auth_in_progress {
-            return;
-        }
-
-        if self.has_persisted_github_token() {
-            self.clear_saved_github_token(cx);
-            return;
-        }
-
-        self.start_github_oauth_sign_in(cx);
-    }
-
-    fn start_github_oauth_sign_in(&mut self, cx: &mut Context<Self>) {
-        if self.github_auth_in_progress {
-            return;
-        }
-
-        let Some(client_id) = github_oauth_client_id() else {
-            self.notice = Some(
-                "GitHub OAuth client ID is not configured. Set ARBOR_GITHUB_OAUTH_CLIENT_ID."
-                    .to_owned(),
-            );
-            cx.notify();
-            return;
-        };
-
-        self.github_auth_modal = None;
-        self.github_auth_copy_feedback_active = false;
-        self.github_auth_in_progress = true;
-        self.notice = Some("starting GitHub device authorization".to_owned());
-        cx.notify();
-
-        cx.spawn(async move |this, cx| {
-            let client_id_for_start = client_id.clone();
-            let device_code_result = cx
-                .background_spawn(async move { github_request_device_code(&client_id_for_start) })
-                .await;
-
-            let device_code = match device_code_result {
-                Ok(device_code) => device_code,
-                Err(error) => {
-                    let _ = this.update(cx, |this, cx| {
-                        this.github_auth_in_progress = false;
-                        this.github_auth_modal = None;
-                        this.github_auth_copy_feedback_active = false;
-                        this.notice = Some(error);
-                        cx.notify();
-                    });
-                    return;
-                },
-            };
-
-            let verification_url = device_code
-                .verification_uri_complete
-                .clone()
-                .unwrap_or_else(|| device_code.verification_uri.clone());
-            let user_code = device_code.user_code.clone();
-
-            if this
-                .update(cx, |this, cx| {
-                    this.github_auth_modal = Some(GitHubAuthModal {
-                        user_code: user_code.clone(),
-                        verification_url: verification_url.clone(),
-                    });
-                    this.github_auth_copy_feedback_active = false;
-                    this.open_external_url(&verification_url, cx);
-                    this.notice = Some("complete GitHub auth in browser".to_owned());
-                    cx.notify();
-                })
-                .is_err()
-            {
-                return;
-            }
-
-            let poll_result = cx
-                .background_spawn(async move {
-                    github_poll_device_access_token(&client_id, &device_code)
-                })
-                .await;
-
-            let _ = this.update(cx, |this, cx| {
-                this.github_auth_in_progress = false;
-                this.github_auth_modal = None;
-                this.github_auth_copy_feedback_active = false;
-                match poll_result {
-                    Ok(token) => {
-                        this.github_auth_state = github_auth_store::GithubAuthState {
-                            access_token: Some(token.access_token),
-                            token_type: token.token_type,
-                            scope: token.scope,
-                            user_login: None,
-                            user_avatar_url: None,
-                        };
-
-                        this.notice = match this.persist_github_auth_state() {
-                            Ok(()) => Some(
-                                "GitHub connected, pull request numbers will refresh automatically"
-                                    .to_owned(),
-                            ),
-                            Err(error) => Some(format!(
-                                "GitHub connected, but failed to persist auth state: {error}"
-                            )),
-                        };
-                        this.sync_github_token_shared();
-                        this.refresh_worktree_pull_requests(cx);
-                    },
-                    Err(error) => {
-                        this.notice = Some(error);
-                    },
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    fn close_top_bar_worktree_quick_actions(&mut self) {
-        self.top_bar_quick_actions_open = false;
-        self.top_bar_quick_actions_submenu = None;
-    }
-
-    fn refresh_top_bar_external_launchers(&mut self) {
-        self.ide_launchers = detect_ide_launchers();
-        self.terminal_launchers = detect_terminal_launchers();
-    }
-
-    fn toggle_top_bar_worktree_quick_actions_menu(&mut self, cx: &mut Context<Self>) {
-        if self.selected_local_worktree_path().is_none() {
-            self.notice = Some("select a local worktree first".to_owned());
-            self.close_top_bar_worktree_quick_actions();
-            cx.notify();
-            return;
-        }
-
-        if self.top_bar_quick_actions_open {
-            self.close_top_bar_worktree_quick_actions();
-        } else {
-            self.top_bar_quick_actions_open = true;
-            self.top_bar_quick_actions_submenu = None;
-            self.refresh_top_bar_external_launchers();
-        }
-        cx.notify();
-    }
-
-    fn toggle_top_bar_worktree_quick_actions_submenu(
-        &mut self,
-        submenu: QuickActionSubmenu,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.top_bar_quick_actions_open {
-            return;
-        }
-
-        self.top_bar_quick_actions_submenu = if self.top_bar_quick_actions_submenu == Some(submenu)
-        {
-            None
-        } else {
-            Some(submenu)
-        };
-        cx.notify();
-    }
-
-    fn run_worktree_quick_action(&mut self, action: WorktreeQuickAction, cx: &mut Context<Self>) {
-        let Some(worktree_path) = self.selected_local_worktree_path().map(Path::to_path_buf) else {
-            self.notice = Some("select a local worktree first".to_owned());
-            self.close_top_bar_worktree_quick_actions();
-            cx.notify();
-            return;
-        };
-
-        let result = match action {
-            WorktreeQuickAction::OpenFinder => open_worktree_in_file_manager(&worktree_path),
-            WorktreeQuickAction::CopyPath => {
-                cx.write_to_clipboard(ClipboardItem::new_string(
-                    worktree_path.display().to_string(),
-                ));
-                Ok("copied worktree path to clipboard".to_owned())
-            },
-        };
-
-        self.close_top_bar_worktree_quick_actions();
-        self.notice = Some(match result {
-            Ok(message) => message,
-            Err(error) => error,
-        });
-        cx.notify();
-    }
-
-    fn run_worktree_external_launcher(
-        &mut self,
-        submenu: QuickActionSubmenu,
-        launcher_index: usize,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(worktree_path) = self.selected_local_worktree_path().map(Path::to_path_buf) else {
-            self.notice = Some("select a local worktree first".to_owned());
-            self.close_top_bar_worktree_quick_actions();
-            cx.notify();
-            return;
-        };
-
-        let launcher = match submenu {
-            QuickActionSubmenu::Ide => self.ide_launchers.get(launcher_index).copied(),
-            QuickActionSubmenu::Terminal => self.terminal_launchers.get(launcher_index).copied(),
-        };
-        let Some(launcher) = launcher else {
-            self.notice = Some("launcher no longer available".to_owned());
-            self.close_top_bar_worktree_quick_actions();
-            cx.notify();
-            return;
-        };
-
-        let result = open_worktree_with_external_launcher(&worktree_path, launcher);
-        self.close_top_bar_worktree_quick_actions();
-        self.notice = Some(match result {
-            Ok(message) => message,
-            Err(error) => error,
-        });
-        cx.notify();
-    }
-
-    fn select_worktree(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        self.repository_context_menu = None;
-        self.worktree_context_menu = None;
-        self._hover_show_task = None;
-        self.worktree_hover_popover = None;
-        self.active_remote_worktree = None;
-        if let Some(worktree) = self.worktrees.get(index) {
-            tracing::info!(worktree = %worktree.path.display(), branch = %worktree.branch, "switching worktree");
-        }
-        if let Some(old) = self.active_worktree_index
-            && old != index
-        {
-            self.worktree_nav_back.push(old);
-            self.worktree_nav_forward.clear();
-        }
-        self.close_top_bar_worktree_quick_actions();
-        if self.active_worktree_index != Some(index) {
-            self.worktree_selection_epoch = self.worktree_selection_epoch.wrapping_add(1);
-        }
-        self.active_worktree_index = Some(index);
-        self.active_outpost_index = None;
-        self.active_diff_session_id = None;
-        self.changes_view_mode = ChangesViewMode::Local;
-        self.pr_changed_files.clear();
-        self.pr_merge_base = None;
-        self.sync_active_repository_from_selected_worktree();
-        let _ = self.reload_changed_files();
-        self.expanded_dirs.clear();
-        self.selected_file_tree_entry = None;
-        self.file_tree_entries.clear();
-        if self.right_pane_tab == RightPaneTab::FileTree {
-            self.rebuild_file_tree();
-        }
-        if self.ensure_selected_worktree_terminal() {
-            self.sync_daemon_session_store(cx);
-        }
-        self.terminal_scroll_handle.scroll_to_bottom();
-        window.focus(&self.terminal_focus);
-        self.focus_terminal_on_next_render = false;
-        cx.notify();
-    }
-
-    fn show_worktree_hover_popover(
-        &mut self,
-        index: usize,
-        mouse_y: Pixels,
-        cx: &mut Context<Self>,
-    ) {
-        self._hover_show_task = None;
-        self._hover_dismiss_task = None;
-        let checks_expanded = self
-            .worktree_hover_popover
-            .as_ref()
-            .filter(|popover| popover.worktree_index == index)
-            .is_some_and(|popover| popover.checks_expanded);
-        self.worktree_hover_popover = Some(WorktreeHoverPopover {
-            worktree_index: index,
-            mouse_y,
-            checks_expanded,
-        });
-        cx.notify();
-    }
-
-    fn cancel_worktree_hover_popover_show(&mut self) {
-        self._hover_show_task = None;
-    }
-
-    fn cancel_worktree_hover_popover_dismiss(&mut self) {
-        self._hover_dismiss_task = None;
-    }
-
-    fn update_worktree_hover_mouse_position(&mut self, position: gpui::Point<Pixels>) {
-        self.last_mouse_position = position;
-        if self.worktree_hover_safe_zone_contains_mouse() {
-            self.cancel_worktree_hover_popover_dismiss();
-        }
-    }
-
-    fn worktree_hover_safe_zone_contains_mouse(&self) -> bool {
-        let Some(popover) = self.worktree_hover_popover.as_ref() else {
-            return false;
-        };
-        let Some(worktree) = self.worktrees.get(popover.worktree_index) else {
-            return false;
-        };
-        worktree_hover_safe_zone_contains(
-            self.left_pane_width,
-            popover,
-            worktree,
-            self.last_mouse_position,
-        )
-    }
-
-    fn schedule_worktree_hover_popover_dismiss(
-        &mut self,
-        worktree_index: usize,
-        cx: &mut Context<Self>,
-    ) {
-        self.cancel_worktree_hover_popover_show();
-        self._hover_dismiss_task = Some(cx.spawn(async move |this, cx| {
-            cx.background_spawn(async {
-                smol::Timer::after(WORKTREE_HOVER_POPOVER_HIDE_DELAY).await;
-            })
-            .await;
-            let _ = this.update(cx, |this, cx| {
-                if this
-                    .worktree_hover_popover
-                    .as_ref()
-                    .is_some_and(|popover| popover.worktree_index == worktree_index)
-                    && !this.worktree_hover_safe_zone_contains_mouse()
-                {
-                    this.worktree_hover_popover = None;
-                    cx.notify();
-                }
-            });
-        }));
-    }
-
-    fn schedule_worktree_hover_popover_show(
-        &mut self,
-        worktree_index: usize,
-        mouse_y: Pixels,
-        cx: &mut Context<Self>,
-    ) {
-        // Never show hover popover while a context menu is open.
-        if self.worktree_context_menu.is_some() {
-            return;
-        }
-
-        self.cancel_worktree_hover_popover_dismiss();
-
-        if self
-            .worktree_hover_popover
-            .as_ref()
-            .is_some_and(|popover| popover.worktree_index == worktree_index)
-        {
-            return;
-        }
-
-        // Show immediately — no delay. This avoids timing issues where the
-        // dismiss timer of the previous cell races with the show timer of the
-        // new cell, causing the tooltip to not appear.
-        self.show_worktree_hover_popover(worktree_index, mouse_y, cx);
-    }
-
-    fn select_outpost(&mut self, index: usize, _window: &mut Window, cx: &mut Context<Self>) {
-        self.repository_context_menu = None;
-        self.worktree_context_menu = None;
-        self._hover_show_task = None;
-        self.worktree_hover_popover = None;
-        self.close_top_bar_worktree_quick_actions();
-        self.active_outpost_index = Some(index);
-        self.active_worktree_index = None;
-        self.changed_files.clear();
-        self.selected_changed_file = None;
-        self.refresh_remote_changed_files(cx);
-        cx.notify();
-    }
-
-    fn open_remote_create_modal(
-        &mut self,
-        daemon_url: String,
-        hostname: String,
-        repo_root: String,
-        cx: &mut Context<Self>,
-    ) {
-        tracing::info!(
-            url = %daemon_url,
-            host = %hostname,
-            repo = %repo_root,
-            "opening create modal on remote daemon"
-        );
-        connection_history::record_connection(&daemon_url, Some(&hostname));
-        self.connection_history = connection_history::load_history();
-        let connected = self.connect_to_daemon_endpoint(&daemon_url, Some(hostname), None, cx);
-        if connected {
-            // Find the repo in the now-refreshed list by root path
-            if let Some(repo_index) = self
-                .repositories
-                .iter()
-                .position(|r| r.root.to_string_lossy().ends_with(&repo_root))
-            {
-                self.select_repository(repo_index, cx);
-                self.open_create_modal(repo_index, CreateModalTab::LocalWorktree, cx);
-            } else if let Some(repo_index) = self.repositories.first().map(|_| 0) {
-                self.select_repository(repo_index, cx);
-                self.open_create_modal(repo_index, CreateModalTab::LocalWorktree, cx);
-            }
-        }
-    }
-
-    fn select_remote_worktree(
-        &mut self,
-        daemon_index: usize,
-        worktree_path: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(state) = self.remote_daemon_states.get(&daemon_index) else {
-            return;
-        };
-        let client = Arc::clone(&state.client);
-        let hostname = state.hostname.clone();
-
-        tracing::info!(
-            host = %hostname,
-            path = %worktree_path,
-            "selecting remote worktree (keeping local daemon)"
-        );
-
-        // Deselect local worktree, activate remote
-        let cwd = PathBuf::from(&worktree_path);
-        self.active_worktree_index = None;
-        self.active_outpost_index = None;
-        self.active_remote_worktree = Some(ActiveRemoteWorktree {
-            daemon_index,
-            worktree_path: cwd.clone(),
-        });
-        let has_terminal = self
-            .terminals
-            .iter()
-            .any(|session| session.worktree_path == cwd);
-        if has_terminal {
-            // Already have a terminal for this remote worktree, just activate it
-            if let Some(session_id) = self.active_terminal_id_for_worktree(&cwd) {
-                self.active_terminal_by_worktree.insert(cwd, session_id);
-            }
-        } else {
-            // Spawn a new terminal session on the remote daemon
-            let session_id = self.next_terminal_id;
-            self.next_terminal_id += 1;
-            self.active_terminal_by_worktree
-                .insert(cwd.clone(), session_id);
-
-            let shell = self.embedded_shell();
-
-            let mut session = TerminalSession {
-                id: session_id,
-                daemon_session_id: SessionId::new(session_id.to_string()),
-                worktree_path: cwd.clone(),
-                title: format!("term-{session_id}"),
-                last_command: None,
-                pending_command: String::new(),
-                command: String::new(),
-                state: TerminalState::Running,
-                exit_code: None,
-                updated_at_unix_ms: current_unix_timestamp_millis(),
-                cols: 120,
-                rows: 35,
-                generation: 0,
-                output: String::new(),
-                styled_output: Vec::new(),
-                cursor: None,
-                modes: TerminalModes::default(),
-                last_runtime_sync_at: None,
-                runtime: None,
-            };
-
-            match client.create_or_attach(CreateOrAttachRequest {
-                session_id: SessionId::default(),
-                workspace_id: cwd.display().to_string().into(),
-                cwd: cwd.clone(),
-                shell,
-                cols: 120,
-                rows: 35,
-                title: Some(session.title.clone()),
-                command: None,
-            }) {
-                Ok(response) => {
-                    let daemon_session = response.session;
-                    session.daemon_session_id = daemon_session.session_id.clone();
-                    session.title = daemon_session
-                        .title
-                        .clone()
-                        .filter(|value| !value.trim().is_empty())
-                        .unwrap_or(session.title);
-                    session.last_command = daemon_session.last_command.clone();
-                    session.command = daemon_session.shell.clone();
-                    session.output = daemon_session.output_tail.clone().unwrap_or_default();
-                    session.state = terminal_state_from_daemon_record(&daemon_session);
-                    session.exit_code = daemon_session.exit_code;
-                    session.updated_at_unix_ms = daemon_session.updated_at_unix_ms;
-                    session.cols = daemon_session.cols.max(2);
-                    session.rows = daemon_session.rows.max(1);
-                    session.runtime = Some(local_daemon_runtime(
-                        client,
-                        daemon_session.session_id.to_string(),
-                        Some(self.terminal_poll_tx.clone()),
-                    ));
-                },
-                Err(error) => {
-                    tracing::warn!(%error, "failed to create remote terminal session");
-                    self.notice = Some(format!("failed to create terminal on {hostname}: {error}"));
-                },
-            }
-
-            self.terminals.push(session);
-        }
-
-        self.terminal_scroll_handle.scroll_to_bottom();
-        window.focus(&self.terminal_focus);
-        cx.notify();
-    }
-
-    fn toggle_discovered_daemon(&mut self, index: usize, cx: &mut Context<Self>) {
-        // If already expanded, collapse it
-        if let Some(state) = self.remote_daemon_states.get(&index) {
-            if state.expanded {
-                if let Some(s) = self.remote_daemon_states.get_mut(&index) {
-                    s.expanded = false;
-                }
-                cx.notify();
-                return;
-            }
-            // If collapsed but already fetched, just re-expand
-            if !state.repositories.is_empty() || !state.worktrees.is_empty() {
-                if let Some(s) = self.remote_daemon_states.get_mut(&index) {
-                    s.expanded = true;
-                }
-                cx.notify();
-                return;
-            }
-        }
-
-        let Some(daemon) = self.discovered_daemons.get(index) else {
-            return;
-        };
-        let url = daemon.base_url();
-        let hostname = daemon.display_name().to_owned();
-
-        // Create HTTP client for the remote daemon
-        let client = match terminal_daemon_http::HttpTerminalDaemon::new(&url) {
-            Ok(c) => Arc::new(c),
-            Err(err) => {
-                tracing::error!(%err, %url, "failed to create HTTP client for LAN daemon");
-                return;
-            },
-        };
-
-        // Apply stored auth token if we have one
-        if let Some(token) = self.daemon_auth_tokens.get(&url) {
-            client.set_auth_token(Some(token.clone()));
-        }
-
-        tracing::info!(%url, name = %hostname, "fetching repos/worktrees from LAN daemon");
-
-        self.remote_daemon_states.insert(index, RemoteDaemonState {
-            client: Arc::clone(&client),
-            hostname: hostname.clone(),
-            repositories: Vec::new(),
-            worktrees: Vec::new(),
-            loading: true,
-            expanded: true,
-            error: None,
-        });
-        cx.notify();
-
-        // Fetch repos and worktrees in background
-        let client_clone = Arc::clone(&client);
-        let url_clone = url.clone();
-        cx.spawn(async move |this, cx| {
-            let (repos, worktrees, error, needs_auth) = {
-                let repos = client_clone.list_repositories();
-                let worktrees = client_clone.list_worktrees();
-                match (repos, worktrees) {
-                    (Ok(r), Ok(w)) => (r, w, None, false),
-                    (Err(e), _) | (_, Err(e)) => {
-                        let needs_auth = e.is_unauthorized();
-                        tracing::warn!(%e, needs_auth, "failed to fetch from LAN daemon");
-                        (Vec::new(), Vec::new(), Some(format!("{e}")), needs_auth)
-                    },
-                }
-            };
-
-            let _ = cx.update(|cx| {
-                this.update(cx, |this, cx| {
-                    if let Some(state) = this.remote_daemon_states.get_mut(&index) {
-                        state.repositories = repos;
-                        state.worktrees = worktrees;
-                        state.loading = false;
-                        state.error = error;
-                    }
-                    if needs_auth {
-                        this.daemon_auth_modal = Some(DaemonAuthModal {
-                            daemon_url: url_clone,
-                            token: String::new(),
-                            token_cursor: 0,
-                            error: None,
-                        });
-                        // Track which daemon index needs auth so we can retry
-                        this.pending_remote_daemon_auth = Some(index);
-                    }
-                    cx.notify();
-                })
-            });
-        })
-        .detach();
-    }
-
-    fn connect_to_ssh_daemon(
-        &mut self,
-        target: SshDaemonTarget,
-        label: Option<String>,
-        auth_key: String,
-        cx: &mut Context<Self>,
-    ) {
-        self.stop_active_ssh_daemon_tunnel();
-
-        let tunnel = match SshDaemonTunnel::start(&target) {
-            Ok(tunnel) => tunnel,
-            Err(error) => {
-                self.notice = Some(error);
-                self.terminal_daemon = None;
-                self.connected_daemon_label = None;
-                cx.notify();
-                return;
-            },
-        };
-
-        let local_url = tunnel.local_url();
-        let local_port = tunnel.local_port;
-        tracing::info!(
-            remote = %target.ssh_destination(),
-            ssh_port = target.ssh_port,
-            daemon_port = target.daemon_port,
-            local_url = %local_url,
-            "connecting to daemon through ssh tunnel"
-        );
-
-        self.ssh_daemon_tunnel = Some(tunnel);
-        self.notice = Some(format!(
-            "connecting to {} via SSH tunnel\u{2026}",
-            target.ssh_destination()
-        ));
-        cx.notify();
-
-        cx.spawn(async move |this, cx| {
-            let ready = cx
-                .background_spawn(async move {
-                    for _ in 0..40 {
-                        if std::net::TcpStream::connect(("127.0.0.1", local_port)).is_ok() {
-                            return true;
-                        }
-                        std::thread::sleep(Duration::from_millis(250));
-                    }
-                    false
-                })
-                .await;
-
-            let _ = this.update(cx, |this, cx| {
-                this.notice = None;
-                if ready {
-                    let connected =
-                        this.connect_to_daemon_endpoint(&local_url, label, Some(auth_key), cx);
-                    if !connected {
-                        this.stop_active_ssh_daemon_tunnel();
-                    }
-                } else {
-                    tracing::warn!(
-                        local_port = local_port,
-                        "SSH tunnel did not become ready in time"
-                    );
-                    this.notice =
-                        Some("SSH tunnel timed out — is the remote daemon running?".to_owned());
-                    this.stop_active_ssh_daemon_tunnel();
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
-    }
-
-    fn connect_to_daemon_endpoint(
-        &mut self,
-        url: &str,
-        label: Option<String>,
-        auth_key: Option<String>,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        tracing::info!(url = %url, "connecting to daemon");
-        self.daemon_base_url = url.to_owned();
-        let token_key = auth_key.unwrap_or_else(|| url.to_owned());
-        let client = match terminal_daemon_http::default_terminal_daemon_client(url) {
-            Ok(c) => c,
-            Err(error) => {
-                tracing::warn!(url = %url, %error, "failed to create daemon client");
-                self.notice = Some(format!("failed to connect to {url}: {error}"));
-                self.terminal_daemon = None;
-                self.connected_daemon_label = None;
-                cx.notify();
-                return false;
-            },
-        };
-
-        if let Some(token) = self.daemon_auth_tokens.get(&token_key) {
-            client.set_auth_token(Some(token.clone()));
-        }
-
-        match client.list_sessions() {
-            Ok(records) => {
-                self.terminal_daemon = Some(client);
-                self.connected_daemon_label = label;
-                self.restore_terminal_sessions_from_records(records, true);
-                self.refresh_worktrees(cx);
-                cx.notify();
-                true
-            },
-            Err(error) => {
-                if error.is_forbidden() {
-                    tracing::warn!(url = %url, "daemon rejected connection: forbidden (no auth token configured on remote)");
-                    self.notice = Some(
-                        "Remote host has no auth token configured. Set [daemon] auth_token in ~/.config/arbor/config.toml on the remote host.".to_owned(),
-                    );
-                    self.terminal_daemon = None;
-                    self.connected_daemon_label = None;
-                    cx.notify();
-                    false
-                } else if error.is_unauthorized() {
-                    tracing::info!(url = %url, "daemon requires authentication, showing auth modal");
-                    self.daemon_auth_modal = Some(DaemonAuthModal {
-                        daemon_url: token_key,
-                        token: String::new(),
-                        token_cursor: 0,
-                        error: None,
-                    });
-                    self.terminal_daemon = Some(client);
-                    self.connected_daemon_label = label;
-                    cx.notify();
-                    true
-                } else {
-                    tracing::warn!(url = %url, %error, "failed to connect to daemon");
-                    self.notice = Some(format!("failed to connect to {url}: {error}"));
-                    self.terminal_daemon = None;
-                    self.connected_daemon_label = None;
-                    cx.notify();
-                    false
-                }
-            },
-        }
-    }
-
-    fn try_start_and_connect_daemon(&mut self, cx: &mut Context<Self>) {
-        let daemon_base_url = self.daemon_base_url.clone();
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_spawn(async move { try_auto_start_daemon(&daemon_base_url) })
-                .await;
-
-            let _ = this.update(cx, |this, cx| {
-                if let Some(client) = result {
-                    let records = client.list_sessions().unwrap_or_default();
-                    this.terminal_daemon = Some(client);
-                    this.restore_terminal_sessions_from_records(records, true);
-                    this.refresh_worktrees(cx);
-                } else {
-                    this.notice =
-                        Some("Failed to start daemon. Is arbor-httpd available?".to_owned());
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    fn stop_active_ssh_daemon_tunnel(&mut self) {
-        let _ = self.ssh_daemon_tunnel.take();
-    }
-
-    fn submit_daemon_auth(&mut self, cx: &mut Context<Self>) {
-        let Some(modal) = self.daemon_auth_modal.take() else {
-            return;
-        };
-        let token = modal.token.trim().to_owned();
-        if token.is_empty() {
-            self.daemon_auth_modal = Some(DaemonAuthModal {
-                token_cursor: 0,
-                error: Some("Token cannot be empty".to_owned()),
-                ..modal
-            });
-            cx.notify();
-            return;
-        }
-        let url = modal.daemon_url.clone();
-
-        // Handle remote daemon auth (inline expand)
-        if let Some(daemon_index) = self.pending_remote_daemon_auth.take() {
-            self.daemon_auth_tokens.insert(url.clone(), token.clone());
-            connection_history::save_tokens(&self.daemon_auth_tokens);
-            // Set token on existing client and retry, or re-toggle to fetch
-            if let Some(state) = self.remote_daemon_states.get(&daemon_index) {
-                state.client.set_auth_token(Some(token));
-            }
-            // Clear the state so toggle_discovered_daemon will re-fetch
-            self.remote_daemon_states.remove(&daemon_index);
-            self.toggle_discovered_daemon(daemon_index, cx);
-            return;
-        }
-
-        // Handle local daemon auth
-        if let Some(client) = self.terminal_daemon.as_ref() {
-            client.set_auth_token(Some(token.clone()));
-        }
-        // Verify the token works
-        if let Some(client) = self.terminal_daemon.as_ref() {
-            match client.list_sessions() {
-                Ok(records) => {
-                    self.daemon_auth_tokens.insert(url, token);
-                    connection_history::save_tokens(&self.daemon_auth_tokens);
-                    self.restore_terminal_sessions_from_records(records, true);
-                    self.refresh_worktrees(cx);
-                },
-                Err(error) => {
-                    if error.is_unauthorized() || error.is_forbidden() {
-                        self.daemon_auth_modal = Some(DaemonAuthModal {
-                            daemon_url: modal.daemon_url,
-                            token_cursor: char_count(&modal.token),
-                            token: modal.token,
-                            error: Some("Invalid token".to_owned()),
-                        });
-                    } else {
-                        self.notice = Some(format!("connection failed: {error}"));
-                    }
-                },
-            }
-        }
-        cx.notify();
-    }
-
-    fn reload_changed_files(&mut self) -> bool {
-        let previous_files = self.changed_files.clone();
-        let previous_notice = self.notice.clone();
-        // Remote outposts don't have a local working tree to diff against.
-        if self.active_outpost_index.is_some() {
-            self.changed_files.clear();
-            self.selected_changed_file = None;
-            return self.changed_files != previous_files;
-        }
-        let Some(path) = self.selected_worktree_path() else {
-            self.changed_files.clear();
-            self.selected_changed_file = None;
-            return self.changed_files != previous_files || self.notice != previous_notice;
-        };
-
-        match changes::changed_files(path) {
-            Ok(files) => {
-                self.changed_files = files;
-                self.notice = None;
-            },
-            Err(error) => {
-                self.changed_files.clear();
-                self.notice = Some(format!("failed to load changed files with gix: {error}"));
-            },
-        }
-
-        self.sync_selected_changed_file();
-        self.changed_files != previous_files || self.notice != previous_notice
-    }
-
-    fn refresh_remote_changed_files(&mut self, cx: &mut Context<Self>) {
-        let Some(outpost_index) = self.active_outpost_index else {
-            return;
-        };
-        let Some(outpost) = self.outposts.get(outpost_index) else {
-            return;
-        };
-        let Some(host) = self
-            .remote_hosts
-            .iter()
-            .find(|h| h.name == outpost.host_name)
-            .cloned()
-        else {
-            return;
-        };
-
-        let remote_path = outpost.remote_path.clone();
-        let pool = self.ssh_connection_pool.clone();
-
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_spawn(async move {
-                    let conn_slot = pool
-                        .get_or_connect(&host)
-                        .map_err(|e| format!("SSH connection failed: {e}"))?;
-                    let guard = conn_slot
-                        .lock()
-                        .map_err(|_| "SSH connection lock poisoned".to_owned())?;
-                    let connection = guard
-                        .as_ref()
-                        .ok_or_else(|| "SSH connection not available".to_owned())?;
-
-                    use arbor_core::remote::RemoteTransport;
-
-                    let status_output = connection
-                        .run_command(&format!("cd {remote_path} && git status --porcelain"))
-                        .map_err(|e| format!("{e}"))?;
-                    if status_output.exit_code != Some(0) {
-                        return Err(format!("git status failed: {}", status_output.stderr));
-                    }
-
-                    let numstat_output = connection
-                        .run_command(&format!(
-                            "cd {remote_path} && git diff --numstat HEAD 2>/dev/null"
-                        ))
-                        .map_err(|e| format!("{e}"))?;
-                    let numstat_map = parse_remote_numstat_output(&numstat_output.stdout);
-
-                    let mut files = Vec::new();
-                    for line in status_output.stdout.lines() {
-                        if line.len() < 3 {
-                            continue;
-                        }
-                        let xy = &line[..2];
-                        let path_str = line[3..].trim();
-                        if path_str.is_empty() {
-                            continue;
-                        }
-                        let path = PathBuf::from(path_str);
-                        let kind = porcelain_status_to_change_kind(xy);
-                        let (additions, deletions) =
-                            numstat_map.get(&path).copied().unwrap_or((0, 0));
-                        files.push(ChangedFile {
-                            path,
-                            kind,
-                            additions,
-                            deletions,
-                        });
-                    }
-                    files.sort_by(|a, b| a.path.cmp(&b.path));
-                    Ok::<Vec<ChangedFile>, String>(files)
-                })
-                .await;
-
-            let _ = this.update(cx, |this, cx| {
-                if this.active_outpost_index.is_some() {
-                    if let Ok(files) = result {
-                        this.changed_files = files;
-                        this.sync_selected_changed_file();
-                    }
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
-    }
-
-    fn run_commit_action(&mut self, cx: &mut Context<Self>) {
-        if self.git_action_in_flight.is_some() {
-            return;
-        }
-
-        if self.active_outpost_index.is_some() {
-            self.notice = Some("git actions are only available for local worktrees".to_owned());
-            cx.notify();
-            return;
-        }
-
-        let Some(worktree_path) = self.selected_worktree_path().map(Path::to_path_buf) else {
-            self.notice = Some("select a worktree before committing".to_owned());
-            cx.notify();
-            return;
-        };
-
-        if self.changed_files.is_empty() {
-            self.notice = Some("nothing to commit".to_owned());
-            cx.notify();
-            return;
-        }
-
-        let changed_files = self.changed_files.clone();
-        self.git_action_in_flight = Some(GitActionKind::Commit);
-        self.notice = Some("running git commit".to_owned());
-        cx.notify();
-
-        cx.spawn(async move |this, cx| {
-            let result = cx.background_spawn(async move {
-                run_git_commit_for_worktree(worktree_path.as_path(), &changed_files)
-            });
-            let result = result.await;
-
-            let _ = this.update(cx, |this, cx| {
-                this.git_action_in_flight = None;
-                match result {
-                    Ok(message) => {
-                        this.notice = Some(message);
-                        let _ = this.reload_changed_files();
-                        this.refresh_worktree_diff_summaries(cx);
-                        this.refresh_worktree_pull_requests(cx);
-                    },
-                    Err(error) => {
-                        this.notice = Some(error);
-                    },
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    fn run_push_action(&mut self, cx: &mut Context<Self>) {
-        if self.git_action_in_flight.is_some() {
-            return;
-        }
-
-        if self.active_outpost_index.is_some() {
-            self.notice = Some("git actions are only available for local worktrees".to_owned());
-            cx.notify();
-            return;
-        }
-
-        let Some(worktree_path) = self.selected_worktree_path().map(Path::to_path_buf) else {
-            self.notice = Some("select a worktree before pushing".to_owned());
-            cx.notify();
-            return;
-        };
-
-        self.git_action_in_flight = Some(GitActionKind::Push);
-        self.notice = Some("running git push".to_owned());
-        cx.notify();
-
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_spawn(async move { run_git_push_for_worktree(worktree_path.as_path()) })
-                .await;
-
-            let _ = this.update(cx, |this, cx| {
-                this.git_action_in_flight = None;
-                match result {
-                    Ok(message) => {
-                        this.notice = Some(message);
-                        this.refresh_worktree_pull_requests(cx);
-                    },
-                    Err(error) => {
-                        this.notice = Some(error);
-                    },
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    fn run_create_pr_action(&mut self, cx: &mut Context<Self>) {
-        if self.git_action_in_flight.is_some() {
-            return;
-        }
-
-        if self.active_outpost_index.is_some() {
-            self.notice = Some("git actions are only available for local worktrees".to_owned());
-            cx.notify();
-            return;
-        }
-
-        let Some(worktree_path) = self.selected_worktree_path().map(Path::to_path_buf) else {
-            self.notice = Some("select a worktree before creating a PR".to_owned());
-            cx.notify();
-            return;
-        };
-
-        let repo_slug = self
-            .github_repo_slug
-            .clone()
-            .or_else(|| github_repo_slug_for_repo(worktree_path.as_path()));
-        let github_token = self.github_access_token();
-        let github_service = self.github_service.clone();
-
-        self.git_action_in_flight = Some(GitActionKind::CreatePullRequest);
-        self.notice = Some("creating pull request".to_owned());
-        cx.notify();
-
-        cx.spawn(async move |this, cx| {
-            let result = cx.background_spawn(async move {
-                run_create_pr_for_worktree(
-                    github_service.as_ref(),
-                    worktree_path.as_path(),
-                    repo_slug.as_deref(),
-                    github_token.as_deref(),
-                )
-            });
-            let result = result.await;
-
-            let _ = this.update(cx, |this, cx| {
-                this.git_action_in_flight = None;
-                match result {
-                    Ok(message) => {
-                        if let Some(url) = extract_first_url(&message) {
-                            this.open_external_url(&url, cx);
-                        }
-                        this.notice = Some(message);
-                        this.refresh_worktree_pull_requests(cx);
-                    },
-                    Err(error) => {
-                        this.notice = Some(error);
-                    },
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    fn sync_selected_changed_file(&mut self) {
-        let Some(selected) = self.selected_changed_file.as_ref() else {
-            self.selected_changed_file =
-                self.changed_files.first().map(|change| change.path.clone());
-            return;
-        };
-
-        if !self
-            .changed_files
-            .iter()
-            .any(|change| change.path.as_path() == selected.as_path())
-        {
-            self.selected_changed_file =
-                self.changed_files.first().map(|change| change.path.clone());
-        }
-    }
-
-    fn select_changed_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        if self
-            .selected_changed_file
-            .as_ref()
-            .is_some_and(|selected| selected == &path)
-        {
-            return;
-        }
-        self.selected_changed_file = Some(path);
-        if let Some(selected_path) = self.selected_changed_file.as_ref()
-            && !self.scroll_diff_to_file(selected_path.as_path())
-            && self
-                .active_center_tab_for_selected_worktree()
-                .is_some_and(|tab| matches!(tab, CenterTab::Diff(_)))
-        {
-            self.pending_diff_scroll_to_file = Some(selected_path.clone());
-        }
-        cx.notify();
-    }
-
-    fn selected_changed_file(&self) -> Option<&ChangedFile> {
-        let selected_path = self.selected_changed_file.as_ref()?;
-        self.changed_files
-            .iter()
-            .find(|change| change.path == *selected_path)
-    }
-
-    fn rebuild_file_tree(&mut self) {
-        let Some(worktree_path) = self.selected_worktree_path().map(|p| p.to_path_buf()) else {
-            self.file_tree_entries.clear();
-            return;
-        };
-        let mut entries = Vec::new();
-        self.walk_directory(&worktree_path, &worktree_path, 0, &mut entries);
-        self.file_tree_entries = entries;
-    }
-
-    fn walk_directory(
-        &self,
-        base: &Path,
-        dir: &Path,
-        depth: usize,
-        entries: &mut Vec<FileTreeEntry>,
-    ) {
-        let Ok(read_dir) = fs::read_dir(dir) else {
-            return;
-        };
-
-        let mut children: Vec<(String, PathBuf, bool)> = Vec::new();
-        for entry in read_dir.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') {
-                continue;
-            }
-            let is_dir = entry.file_type().is_ok_and(|ft| ft.is_dir());
-            if is_dir
-                && matches!(
-                    name.as_str(),
-                    "node_modules" | "target" | "__pycache__" | ".git"
-                )
-            {
-                continue;
-            }
-            children.push((name, entry.path(), is_dir));
-        }
-
-        children.sort_by(|a, b| {
-            b.2.cmp(&a.2)
-                .then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
-        });
-
-        for (name, full_path, is_dir) in children {
-            let relative = full_path
-                .strip_prefix(base)
-                .unwrap_or(&full_path)
-                .to_path_buf();
-            entries.push(FileTreeEntry {
-                path: relative.clone(),
-                name,
-                is_dir,
-                depth,
-            });
-            if is_dir && self.expanded_dirs.contains(&relative) {
-                self.walk_directory(base, &full_path, depth + 1, entries);
-            }
-        }
-    }
-
-    fn toggle_file_tree_dir(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        if self.expanded_dirs.contains(&path) {
-            self.expanded_dirs.remove(&path);
-        } else {
-            self.expanded_dirs.insert(path.clone());
-        }
-        self.selected_file_tree_entry = Some(path);
-        self.rebuild_file_tree();
-        cx.notify();
-    }
-
-    fn select_file_tree_entry(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        self.selected_file_tree_entry = Some(path.clone());
-
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_lowercase();
-        let is_image = matches!(
-            ext.as_str(),
-            "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "ico" | "svg" | "tiff" | "tif"
-        );
-
-        if !is_image
-            && let Ok(editor) = env::var("EDITOR")
-            && let Some(worktree_path) = self.selected_worktree_path().map(Path::to_path_buf)
-        {
-            let full_path = worktree_path.join(&path);
-            if is_gui_editor(&editor) {
-                if let Err(error) = create_command(&editor)
-                    .arg(&full_path)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn()
-                {
-                    self.notice = Some(format!("Failed to open $EDITOR ({editor}): {error}"));
-                }
-            } else {
-                self.open_editor_in_terminal(&editor, &full_path, cx);
-            }
-            cx.notify();
-            return;
-        }
-
-        self.open_file_view_tab(path, cx);
-        cx.notify();
-    }
-
-    fn set_right_pane_tab(&mut self, tab: RightPaneTab, cx: &mut Context<Self>) {
-        if self.right_pane_tab == tab {
-            return;
-        }
-        self.right_pane_tab = tab;
-        self.right_pane_search.clear();
-        self.right_pane_search_cursor = 0;
-        self.right_pane_search_active = false;
-        if tab == RightPaneTab::FileTree && self.file_tree_entries.is_empty() {
-            self.rebuild_file_tree();
-        }
-        cx.notify();
     }
 
     fn switch_terminal_backend(
@@ -5144,6 +2360,7 @@ impl ArborWindow {
         }
 
         self.theme_kind = theme_kind;
+        self.theme_picker_selected_index = theme_picker_index_for_kind(theme_kind);
         if let Err(error) = self
             .app_config_store
             .save_scalar_settings(&[("theme", Some(theme_kind.slug()))])
@@ -5172,706 +2389,6 @@ impl ArborWindow {
             });
         })
         .detach();
-    }
-
-    fn open_create_modal(
-        &mut self,
-        repo_index: usize,
-        tab: CreateModalTab,
-        cx: &mut Context<Self>,
-    ) {
-        let repository_path = self
-            .repositories
-            .get(repo_index)
-            .map(|r| r.root.display().to_string())
-            .unwrap_or_else(|| self.repo_root.display().to_string());
-        let clone_url = self
-            .repositories
-            .get(repo_index)
-            .and_then(|r| r.github_repo_slug.as_ref())
-            .map(|slug| format!("git@github.com:{slug}.git"))
-            .unwrap_or_default();
-        self.create_modal = Some(CreateModal {
-            tab,
-            repository_path_cursor: char_count(&repository_path),
-            repository_path,
-            worktree_name: String::new(),
-            worktree_name_cursor: 0,
-            checkout_kind: self.preferred_checkout_kind,
-            worktree_active_field: CreateWorktreeField::WorktreeName,
-            host_index: 0,
-            host_dropdown_open: false,
-            clone_url_cursor: char_count(&clone_url),
-            clone_url,
-            outpost_name: String::new(),
-            outpost_name_cursor: 0,
-            outpost_active_field: CreateOutpostField::CloneUrl,
-            is_creating: false,
-            creating_status: None,
-            error: None,
-        });
-        cx.notify();
-    }
-
-    fn set_create_modal_checkout_kind(
-        &mut self,
-        checkout_kind: CheckoutKind,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(modal) = self.create_modal.as_mut() else {
-            return;
-        };
-        if modal.is_creating || modal.checkout_kind == checkout_kind {
-            return;
-        }
-
-        modal.checkout_kind = checkout_kind;
-        modal.error = None;
-        self.preferred_checkout_kind = checkout_kind;
-        cx.notify();
-    }
-
-    fn close_create_modal(&mut self, cx: &mut Context<Self>) {
-        self.create_modal = None;
-        cx.notify();
-    }
-
-    fn open_delete_modal(
-        &mut self,
-        target: DeleteTarget,
-        label: String,
-        branch: String,
-        cx: &mut Context<Self>,
-    ) {
-        let worktree_index = match &target {
-            DeleteTarget::Worktree(i) => Some(*i),
-            _ => None,
-        };
-        self.delete_modal = Some(DeleteModal {
-            target,
-            label,
-            branch: worktree::short_branch(&branch),
-            has_unpushed: if worktree_index.is_some() {
-                None
-            } else {
-                Some(false)
-            },
-            delete_branch: false,
-            is_deleting: false,
-            error: None,
-        });
-        cx.notify();
-
-        // For worktrees, spawn async check for unpushed commits.
-        if let Some(worktree_index) = worktree_index
-            && let Some(wt) = self.worktrees.get(worktree_index)
-        {
-            let wt_path = wt.path.clone();
-            cx.spawn(async move |this, cx| {
-                let has_unpushed = cx
-                    .background_spawn(async move { worktree::has_unpushed_commits(&wt_path) })
-                    .await;
-                let _ = this.update(cx, |this, cx| {
-                    if let Some(modal) = this.delete_modal.as_mut() {
-                        modal.has_unpushed = Some(has_unpushed);
-                        cx.notify();
-                    }
-                });
-            })
-            .detach();
-        }
-    }
-
-    fn close_delete_modal(&mut self, cx: &mut Context<Self>) {
-        self.delete_modal = None;
-        cx.notify();
-    }
-
-    fn execute_delete(&mut self, cx: &mut Context<Self>) {
-        let Some(modal) = self.delete_modal.as_ref() else {
-            return;
-        };
-        if modal.is_deleting {
-            return;
-        }
-
-        match modal.target.clone() {
-            DeleteTarget::Worktree(index) => {
-                let Some(wt) = self.worktrees.get(index) else {
-                    self.close_delete_modal(cx);
-                    return;
-                };
-                let is_discrete_clone = wt.checkout_kind == CheckoutKind::DiscreteClone;
-                let repo_root = wt.repo_root.clone();
-                let wt_path = wt.path.clone();
-                let branch = modal.branch.clone();
-                let delete_branch = modal.delete_branch && !is_discrete_clone;
-
-                if let Some(modal) = self.delete_modal.as_mut() {
-                    modal.is_deleting = true;
-                    modal.error = None;
-                    cx.notify();
-                }
-
-                cx.spawn(async move |this, cx| {
-                    let result = if is_discrete_clone {
-                        cx.background_spawn({
-                            let wt_path = wt_path.clone();
-                            async move {
-                                fs::remove_dir_all(&wt_path).map_err(|error| {
-                                    format!(
-                                        "failed to remove discrete clone `{}`: {error}",
-                                        wt_path.display()
-                                    )
-                                })
-                            }
-                        })
-                        .await
-                    } else {
-                        cx.background_spawn({
-                            let repo_root = repo_root.clone();
-                            let wt_path = wt_path.clone();
-                            async move {
-                                worktree::remove(&repo_root, &wt_path, true)
-                                    .map_err(|error| error.to_string())
-                            }
-                        })
-                        .await
-                    };
-
-                    if let Err(e) = &result {
-                        let err_msg = e.to_string();
-                        let _ = this.update(cx, |this, cx| {
-                            if let Some(modal) = this.delete_modal.as_mut() {
-                                modal.is_deleting = false;
-                                modal.error = Some(err_msg);
-                                cx.notify();
-                            }
-                        });
-                        return;
-                    }
-
-                    if delete_branch && !branch.is_empty() {
-                        let _ = cx
-                            .background_spawn(async move {
-                                worktree::delete_branch(&repo_root, &branch)
-                            })
-                            .await;
-                    }
-
-                    let _ = this.update(cx, |this, cx| {
-                        if is_discrete_clone {
-                            this.remove_repository_checkout_root(&wt_path);
-                            this.persist_repositories(cx);
-                        }
-                        this.delete_modal = None;
-                        this.refresh_worktrees(cx);
-                        cx.notify();
-                    });
-                })
-                .detach();
-            },
-            DeleteTarget::Outpost(index) => {
-                let Some(outpost) = self.outposts.get(index) else {
-                    self.close_delete_modal(cx);
-                    return;
-                };
-                let outpost_id = outpost.outpost_id.clone();
-
-                if let Err(e) = self.outpost_store.remove(&outpost_id) {
-                    if let Some(modal) = self.delete_modal.as_mut() {
-                        modal.error = Some(e.to_string());
-                        cx.notify();
-                    }
-                    return;
-                }
-
-                self.outposts.remove(index);
-                if self.active_outpost_index == Some(index) {
-                    self.active_outpost_index = None;
-                } else if let Some(active) = self.active_outpost_index
-                    && active > index
-                {
-                    self.active_outpost_index = Some(active - 1);
-                }
-                self.delete_modal = None;
-                cx.notify();
-            },
-            DeleteTarget::Repository(index) => {
-                if index >= self.repositories.len() {
-                    self.close_delete_modal(cx);
-                    return;
-                }
-
-                let mut repositories = self.repositories.clone();
-                repositories.remove(index);
-                self.set_repositories_preserving_state(repositories);
-
-                self.delete_modal = None;
-                self.persist_repositories(cx);
-                self.refresh_worktrees(cx);
-                cx.notify();
-            },
-        }
-    }
-
-    fn update_create_worktree_modal_input(
-        &mut self,
-        input: ModalInputEvent,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(modal) = self.create_modal.as_mut() else {
-            return;
-        };
-
-        if modal.is_creating {
-            return;
-        }
-
-        match input {
-            ModalInputEvent::SetActiveField(field) => {
-                modal.worktree_active_field = field;
-                match field {
-                    CreateWorktreeField::RepositoryPath => {
-                        modal.repository_path_cursor = char_count(&modal.repository_path);
-                    },
-                    CreateWorktreeField::WorktreeName => {
-                        modal.worktree_name_cursor = char_count(&modal.worktree_name);
-                    },
-                }
-            },
-            ModalInputEvent::MoveActiveField => {
-                modal.worktree_active_field = match modal.worktree_active_field {
-                    CreateWorktreeField::RepositoryPath => CreateWorktreeField::WorktreeName,
-                    CreateWorktreeField::WorktreeName => CreateWorktreeField::RepositoryPath,
-                };
-            },
-            ModalInputEvent::Edit(action) => match modal.worktree_active_field {
-                CreateWorktreeField::RepositoryPath => {
-                    apply_text_edit_action(
-                        &mut modal.repository_path,
-                        &mut modal.repository_path_cursor,
-                        &action,
-                    );
-                },
-                CreateWorktreeField::WorktreeName => {
-                    apply_text_edit_action(
-                        &mut modal.worktree_name,
-                        &mut modal.worktree_name_cursor,
-                        &action,
-                    );
-                },
-            },
-            ModalInputEvent::ClearError => {
-                modal.error = None;
-            },
-        }
-
-        cx.notify();
-    }
-
-    fn submit_create_worktree_modal(&mut self, cx: &mut Context<Self>) {
-        let Some(modal) = self.create_modal.as_mut() else {
-            return;
-        };
-        if modal.is_creating {
-            return;
-        }
-
-        modal.error = None;
-        let repository_input = modal.repository_path.trim().to_owned();
-        let worktree_input = modal.worktree_name.trim().to_owned();
-        let checkout_kind = modal.checkout_kind;
-
-        if repository_input.is_empty() {
-            modal.error = Some("Repository path is required.".to_owned());
-            cx.notify();
-            return;
-        }
-
-        if worktree_input.is_empty() {
-            modal.error = Some("Worktree name is required.".to_owned());
-            cx.notify();
-            return;
-        }
-
-        modal.is_creating = true;
-        cx.notify();
-
-        cx.spawn(async move |this, cx| {
-            let creation = cx
-                .background_spawn(async move {
-                    create_managed_worktree(repository_input, worktree_input, checkout_kind)
-                })
-                .await;
-
-            let _ = this.update(cx, |this, cx| {
-                match creation {
-                    Ok(created) => {
-                        if created.checkout_kind == CheckoutKind::DiscreteClone {
-                            let group_key = this
-                                .repositories
-                                .iter()
-                                .find(|repository| {
-                                    repository.contains_checkout_root(&created.source_repo_root)
-                                })
-                                .map(|repository| repository.group_key.clone())
-                                .unwrap_or_else(|| {
-                                    repository_store::default_group_key_for_root(
-                                        &created.source_repo_root,
-                                    )
-                                });
-                            this.upsert_repository_checkout_root(
-                                created.worktree_path.clone(),
-                                CheckoutKind::DiscreteClone,
-                                group_key,
-                            );
-                            this.persist_repositories(cx);
-                        }
-
-                        this.notice = Some(format!(
-                            "created {} `{}` on branch `{}`",
-                            created.checkout_kind.label().to_ascii_lowercase(),
-                            created.worktree_name,
-                            created.branch_name
-                        ));
-                        this.create_modal = None;
-                        this.refresh_worktrees(cx);
-                        if let Some(index) = this
-                            .worktrees
-                            .iter()
-                            .position(|worktree| worktree.path == created.worktree_path)
-                        {
-                            this.active_worktree_index = Some(index);
-                            let _ = this.reload_changed_files();
-                            if this.ensure_selected_worktree_terminal() {
-                                this.sync_daemon_session_store(cx);
-                            }
-                            this.terminal_scroll_handle.scroll_to_bottom();
-                            this.focus_terminal_on_next_render = true;
-                        }
-                    },
-                    Err(error) => {
-                        tracing::error!("worktree creation failed: {error}");
-                        if let Some(modal) = this.create_modal.as_mut() {
-                            modal.is_creating = false;
-                            modal.creating_status = None;
-                            modal.error = Some(error);
-                        } else {
-                            this.notice = Some(error);
-                        }
-                    },
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    fn open_manage_hosts_modal(&mut self, cx: &mut Context<Self>) {
-        self.manage_hosts_modal = Some(ManageHostsModal {
-            adding: false,
-            name: String::new(),
-            name_cursor: 0,
-            hostname: String::new(),
-            hostname_cursor: 0,
-            user: String::new(),
-            user_cursor: 0,
-            active_field: ManageHostsField::Name,
-            error: None,
-        });
-        cx.notify();
-    }
-
-    fn close_manage_hosts_modal(&mut self, cx: &mut Context<Self>) {
-        self.manage_hosts_modal = None;
-        cx.notify();
-    }
-
-    fn update_manage_hosts_modal_input(
-        &mut self,
-        input: HostsModalInputEvent,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(modal) = self.manage_hosts_modal.as_mut() else {
-            return;
-        };
-
-        match input {
-            HostsModalInputEvent::SetActiveField(field) => {
-                modal.active_field = field;
-                match field {
-                    ManageHostsField::Name => modal.name_cursor = char_count(&modal.name),
-                    ManageHostsField::Hostname => {
-                        modal.hostname_cursor = char_count(&modal.hostname);
-                    },
-                    ManageHostsField::User => modal.user_cursor = char_count(&modal.user),
-                }
-            },
-            HostsModalInputEvent::MoveActiveField(reverse) => {
-                modal.active_field = match (modal.active_field, reverse) {
-                    (ManageHostsField::Name, false) => ManageHostsField::Hostname,
-                    (ManageHostsField::Hostname, false) => ManageHostsField::User,
-                    (ManageHostsField::User, false) => ManageHostsField::Name,
-                    (ManageHostsField::Name, true) => ManageHostsField::User,
-                    (ManageHostsField::Hostname, true) => ManageHostsField::Name,
-                    (ManageHostsField::User, true) => ManageHostsField::Hostname,
-                };
-            },
-            HostsModalInputEvent::Edit(action) => match modal.active_field {
-                ManageHostsField::Name => {
-                    apply_text_edit_action(&mut modal.name, &mut modal.name_cursor, &action);
-                },
-                ManageHostsField::Hostname => {
-                    apply_text_edit_action(
-                        &mut modal.hostname,
-                        &mut modal.hostname_cursor,
-                        &action,
-                    );
-                },
-                ManageHostsField::User => {
-                    apply_text_edit_action(&mut modal.user, &mut modal.user_cursor, &action);
-                },
-            },
-            HostsModalInputEvent::ClearError => {
-                modal.error = None;
-            },
-        }
-
-        cx.notify();
-    }
-
-    fn submit_add_host(&mut self, cx: &mut Context<Self>) {
-        let Some(modal) = self.manage_hosts_modal.as_mut() else {
-            return;
-        };
-        let name = modal.name.trim().to_owned();
-        let hostname = modal.hostname.trim().to_owned();
-        let user = modal.user.trim().to_owned();
-
-        if name.is_empty() || hostname.is_empty() || user.is_empty() {
-            modal.error = Some("All fields are required.".to_owned());
-            cx.notify();
-            return;
-        }
-
-        if self.remote_hosts.iter().any(|h| h.name == name) {
-            modal.error = Some(format!("Host \"{name}\" already exists."));
-            cx.notify();
-            return;
-        }
-
-        let host_config = app_config::RemoteHostConfig {
-            name: name.clone(),
-            hostname,
-            user,
-            port: 22,
-            identity_file: None,
-            remote_base_path: "~/arbor-outposts".to_owned(),
-            daemon_port: None,
-            mosh: None,
-            mosh_server_path: None,
-        };
-
-        if let Err(error) = self.app_config_store.append_remote_host(&host_config) {
-            modal.error = Some(error);
-            cx.notify();
-            return;
-        }
-
-        self.config_last_modified = None;
-        self.refresh_config_if_changed(cx);
-        self.notice = Some(format!("Host \"{name}\" added."));
-        if let Some(modal) = self.manage_hosts_modal.as_mut() {
-            modal.adding = false;
-            modal.name.clear();
-            modal.name_cursor = 0;
-            modal.hostname.clear();
-            modal.hostname_cursor = 0;
-            modal.user.clear();
-            modal.user_cursor = 0;
-            modal.error = None;
-        }
-        cx.notify();
-    }
-
-    fn remove_host_at(&mut self, host_name: String, cx: &mut Context<Self>) {
-        if let Err(error) = self.app_config_store.remove_remote_host(&host_name) {
-            self.notice = Some(error);
-            cx.notify();
-            return;
-        }
-        self.config_last_modified = None;
-        self.refresh_config_if_changed(cx);
-        self.notice = Some(format!("Host \"{host_name}\" removed."));
-        cx.notify();
-    }
-
-    fn preset_command_for_kind(&self, kind: AgentPresetKind) -> String {
-        self.agent_presets
-            .iter()
-            .find(|preset| preset.kind == kind)
-            .map(|preset| preset.command.clone())
-            .unwrap_or_else(|| kind.default_command().to_owned())
-    }
-
-    fn set_preset_command_for_kind(&mut self, kind: AgentPresetKind, command: String) {
-        if let Some(preset) = self
-            .agent_presets
-            .iter_mut()
-            .find(|preset| preset.kind == kind)
-        {
-            preset.command = command;
-            return;
-        }
-
-        self.agent_presets.push(AgentPreset { kind, command });
-        self.agent_presets.sort_by_key(|preset| {
-            AgentPresetKind::ORDER
-                .iter()
-                .position(|kind| *kind == preset.kind)
-                .unwrap_or(usize::MAX)
-        });
-    }
-
-    fn save_agent_presets(&self) -> Result<(), String> {
-        let presets = self
-            .agent_presets
-            .iter()
-            .map(|preset| app_config::AgentPresetConfig {
-                key: preset.kind.key().to_owned(),
-                command: preset.command.clone(),
-            })
-            .collect::<Vec<_>>();
-        self.app_config_store.save_agent_presets(&presets)
-    }
-
-    fn open_manage_presets_modal(&mut self, cx: &mut Context<Self>) {
-        let active_preset = self.active_preset_tab.unwrap_or(AgentPresetKind::Codex);
-        let command = self.preset_command_for_kind(active_preset);
-        self.manage_presets_modal = Some(ManagePresetsModal {
-            active_preset,
-            command_cursor: char_count(&command),
-            command,
-            error: None,
-        });
-        cx.notify();
-    }
-
-    fn close_manage_presets_modal(&mut self, cx: &mut Context<Self>) {
-        self.manage_presets_modal = None;
-        cx.notify();
-    }
-
-    fn update_manage_presets_modal_input(
-        &mut self,
-        input: PresetsModalInputEvent,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(mut modal) = self.manage_presets_modal.clone() else {
-            return;
-        };
-
-        match input {
-            PresetsModalInputEvent::SetActivePreset(kind) => {
-                modal.active_preset = kind;
-                modal.command = self.preset_command_for_kind(kind);
-                modal.command_cursor = char_count(&modal.command);
-            },
-            PresetsModalInputEvent::CycleActivePreset(reverse) => {
-                modal.active_preset = modal.active_preset.cycle(reverse);
-                modal.command = self.preset_command_for_kind(modal.active_preset);
-                modal.command_cursor = char_count(&modal.command);
-            },
-            PresetsModalInputEvent::Edit(action) => {
-                apply_text_edit_action(&mut modal.command, &mut modal.command_cursor, &action);
-            },
-            PresetsModalInputEvent::RestoreDefault => {
-                modal.command = modal.active_preset.default_command().to_owned();
-                modal.command_cursor = char_count(&modal.command);
-            },
-            PresetsModalInputEvent::ClearError => {
-                modal.error = None;
-            },
-        }
-
-        self.manage_presets_modal = Some(modal);
-        cx.notify();
-    }
-
-    fn submit_manage_presets_modal(&mut self, cx: &mut Context<Self>) {
-        let Some(modal) = self.manage_presets_modal.clone() else {
-            return;
-        };
-
-        let command = modal.command.trim().to_owned();
-        if command.is_empty() {
-            if let Some(modal_state) = self.manage_presets_modal.as_mut() {
-                modal_state.error = Some("Command is required.".to_owned());
-            }
-            cx.notify();
-            return;
-        }
-
-        self.set_preset_command_for_kind(modal.active_preset, command);
-        if let Err(error) = self.save_agent_presets() {
-            if let Some(modal_state) = self.manage_presets_modal.as_mut() {
-                modal_state.error = Some(error);
-            }
-            cx.notify();
-            return;
-        }
-
-        self.config_last_modified = None;
-        self.refresh_config_if_changed(cx);
-        self.manage_presets_modal = None;
-        self.notice = Some(format!("{} preset updated", modal.active_preset.label(),));
-        cx.notify();
-    }
-
-    fn launch_agent_preset(
-        &mut self,
-        preset: AgentPresetKind,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let command = self.preset_command_for_kind(preset).trim().to_owned();
-        self.active_preset_tab = Some(preset);
-        if command.is_empty() {
-            self.notice = Some(format!("{} preset command is empty", preset.label()));
-            cx.notify();
-            return;
-        }
-
-        let terminal_count_before = self.terminals.len();
-        self.spawn_terminal_session(window, cx);
-        if self.terminals.len() <= terminal_count_before {
-            return;
-        }
-
-        let Some(session_id) = self.terminals.last().map(|session| session.id) else {
-            return;
-        };
-
-        let input = format!("{command}\n");
-        if let Err(error) = self.write_input_to_terminal(session_id, input.as_bytes()) {
-            self.notice = Some(format!("failed to run {} preset: {error}", preset.label()));
-            cx.notify();
-            return;
-        }
-
-        if let Some(session) = self
-            .terminals
-            .iter_mut()
-            .find(|session| session.id == session_id)
-        {
-            session.last_command = Some(command);
-            session.pending_command.clear();
-            session.updated_at_unix_ms = current_unix_timestamp_millis();
-        }
-
-        self.sync_daemon_session_store(cx);
-        cx.notify();
     }
 
     fn launch_repo_preset(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -5917,452 +2434,6 @@ impl ArborWindow {
         cx.notify();
     }
 
-    fn open_manage_repo_presets_modal(
-        &mut self,
-        editing_index: Option<usize>,
-        cx: &mut Context<Self>,
-    ) {
-        let (icon, name, command) = if let Some(index) = editing_index {
-            if let Some(preset) = self.repo_presets.get(index) {
-                (
-                    preset.icon.clone(),
-                    preset.name.clone(),
-                    preset.command.clone(),
-                )
-            } else {
-                return;
-            }
-        } else {
-            (String::new(), String::new(), String::new())
-        };
-
-        self.manage_repo_presets_modal = Some(ManageRepoPresetsModal {
-            editing_index,
-            icon_cursor: char_count(&icon),
-            icon,
-            name_cursor: char_count(&name),
-            name,
-            command_cursor: char_count(&command),
-            command,
-            active_tab: RepoPresetModalTab::Edit,
-            active_field: RepoPresetModalField::Icon,
-            error: None,
-        });
-        cx.notify();
-    }
-
-    fn close_manage_repo_presets_modal(&mut self, cx: &mut Context<Self>) {
-        self.manage_repo_presets_modal = None;
-        cx.notify();
-    }
-
-    fn update_manage_repo_presets_modal_input(
-        &mut self,
-        input: RepoPresetsModalInputEvent,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(mut modal) = self.manage_repo_presets_modal.clone() else {
-            return;
-        };
-
-        match input {
-            RepoPresetsModalInputEvent::SetActiveTab(tab) => {
-                modal.active_tab = tab;
-            },
-            RepoPresetsModalInputEvent::SetActiveField(field) => {
-                if modal.active_tab != RepoPresetModalTab::Edit {
-                    self.manage_repo_presets_modal = Some(modal);
-                    cx.notify();
-                    return;
-                }
-                modal.active_field = field;
-                match field {
-                    RepoPresetModalField::Icon => modal.icon_cursor = char_count(&modal.icon),
-                    RepoPresetModalField::Name => modal.name_cursor = char_count(&modal.name),
-                    RepoPresetModalField::Command => {
-                        modal.command_cursor = char_count(&modal.command);
-                    },
-                }
-            },
-            RepoPresetsModalInputEvent::MoveActiveField(reverse) => {
-                if modal.active_tab != RepoPresetModalTab::Edit {
-                    self.manage_repo_presets_modal = Some(modal);
-                    cx.notify();
-                    return;
-                }
-                modal.active_field = if reverse {
-                    modal.active_field.prev()
-                } else {
-                    modal.active_field.next()
-                };
-            },
-            RepoPresetsModalInputEvent::Edit(action) => {
-                if modal.active_tab != RepoPresetModalTab::Edit {
-                    self.manage_repo_presets_modal = Some(modal);
-                    cx.notify();
-                    return;
-                }
-                match modal.active_field {
-                    RepoPresetModalField::Icon => {
-                        apply_text_edit_action(&mut modal.icon, &mut modal.icon_cursor, &action);
-                    },
-                    RepoPresetModalField::Name => {
-                        apply_text_edit_action(&mut modal.name, &mut modal.name_cursor, &action);
-                    },
-                    RepoPresetModalField::Command => {
-                        apply_text_edit_action(
-                            &mut modal.command,
-                            &mut modal.command_cursor,
-                            &action,
-                        );
-                    },
-                }
-            },
-            RepoPresetsModalInputEvent::ClearError => {
-                modal.error = None;
-            },
-        }
-
-        self.manage_repo_presets_modal = Some(modal);
-        cx.notify();
-    }
-
-    fn submit_manage_repo_presets_modal(&mut self, cx: &mut Context<Self>) {
-        let Some(modal) = self.manage_repo_presets_modal.clone() else {
-            return;
-        };
-
-        let name = modal.name.trim().to_owned();
-        let command = modal.command.trim().to_owned();
-        let icon = modal.icon.trim().to_owned();
-
-        if name.is_empty() {
-            if let Some(m) = self.manage_repo_presets_modal.as_mut() {
-                m.error = Some("Name is required.".to_owned());
-            }
-            cx.notify();
-            return;
-        }
-        if command.is_empty() {
-            if let Some(m) = self.manage_repo_presets_modal.as_mut() {
-                m.error = Some("Command is required.".to_owned());
-            }
-            cx.notify();
-            return;
-        }
-
-        let new_preset = RepoPreset {
-            name: name.clone(),
-            icon,
-            command,
-        };
-
-        if let Some(index) = modal.editing_index {
-            if let Some(preset) = self.repo_presets.get_mut(index) {
-                *preset = new_preset;
-            }
-        } else {
-            self.repo_presets.push(new_preset);
-        }
-
-        if let Err(error) = self.save_repo_presets() {
-            if let Some(m) = self.manage_repo_presets_modal.as_mut() {
-                m.error = Some(error);
-            }
-            cx.notify();
-            return;
-        }
-
-        self.manage_repo_presets_modal = None;
-        let action = if modal.editing_index.is_some() {
-            "updated"
-        } else {
-            "added"
-        };
-        self.notice = Some(format!("Preset \"{name}\" {action}."));
-        cx.notify();
-    }
-
-    fn delete_repo_preset(&mut self, cx: &mut Context<Self>) {
-        let Some(modal) = self.manage_repo_presets_modal.as_ref() else {
-            return;
-        };
-        let Some(index) = modal.editing_index else {
-            return;
-        };
-        let Some(preset) = self.repo_presets.get(index) else {
-            return;
-        };
-        let name = preset.name.clone();
-        let save_dir = self.active_arbor_toml_dir();
-
-        if let Err(error) = self.app_config_store.remove_repo_preset(&save_dir, &name) {
-            if let Some(m) = self.manage_repo_presets_modal.as_mut() {
-                m.error = Some(error);
-            }
-            cx.notify();
-            return;
-        }
-
-        self.repo_presets.remove(index);
-        self.manage_repo_presets_modal = None;
-        self.notice = Some(format!("Preset \"{name}\" removed."));
-        cx.notify();
-    }
-
-    fn save_repo_presets(&self) -> Result<(), String> {
-        let save_dir = self.active_arbor_toml_dir();
-        let presets: Vec<app_config::RepoPresetConfig> = self
-            .repo_presets
-            .iter()
-            .map(|p| app_config::RepoPresetConfig {
-                name: p.name.clone(),
-                icon: p.icon.clone(),
-                command: p.command.clone(),
-            })
-            .collect();
-        self.app_config_store.save_repo_presets(&save_dir, &presets)
-    }
-
-    fn update_create_outpost_modal_input(
-        &mut self,
-        input: OutpostModalInputEvent,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(modal) = self.create_modal.as_mut() else {
-            return;
-        };
-        if modal.is_creating {
-            return;
-        }
-
-        match input {
-            OutpostModalInputEvent::SetActiveField(field) => {
-                modal.host_dropdown_open = false;
-                modal.outpost_active_field = field;
-                match field {
-                    CreateOutpostField::HostSelector => {},
-                    CreateOutpostField::CloneUrl => {
-                        modal.clone_url_cursor = char_count(&modal.clone_url);
-                    },
-                    CreateOutpostField::OutpostName => {
-                        modal.outpost_name_cursor = char_count(&modal.outpost_name);
-                    },
-                }
-            },
-            OutpostModalInputEvent::MoveActiveField(reverse) => {
-                modal.host_dropdown_open = false;
-                modal.outpost_active_field = match (modal.outpost_active_field, reverse) {
-                    (CreateOutpostField::HostSelector, false) => CreateOutpostField::CloneUrl,
-                    (CreateOutpostField::CloneUrl, false) => CreateOutpostField::OutpostName,
-                    (CreateOutpostField::OutpostName, false) => CreateOutpostField::HostSelector,
-                    (CreateOutpostField::HostSelector, true) => CreateOutpostField::OutpostName,
-                    (CreateOutpostField::CloneUrl, true) => CreateOutpostField::HostSelector,
-                    (CreateOutpostField::OutpostName, true) => CreateOutpostField::CloneUrl,
-                };
-            },
-            OutpostModalInputEvent::CycleHost(reverse) => {
-                let count = self.remote_hosts.len();
-                if count > 0 {
-                    if reverse {
-                        modal.host_index = (modal.host_index + count - 1) % count;
-                    } else {
-                        modal.host_index = (modal.host_index + 1) % count;
-                    }
-                }
-            },
-            OutpostModalInputEvent::SelectHost(index) => {
-                if index < self.remote_hosts.len() {
-                    modal.host_index = index;
-                }
-                modal.host_dropdown_open = false;
-            },
-            OutpostModalInputEvent::ToggleHostDropdown => {
-                modal.host_dropdown_open = !modal.host_dropdown_open;
-                modal.outpost_active_field = CreateOutpostField::HostSelector;
-            },
-            OutpostModalInputEvent::Edit(action) => {
-                if modal.outpost_active_field == CreateOutpostField::HostSelector {
-                    return;
-                }
-                match modal.outpost_active_field {
-                    CreateOutpostField::HostSelector => return,
-                    CreateOutpostField::CloneUrl => {
-                        apply_text_edit_action(
-                            &mut modal.clone_url,
-                            &mut modal.clone_url_cursor,
-                            &action,
-                        );
-                    },
-                    CreateOutpostField::OutpostName => {
-                        apply_text_edit_action(
-                            &mut modal.outpost_name,
-                            &mut modal.outpost_name_cursor,
-                            &action,
-                        );
-                    },
-                }
-            },
-            OutpostModalInputEvent::ClearError => {
-                modal.error = None;
-            },
-        }
-
-        cx.notify();
-    }
-
-    fn submit_create_outpost_modal(&mut self, cx: &mut Context<Self>) {
-        let Some(modal) = self.create_modal.as_mut() else {
-            return;
-        };
-        if modal.is_creating {
-            return;
-        }
-
-        modal.error = None;
-        let clone_url = modal.clone_url.trim().to_owned();
-        let outpost_name = modal.outpost_name.trim().to_owned();
-        let host_index = modal.host_index;
-
-        if clone_url.is_empty() {
-            modal.error = Some("Clone URL is required.".to_owned());
-            cx.notify();
-            return;
-        }
-        if outpost_name.is_empty() {
-            modal.error = Some("Outpost name is required.".to_owned());
-            cx.notify();
-            return;
-        }
-        let Some(host) = self.remote_hosts.get(host_index).cloned() else {
-            modal.error = Some("No remote host selected.".to_owned());
-            cx.notify();
-            return;
-        };
-
-        let branch = derive_branch_name(&outpost_name);
-
-        modal.is_creating = true;
-        modal.creating_status = Some("Connecting over SSH…".to_owned());
-        cx.notify();
-
-        let local_repo_root = self
-            .selected_repository()
-            .map(|r| r.root.display().to_string())
-            .unwrap_or_default();
-        let pool = self.ssh_connection_pool.clone();
-        let host_name = host.name.clone();
-        let bg_clone_url = clone_url.clone();
-        let bg_outpost_name = outpost_name.clone();
-        let bg_branch = branch.clone();
-
-        // Channel carries either a progress status (Left) or the final result (Right).
-        enum ProvisionMsg {
-            Progress(String),
-            Done(Result<arbor_core::remote::ProvisionResult, String>),
-        }
-
-        let (msg_tx, msg_rx) = smol::channel::unbounded::<ProvisionMsg>();
-
-        cx.spawn(async move |this, cx| {
-            // Spawn the provisioning work on a background thread.
-            cx.background_spawn(async move {
-                let result = (|| {
-                    let conn_slot = pool
-                        .get_or_connect(&host)
-                        .map_err(|e| format!("SSH connection failed: {e}"))?;
-                    let guard = conn_slot
-                        .lock()
-                        .map_err(|_| "SSH connection lock poisoned".to_owned())?;
-                    let connection = guard
-                        .as_ref()
-                        .ok_or_else(|| "SSH connection not available".to_owned())?;
-                    let provisioner =
-                        arbor_ssh::provisioner::SshProvisioner::new(connection, &host);
-                    provisioner
-                        .provision_with_progress(
-                            &bg_clone_url,
-                            &bg_outpost_name,
-                            &bg_branch,
-                            |status| {
-                                let _ =
-                                    msg_tx.send_blocking(ProvisionMsg::Progress(status.to_owned()));
-                            },
-                        )
-                        .map_err(|e| format!("{e}"))
-                })();
-                let _ = msg_tx.send_blocking(ProvisionMsg::Done(result));
-            })
-            .detach();
-
-            // Read messages until we get the final result.
-            let mut result = Err("provisioning task was cancelled".to_owned());
-            while let Ok(msg) = msg_rx.recv().await {
-                match msg {
-                    ProvisionMsg::Progress(status) => {
-                        let _ = this.update(cx, |this, cx| {
-                            if let Some(modal) = this.create_modal.as_mut() {
-                                modal.creating_status = Some(status);
-                            }
-                            cx.notify();
-                        });
-                    },
-                    ProvisionMsg::Done(r) => {
-                        result = r;
-                        break;
-                    },
-                }
-            }
-
-            let _ = this.update(cx, |this, cx| {
-                match result {
-                    Ok(provision_result) => {
-                        let timestamp = current_unix_timestamp_millis().unwrap_or(0);
-                        let record = arbor_core::outpost::OutpostRecord {
-                            id: format!("outpost-{timestamp}"),
-                            host_name: host_name.clone(),
-                            local_repo_root,
-                            remote_path: provision_result.remote_path,
-                            clone_url,
-                            branch,
-                            label: outpost_name.clone(),
-                            has_remote_daemon: provision_result.has_remote_daemon,
-                        };
-                        if let Err(e) = this.outpost_store.upsert(record) {
-                            this.notice = Some(format!("outpost created but failed to save: {e}"));
-                        } else {
-                            this.notice =
-                                Some(format!("outpost `{outpost_name}` created on {host_name}"));
-                        }
-                        this.outposts =
-                            load_outpost_summaries(this.outpost_store.as_ref(), &this.remote_hosts);
-                        // Select the newly created outpost in the sidebar.
-                        let new_index = this
-                            .outposts
-                            .iter()
-                            .position(|o| o.label == outpost_name && o.host_name == host_name);
-                        if let Some(idx) = new_index {
-                            this.active_outpost_index = Some(idx);
-                        }
-                        this.create_modal = None;
-                    },
-                    Err(error) => {
-                        tracing::error!("outpost creation failed: {error}");
-                        if let Some(modal) = this.create_modal.as_mut() {
-                            modal.is_creating = false;
-                            modal.creating_status = None;
-                            modal.error = Some(error);
-                        } else {
-                            this.notice = Some(error);
-                        }
-                    },
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
     fn handle_global_key_down(
         &mut self,
         event: &KeyDownEvent,
@@ -6401,29 +2472,8 @@ impl ArborWindow {
             return;
         }
 
-        if self.welcome_local_path_active {
-            match event.keystroke.key.as_str() {
-                "escape" => {
-                    self.welcome_local_path_active = false;
-                    cx.notify();
-                    cx.stop_propagation();
-                    return;
-                },
-                "enter" | "return" => {
-                    self.submit_welcome_local_path(cx);
-                    cx.stop_propagation();
-                    return;
-                },
-                _ => {},
-            }
-            if let Some(action) = text_edit_action_for_event(event, cx) {
-                apply_text_edit_action(
-                    &mut self.welcome_local_path,
-                    &mut self.welcome_local_path_cursor,
-                    &action,
-                );
-                self.welcome_local_path_error = None;
-                cx.notify();
+        if self.worktree_notes_active && self.right_pane_tab == RightPaneTab::Notes {
+            if self.handle_worktree_notes_key_down(event, cx) {
                 cx.stop_propagation();
             }
             return;
@@ -6466,11 +2516,71 @@ impl ArborWindow {
             return;
         }
 
-        if self.show_theme_picker {
-            if event.keystroke.key.as_str() == "escape" {
-                self.show_theme_picker = false;
-                cx.stop_propagation();
+        if self.command_palette_modal.is_some() {
+            match event.keystroke.key.as_str() {
+                "escape" => {
+                    self.close_command_palette(cx);
+                    cx.stop_propagation();
+                    return;
+                },
+                "enter" | "return" => {
+                    self.execute_command_palette_selection(window, cx);
+                    cx.stop_propagation();
+                    return;
+                },
+                "up" => {
+                    self.move_command_palette_selection(-1, cx);
+                    cx.stop_propagation();
+                    return;
+                },
+                "down" => {
+                    self.move_command_palette_selection(1, cx);
+                    cx.stop_propagation();
+                    return;
+                },
+                _ => {},
+            }
+
+            if let Some(action) = text_edit_action_for_event(event, cx) {
+                if let Some(modal) = self.command_palette_modal.as_mut() {
+                    apply_text_edit_action(&mut modal.query, &mut modal.query_cursor, &action);
+                    modal.selected_index = 0;
+                }
+                self.command_palette_scroll_handle.scroll_to_item(0);
                 cx.notify();
+                cx.stop_propagation();
+            }
+            return;
+        }
+
+        if self.show_theme_picker {
+            match event.keystroke.key.as_str() {
+                "escape" => {
+                    self.show_theme_picker = false;
+                    cx.stop_propagation();
+                    cx.notify();
+                },
+                "left" => {
+                    self.move_theme_picker_selection(-1, cx);
+                    cx.stop_propagation();
+                },
+                "right" => {
+                    self.move_theme_picker_selection(1, cx);
+                    cx.stop_propagation();
+                },
+                "up" => {
+                    self.move_theme_picker_selection(-(theme_picker_columns() as isize), cx);
+                    cx.stop_propagation();
+                },
+                "down" => {
+                    self.move_theme_picker_selection(theme_picker_columns() as isize, cx);
+                    cx.stop_propagation();
+                },
+                "enter" | "return" => {
+                    self.apply_selected_theme_picker_theme(cx);
+                    cx.stop_propagation();
+                },
+                _ => {},
             }
             return;
         }
@@ -6608,6 +2718,32 @@ impl ArborWindow {
                         cx.stop_propagation();
                     }
                 },
+            }
+            return;
+        }
+
+        if self.commit_modal.is_some() {
+            match event.keystroke.key.as_str() {
+                "escape" => {
+                    self.close_commit_modal(cx);
+                    cx.stop_propagation();
+                    return;
+                },
+                "enter" | "return" => {
+                    self.submit_commit_modal(cx);
+                    cx.stop_propagation();
+                    return;
+                },
+                _ => {},
+            }
+
+            if let Some(action) = text_edit_action_for_event(event, cx) {
+                if let Some(modal) = self.commit_modal.as_mut() {
+                    apply_text_edit_action(&mut modal.message, &mut modal.message_cursor, &action);
+                    modal.error = None;
+                }
+                cx.notify();
+                cx.stop_propagation();
             }
             return;
         }
@@ -6806,6 +2942,12 @@ impl ArborWindow {
                             cx,
                         );
                     },
+                    CreateModalTab::ReviewPullRequest => {
+                        self.update_create_review_pr_modal_input(
+                            ReviewPrModalInputEvent::MoveActiveField,
+                            cx,
+                        );
+                    },
                     CreateModalTab::RemoteOutpost => {
                         self.update_create_outpost_modal_input(
                             OutpostModalInputEvent::MoveActiveField(
@@ -6832,6 +2974,7 @@ impl ArborWindow {
                 } else {
                     match active_tab {
                         CreateModalTab::LocalWorktree => self.submit_create_worktree_modal(cx),
+                        CreateModalTab::ReviewPullRequest => self.submit_create_review_pr_modal(cx),
                         CreateModalTab::RemoteOutpost => self.submit_create_outpost_modal(cx),
                     }
                 }
@@ -6863,6 +3006,16 @@ impl ArborWindow {
                     self.update_create_worktree_modal_input(ModalInputEvent::ClearError, cx);
                     self.update_create_worktree_modal_input(ModalInputEvent::Edit(action), cx);
                 },
+                CreateModalTab::ReviewPullRequest => {
+                    self.update_create_review_pr_modal_input(
+                        ReviewPrModalInputEvent::ClearError,
+                        cx,
+                    );
+                    self.update_create_review_pr_modal_input(
+                        ReviewPrModalInputEvent::Edit(action),
+                        cx,
+                    );
+                },
                 CreateModalTab::RemoteOutpost => {
                     self.update_create_outpost_modal_input(OutpostModalInputEvent::ClearError, cx);
                     self.update_create_outpost_modal_input(
@@ -6883,6 +3036,15 @@ impl ArborWindow {
     ) {
         let repo_index = self.active_repository_index.unwrap_or(0);
         self.open_create_modal(repo_index, CreateModalTab::LocalWorktree, cx);
+    }
+
+    fn action_open_command_palette(
+        &mut self,
+        _: &OpenCommandPalette,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_command_palette(cx);
     }
 
     fn action_open_add_repository(
@@ -6948,15 +3110,6 @@ impl ArborWindow {
     ) {
         let _ = self.reload_changed_files();
         cx.notify();
-    }
-
-    fn action_refresh_review_comments(
-        &mut self,
-        _: &RefreshReviewComments,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.refresh_review_threads_for_worktree(cx);
     }
 
     fn action_use_embedded_backend(
@@ -7104,8 +3257,7 @@ impl ArborWindow {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.show_theme_picker = true;
-        cx.notify();
+        self.open_theme_picker_modal(cx);
     }
 
     fn action_open_settings(&mut self, _: &OpenSettings, _: &mut Window, cx: &mut Context<Self>) {
@@ -7144,222 +3296,6 @@ impl ArborWindow {
         cx.notify();
     }
 
-    fn submit_connect_to_host(&mut self, cx: &mut Context<Self>) {
-        let Some(modal) = self.connect_to_host_modal.take() else {
-            return;
-        };
-        let addr = modal.address.trim().to_owned();
-        if addr.is_empty() {
-            self.connect_to_host_modal = Some(ConnectToHostModal {
-                address_cursor: char_count(&modal.address),
-                error: Some("Address cannot be empty".to_owned()),
-                ..modal
-            });
-            cx.notify();
-            return;
-        }
-
-        let target = match parse_connect_host_target(&addr) {
-            Ok(target) => target,
-            Err(error) => {
-                let address = modal.address;
-                self.connect_to_host_modal = Some(ConnectToHostModal {
-                    address_cursor: char_count(&address),
-                    address,
-                    error: Some(error),
-                });
-                cx.notify();
-                return;
-            },
-        };
-        let label = addr.clone();
-        connection_history::record_connection(&addr, None);
-        self.connection_history = connection_history::load_history();
-        match target {
-            ConnectHostTarget::Http { url, auth_key } => {
-                self.stop_active_ssh_daemon_tunnel();
-                let _ = self.connect_to_daemon_endpoint(&url, Some(label), Some(auth_key), cx);
-            },
-            ConnectHostTarget::Ssh { target, auth_key } => {
-                self.connect_to_ssh_daemon(target, Some(label), auth_key, cx);
-            },
-        }
-    }
-
-    fn open_settings_modal(&mut self, cx: &mut Context<Self>) {
-        let loaded = self.app_config_store.load_or_create_config();
-        let daemon_auth_token = loaded
-            .config
-            .daemon
-            .as_ref()
-            .and_then(|daemon| daemon.auth_token.clone())
-            .unwrap_or_default();
-        let daemon_bind_mode = DaemonBindMode::from_config(
-            loaded
-                .config
-                .daemon
-                .as_ref()
-                .and_then(|daemon| daemon.bind.as_deref()),
-        );
-        self.settings_modal = Some(SettingsModal {
-            active_control: SettingsControl::DaemonBindMode,
-            daemon_bind_mode,
-            initial_daemon_bind_mode: daemon_bind_mode,
-            notifications: self.notifications_enabled,
-            daemon_auth_token,
-            error: None,
-        });
-        cx.notify();
-    }
-
-    fn close_settings_modal(&mut self, cx: &mut Context<Self>) {
-        self.settings_modal = None;
-        cx.notify();
-    }
-
-    fn update_settings_modal_input(
-        &mut self,
-        input: SettingsModalInputEvent,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(mut modal) = self.settings_modal.clone() else {
-            return;
-        };
-
-        modal.error = None;
-        match input {
-            SettingsModalInputEvent::CycleControl(reverse) => {
-                modal.active_control = modal.active_control.cycle(reverse);
-            },
-            SettingsModalInputEvent::SelectDaemonBindMode(bind_mode) => {
-                modal.active_control = SettingsControl::DaemonBindMode;
-                modal.daemon_bind_mode = bind_mode;
-            },
-            SettingsModalInputEvent::ToggleActiveControl => match modal.active_control {
-                SettingsControl::DaemonBindMode => {
-                    modal.daemon_bind_mode = match modal.daemon_bind_mode {
-                        DaemonBindMode::Localhost => DaemonBindMode::AllInterfaces,
-                        DaemonBindMode::AllInterfaces => DaemonBindMode::Localhost,
-                    };
-                },
-                SettingsControl::Notifications => {
-                    modal.notifications = !modal.notifications;
-                },
-            },
-            SettingsModalInputEvent::ToggleNotifications => {
-                modal.active_control = SettingsControl::Notifications;
-                modal.notifications = !modal.notifications;
-            },
-        }
-
-        self.settings_modal = Some(modal);
-        cx.notify();
-    }
-
-    fn submit_settings_modal(&mut self, cx: &mut Context<Self>) {
-        let Some(modal) = self.settings_modal.clone() else {
-            return;
-        };
-
-        let notifications_str = if modal.notifications {
-            "true"
-        } else {
-            "false"
-        };
-        let theme_slug = self.theme_kind.slug();
-        let daemon_bind_changed = modal.daemon_bind_mode != modal.initial_daemon_bind_mode;
-
-        if let Err(error) = self.app_config_store.save_scalar_settings(&[
-            ("notifications", Some(notifications_str)),
-            ("theme", Some(theme_slug)),
-        ]) {
-            if let Some(modal_state) = self.settings_modal.as_mut() {
-                modal_state.error = Some(error);
-            }
-            cx.notify();
-            return;
-        }
-
-        if let Err(error) = self
-            .app_config_store
-            .save_daemon_bind_mode(Some(modal.daemon_bind_mode.as_config_value()))
-        {
-            if let Some(modal_state) = self.settings_modal.as_mut() {
-                modal_state.error = Some(error);
-            }
-            cx.notify();
-            return;
-        }
-
-        self.config_last_modified = None;
-        self.refresh_config_if_changed(cx);
-        self.settings_modal = None;
-        if daemon_bind_changed && daemon_url_is_local(&self.daemon_base_url) {
-            let allow_remote = modal.daemon_bind_mode == DaemonBindMode::AllInterfaces;
-            if let Some(daemon) = &self.terminal_daemon {
-                match daemon.set_bind_mode(allow_remote) {
-                    Ok(()) => {
-                        let mode = if allow_remote {
-                            "all interfaces"
-                        } else {
-                            "localhost only"
-                        };
-                        self.notice =
-                            Some(format!("Settings saved. Daemon now listening on {mode}."));
-                    },
-                    Err(error) => {
-                        tracing::warn!(%error, "failed to update daemon bind mode, restarting");
-                        self.restart_local_daemon_after_settings_save(cx);
-                        return;
-                    },
-                }
-            } else {
-                self.notice = Some("Settings saved".to_owned());
-            }
-        } else {
-            self.notice = Some("Settings saved".to_owned());
-        }
-        cx.notify();
-    }
-
-    fn restart_local_daemon_after_settings_save(&mut self, cx: &mut Context<Self>) {
-        let Some(daemon) = self.terminal_daemon.clone() else {
-            self.notice = Some("Settings saved".to_owned());
-            cx.notify();
-            return;
-        };
-        let daemon_base_url = self.daemon_base_url.clone();
-        self.notice = Some("Settings saved. Restarting daemon…".to_owned());
-        cx.notify();
-
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_spawn(async move {
-                    let _ = daemon.shutdown();
-                    std::thread::sleep(Duration::from_millis(500));
-                    try_auto_start_daemon(&daemon_base_url)
-                })
-                .await;
-
-            let _ = this.update(cx, |this, cx| {
-                if let Some(client) = result {
-                    let records = client.list_sessions().unwrap_or_default();
-                    this.terminal_daemon = Some(client);
-                    this.restore_terminal_sessions_from_records(records, true);
-                    this.refresh_worktrees(cx);
-                    this.notice = Some("Settings saved".to_owned());
-                } else {
-                    this.notice = Some(
-                        "Settings saved, but Arbor could not restart the daemon automatically."
-                            .to_owned(),
-                    );
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
     fn spawn_terminal_session_inner(&mut self, show_notice_on_missing_worktree: bool) -> bool {
         let Some(cwd) = self.selected_worktree_path().map(Path::to_path_buf) else {
             if show_notice_on_missing_worktree {
@@ -7377,15 +3313,18 @@ impl ArborWindow {
 
         let mut session = TerminalSession {
             id: session_id,
-            daemon_session_id: SessionId::new(session_id.to_string()),
+            daemon_session_id: session_id.to_string(),
             worktree_path: cwd.clone(),
             title: format!("term-{session_id}"),
             last_command: None,
             pending_command: String::new(),
             command: String::new(),
+            agent_preset: None,
+            execution_mode: None,
             state: TerminalState::Running,
             exit_code: None,
             updated_at_unix_ms: current_unix_timestamp_millis(),
+            root_pid: None,
             cols: 120,
             rows: 35,
             generation: 0,
@@ -7403,7 +3342,7 @@ impl ArborWindow {
         {
             let shell = self.embedded_shell();
             match daemon.create_or_attach(CreateOrAttachRequest {
-                session_id: SessionId::default(),
+                session_id: String::new().into(),
                 workspace_id: cwd.display().to_string().into(),
                 cwd: cwd.clone(),
                 shell,
@@ -7414,7 +3353,7 @@ impl ArborWindow {
             }) {
                 Ok(response) => {
                     let daemon_session = response.session;
-                    session.daemon_session_id = daemon_session.session_id.clone();
+                    session.daemon_session_id = daemon_session.session_id.to_string();
                     session.title = daemon_session
                         .title
                         .clone()
@@ -7426,6 +3365,7 @@ impl ArborWindow {
                     session.state = terminal_state_from_daemon_record(&daemon_session);
                     session.exit_code = daemon_session.exit_code;
                     session.updated_at_unix_ms = daemon_session.updated_at_unix_ms;
+                    session.root_pid = daemon_session.root_pid;
                     session.cols = daemon_session.cols.max(2);
                     session.rows = daemon_session.rows.max(1);
                     session.runtime = Some(local_daemon_runtime(
@@ -7453,6 +3393,7 @@ impl ArborWindow {
             let (initial_rows, initial_cols) = self.last_terminal_grid_size.unwrap_or((0, 0));
             match terminal_backend::launch_backend(backend_kind, &cwd, initial_rows, initial_cols) {
                 Ok(TerminalLaunch::Embedded(runtime)) => {
+                    session.root_pid = runtime.root_pid();
                     runtime.set_notify(self.terminal_poll_tx.clone());
                     session.command = "embedded shell".to_owned();
                     session.generation = runtime.generation();
@@ -7554,6 +3495,7 @@ impl ArborWindow {
         self.terminal_scroll_handle.scroll_to_bottom();
         window.focus(&self.terminal_focus);
         self.focus_terminal_on_next_render = false;
+        self.sync_ui_state_store(window);
         cx.notify();
     }
 
@@ -7590,15 +3532,18 @@ impl ArborWindow {
         let title = format!("ssh-{}", outpost.label);
         let mut session = TerminalSession {
             id: session_id,
-            daemon_session_id: SessionId::new(session_id.to_string()),
+            daemon_session_id: session_id.to_string(),
             worktree_path,
             title,
             last_command: None,
             pending_command: String::new(),
             command: String::new(),
+            agent_preset: None,
+            execution_mode: None,
             state: TerminalState::Running,
             exit_code: None,
             updated_at_unix_ms: current_unix_timestamp_millis(),
+            root_pid: None,
             cols: 120,
             rows: 35,
             generation: 0,
@@ -7718,6 +3663,18 @@ impl ArborWindow {
 
         self.active_terminal_by_worktree
             .insert(worktree_path, session_id);
+        if let Some(session) = self
+            .terminals
+            .iter()
+            .find(|session| session.id == session_id)
+        {
+            if let Some(preset) = session.agent_preset {
+                self.active_preset_tab = Some(preset);
+            }
+            if let Some(mode) = session.execution_mode {
+                self.execution_mode = mode;
+            }
+        }
         self.active_diff_session_id = None;
         self.active_file_view_session_id = None;
         self.logs_tab_active = false;
@@ -7842,13 +3799,7 @@ impl ArborWindow {
                 };
 
                 match diff_document {
-                    Ok((mut lines, mut file_row_indices)) => {
-                        // Inject review comments if available for this worktree
-                        let worktree_path_key = session.worktree_path.clone();
-                        if let Some(threads) = this.review_threads.get(&worktree_path_key) {
-                            inject_review_comments(&mut lines, &mut file_row_indices, threads);
-                        }
-
+                    Ok((lines, file_row_indices)) => {
                         let raw_lines = Arc::<[DiffLine]>::from(lines);
                         let raw_file_row_indices = file_row_indices;
                         let (wrapped_lines, wrapped_indices) = wrap_diff_document_lines(
@@ -7876,7 +3827,6 @@ impl ArborWindow {
                             left_text: format!("failed to build diff: {error}"),
                             right_text: String::new(),
                             kind: DiffLineKind::FileHeader,
-                            comment_meta: None,
                         }]);
                         let fallback_indices = HashMap::new();
                         let (wrapped_lines, wrapped_indices) = wrap_diff_document_lines(
@@ -7913,8515 +3863,1692 @@ impl ArborWindow {
         }
         cx.notify();
     }
+}
 
-    fn active_terminal(&self) -> Option<&TerminalSession> {
-        let worktree_path = self.selected_worktree_path()?;
-        let session_id = self.active_terminal_id_for_worktree(worktree_path)?;
+fn is_command_in_path(command: &str) -> bool {
+    use std::env;
+    let path_var = env::var_os("PATH").unwrap_or_default();
+    env::split_paths(&path_var).any(|dir| dir.join(command).is_file())
+}
 
-        self.terminals.iter().find(|session| {
-            session.id == session_id && session.worktree_path.as_path() == worktree_path
+/// Return the set of `AgentPresetKind` variants whose CLI is found in PATH.
+/// Cached for the lifetime of the process (the set of installed tools is
+/// unlikely to change while the app is running).
+fn installed_preset_kinds() -> &'static HashSet<AgentPresetKind> {
+    static INSTALLED: OnceLock<HashSet<AgentPresetKind>> = OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        AgentPresetKind::ORDER
+            .iter()
+            .copied()
+            .filter(|kind| kind.is_installed())
+            .collect()
+    })
+}
+
+fn default_agent_presets() -> Vec<AgentPreset> {
+    AgentPresetKind::ORDER
+        .iter()
+        .copied()
+        .map(|kind| AgentPreset {
+            kind,
+            command: kind.default_command().to_owned(),
+        })
+        .collect()
+}
+
+fn normalize_agent_presets(configured: &[app_config::AgentPresetConfig]) -> Vec<AgentPreset> {
+    let mut presets = default_agent_presets();
+
+    for configured_preset in configured {
+        let Some(kind) = AgentPresetKind::from_key(&configured_preset.key) else {
+            continue;
+        };
+        let command = configured_preset.command.trim();
+        if command.is_empty() {
+            continue;
+        }
+        if let Some(preset) = presets.iter_mut().find(|preset| preset.kind == kind) {
+            preset.command = command.to_owned();
+        }
+    }
+
+    presets
+}
+
+impl Drop for ArborWindow {
+    fn drop(&mut self) {
+        self.stop_active_ssh_daemon_tunnel();
+        remove_claude_code_hooks();
+        remove_pi_agent_extension();
+    }
+}
+
+impl WorktreeSummary {
+    fn from_worktree(
+        entry: &worktree::Worktree,
+        repo_root: &Path,
+        group_key: &str,
+        checkout_kind: CheckoutKind,
+    ) -> Self {
+        let label = entry
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| entry.path.display().to_string());
+
+        let branch = entry
+            .branch
+            .as_deref()
+            .map(short_branch)
+            .unwrap_or_else(|| "-".to_owned());
+        let is_primary_checkout = entry.path.as_path() == repo_root;
+
+        let last_activity_unix_ms = worktree::last_git_activity_ms(&entry.path);
+
+        Self {
+            group_key: group_key.to_owned(),
+            checkout_kind,
+            repo_root: repo_root.to_path_buf(),
+            path: entry.path.clone(),
+            label,
+            branch,
+            is_primary_checkout,
+            pr_number: None,
+            pr_url: None,
+            pr_details: None,
+            branch_divergence: branch_divergence_summary(&entry.path),
+            diff_summary: None,
+            detected_ports: Vec::new(),
+            recent_turns: Vec::new(),
+            stuck_turn_count: 0,
+            recent_agent_sessions: Vec::new(),
+            agent_state: None,
+            agent_task: None,
+            last_activity_unix_ms,
+        }
+    }
+}
+
+impl RepositorySummary {
+    fn from_checkout_roots(
+        root: PathBuf,
+        group_key: String,
+        checkout_roots: Vec<repository_store::RepositoryCheckoutRoot>,
+    ) -> Self {
+        let label = repository_display_name(&root);
+        let github_repo_slug = github_repo_slug_for_repo(&root);
+        let avatar_url = github_repo_slug
+            .as_ref()
+            .and_then(|repo_slug| github_avatar_url_for_repo_slug(repo_slug));
+
+        Self {
+            group_key,
+            root,
+            checkout_roots,
+            label,
+            avatar_url,
+            github_repo_slug,
+        }
+    }
+
+    fn contains_checkout_root(&self, root: &Path) -> bool {
+        self.checkout_roots
+            .iter()
+            .any(|checkout_root| checkout_root.path == root)
+    }
+}
+
+impl EntityInputHandler for ArborWindow {
+    fn text_for_range(
+        &mut self,
+        _range: std::ops::Range<usize>,
+        _adjusted_range: &mut Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        None
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        Some(UTF16Selection {
+            range: 0..0,
+            reversed: false,
         })
     }
 
-    fn write_input_to_terminal(&mut self, session_id: u64, input: &[u8]) -> Result<(), String> {
-        if input.is_empty() {
-            return Ok(());
-        }
-
-        let Some(index) = self
-            .terminals
-            .iter()
-            .position(|session| session.id == session_id)
-        else {
-            return Ok(());
-        };
-
-        let Some(runtime) = self.terminals[index].runtime.clone() else {
-            return Ok(());
-        };
-
-        {
-            let session = &self.terminals[index];
-            runtime.write_input(session, input)?;
-        }
-
-        self.terminals[index].updated_at_unix_ms = current_unix_timestamp_millis();
-        Ok(())
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<std::ops::Range<usize>> {
+        self.ime_marked_text.as_ref().map(|text| {
+            let len: usize = text.encode_utf16().count();
+            0..len
+        })
     }
 
-    fn clear_terminal_selection(&mut self) {
-        self.terminal_selection = None;
-        self.terminal_selection_drag_anchor = None;
-    }
-
-    fn clear_terminal_selection_for_session(&mut self, session_id: u64) {
-        if self
-            .terminal_selection
-            .as_ref()
-            .is_some_and(|selection| selection.session_id == session_id)
-        {
-            self.clear_terminal_selection();
-        }
-    }
-
-    fn terminal_display_lines_for_session(&self, session_id: u64) -> Vec<String> {
-        let Some(session) = self
-            .terminals
-            .iter()
-            .find(|session| session.id == session_id)
-        else {
-            return vec![String::new()];
-        };
-
-        terminal_display_lines(session)
-    }
-
-    fn terminal_selection_for_session(&self, session_id: u64) -> Option<&TerminalSelection> {
-        self.terminal_selection
-            .as_ref()
-            .filter(|selection| selection.session_id == session_id)
-    }
-
-    fn handle_terminal_output_mouse_down(
-        &mut self,
-        event: &MouseDownEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if event.button != MouseButton::Left {
-            return;
-        }
-
-        let Some(session_id) = self.active_terminal_id_for_selected_worktree() else {
-            return;
-        };
-
-        let lines = self.terminal_display_lines_for_session(session_id);
-        let line_height = terminal_line_height_px(cx);
-        let cell_width = terminal_cell_width_px(cx);
-        let point = terminal_grid_position_from_pointer(
-            event.position,
-            self.terminal_scroll_handle.bounds(),
-            self.terminal_scroll_handle.offset(),
-            line_height,
-            cell_width,
-            lines.len(),
-        );
-
-        let Some(point) = point else {
-            return;
-        };
-
-        if event.click_count >= 3 {
-            if let Some((start, end)) = terminal_line_bounds(&lines, point) {
-                self.terminal_selection = Some(TerminalSelection {
-                    session_id,
-                    anchor: start,
-                    head: end,
-                });
-            } else {
-                self.clear_terminal_selection_for_session(session_id);
-            }
-            self.terminal_selection_drag_anchor = None;
-        } else if event.click_count == 2 {
-            if let Some((start, end)) = terminal_token_bounds(&lines, point) {
-                self.terminal_selection = Some(TerminalSelection {
-                    session_id,
-                    anchor: start,
-                    head: end,
-                });
-            } else {
-                self.clear_terminal_selection_for_session(session_id);
-            }
-            self.terminal_selection_drag_anchor = None;
-        } else {
-            self.terminal_selection = Some(TerminalSelection {
-                session_id,
-                anchor: point,
-                head: point,
-            });
-            self.terminal_selection_drag_anchor = Some(point);
-        }
-
-        window.focus(&self.terminal_focus);
-        self.focus_terminal_on_next_render = false;
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.ime_marked_text = None;
         cx.notify();
     }
 
-    fn handle_terminal_output_mouse_move(
+    fn replace_text_in_range(
         &mut self,
-        event: &MouseMoveEvent,
-        _: &mut Window,
+        _range: Option<std::ops::Range<usize>>,
+        text: &str,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if event.pressed_button != Some(MouseButton::Left) {
-            return;
-        }
-
-        let Some(session_id) = self.active_terminal_id_for_selected_worktree() else {
-            return;
-        };
-        let Some(anchor) = self.terminal_selection_drag_anchor else {
-            return;
-        };
-
-        let lines = self.terminal_display_lines_for_session(session_id);
-        let line_height = terminal_line_height_px(cx);
-        let cell_width = terminal_cell_width_px(cx);
-        let Some(head) = terminal_grid_position_from_pointer(
-            event.position,
-            self.terminal_scroll_handle.bounds(),
-            self.terminal_scroll_handle.offset(),
-            line_height,
-            cell_width,
-            lines.len(),
-        ) else {
-            return;
-        };
-
-        self.terminal_selection = Some(TerminalSelection {
-            session_id,
-            anchor,
-            head,
-        });
-        cx.notify();
-    }
-
-    fn handle_terminal_output_mouse_up(
-        &mut self,
-        event: &MouseUpEvent,
-        _: &mut Window,
-        _: &mut Context<Self>,
-    ) {
-        if event.button == MouseButton::Left {
-            self.terminal_selection_drag_anchor = None;
-        }
-    }
-
-    fn track_terminal_command_input(&mut self, session_id: u64, keystroke: &Keystroke) {
-        let Some(session) = self
-            .terminals
-            .iter_mut()
-            .find(|session| session.id == session_id)
-        else {
-            return;
-        };
-
-        track_terminal_command_keystroke(session, keystroke);
-    }
-
-    fn copy_terminal_content_to_clipboard(&mut self, session_id: u64, cx: &mut Context<Self>) {
-        let Some(session) = self
-            .terminals
-            .iter()
-            .find(|session| session.id == session_id)
-        else {
-            return;
-        };
-
-        let clipboard_text =
-            if let Some(selection) = self.terminal_selection_for_session(session_id) {
-                let selected = terminal_selection_text(
-                    &self.terminal_display_lines_for_session(session_id),
-                    selection,
-                );
-                if !selected.is_empty() {
-                    selected
-                } else if !session.pending_command.trim().is_empty() {
-                    session.pending_command.clone()
-                } else {
-                    session.output.clone()
-                }
-            } else if !session.pending_command.trim().is_empty() {
-                session.pending_command.clone()
-            } else {
-                session.output.clone()
-            };
-        if clipboard_text.is_empty() {
-            return;
-        }
-
-        cx.write_to_clipboard(ClipboardItem::new_string(clipboard_text));
-    }
-
-    fn append_pasted_text_to_pending_command(&mut self, session_id: u64, text: &str) {
-        let Some(session) = self
-            .terminals
-            .iter_mut()
-            .find(|session| session.id == session_id)
-        else {
-            return;
-        };
-
-        session.pending_command.push_str(text);
-    }
-
-    fn paste_clipboard_into_terminal(&mut self, session_id: u64, cx: &mut Context<Self>) {
-        let Some(clipboard_item) = cx.read_from_clipboard() else {
-            return;
-        };
-        let Some(text) = clipboard_item.text() else {
-            return;
-        };
+        self.ime_marked_text = None;
         if text.is_empty() {
-            return;
-        }
-
-        self.append_pasted_text_to_pending_command(session_id, &text);
-        if let Err(error) = self.write_input_to_terminal(session_id, text.as_bytes()) {
-            self.notice = Some(format!("failed to paste into terminal: {error}"));
-        }
-    }
-
-    fn handle_terminal_key_down(
-        &mut self,
-        event: &KeyDownEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.quit_overlay_until.is_some() {
-            // The quit overlay is modal — suppress terminal input entirely so
-            // the key event propagates up to handle_global_key_down which
-            // handles Enter/Escape for the overlay.
-            return;
-        }
-
-        if self.right_pane_search_active
-            || self.create_modal.is_some()
-            || self.settings_modal.is_some()
-            || self.github_auth_modal.is_some()
-            || self.delete_modal.is_some()
-            || self.manage_hosts_modal.is_some()
-            || self.manage_presets_modal.is_some()
-            || self.manage_repo_presets_modal.is_some()
-            || self.daemon_auth_modal.is_some()
-            || self.start_daemon_modal
-            || self.connect_to_host_modal.is_some()
-            || self.show_theme_picker
-        {
-            return;
-        }
-
-        if self.pending_comment.is_some() {
-            match event.keystroke.key.as_str() {
-                "escape" => {
-                    self.cancel_inline_comment(cx);
-                    cx.stop_propagation();
-                    return;
-                },
-                "enter" | "return" => {
-                    self.submit_inline_comment(cx);
-                    cx.stop_propagation();
-                    return;
-                },
-                _ => {},
-            }
-            if let Some(action) = text_edit_action_for_event(event, cx) {
-                if let Some(pc) = self.pending_comment.as_mut() {
-                    apply_text_edit_action(&mut pc.text, &mut pc.text_cursor, &action);
-                }
-                cx.notify();
-                cx.stop_propagation();
-            }
-            return;
-        }
-
-        let active_tab = self.active_center_tab_for_selected_worktree();
-
-        // Handle file view editing before terminal input
-        if matches!(active_tab, Some(CenterTab::FileView(_))) {
-            if self.handle_file_view_key_down(event, cx) {
-                cx.stop_propagation();
-            }
-            return;
-        }
-
-        let Some(CenterTab::Terminal(active_terminal_id)) = active_tab else {
-            return;
-        };
-
-        if let Some(command) = terminal_keys::platform_command_for_keystroke(&event.keystroke) {
-            match command {
-                terminal_keys::TerminalPlatformCommand::Copy => {
-                    self.copy_terminal_content_to_clipboard(active_terminal_id, cx);
-                },
-                terminal_keys::TerminalPlatformCommand::Paste => {
-                    self.paste_clipboard_into_terminal(active_terminal_id, cx);
-                },
-            }
-            cx.stop_propagation();
             cx.notify();
             return;
         }
-
-        self.clear_terminal_selection_for_session(active_terminal_id);
-
-        let terminal_modes = self
-            .terminals
-            .iter()
-            .find(|session| session.id == active_terminal_id)
-            .map(|session| session.modes)
-            .unwrap_or_default();
-
-        let Some(input) =
-            terminal_keys::terminal_bytes_from_keystroke(&event.keystroke, terminal_modes)
-        else {
-            // No bytes for this key — let the event propagate to the IME /
-            // InputHandler so composed characters arrive via
-            // `replace_text_in_range`.
+        // Suppress all text input while the quit overlay is showing.
+        if self.quit_overlay_until.is_some() {
+            return;
+        }
+        // When a modal with a text field is open, route IME text there instead
+        if let Some(ref mut modal) = self.daemon_auth_modal {
+            modal.token.push_str(text);
+            modal.error = None;
+            cx.notify();
+            return;
+        }
+        if let Some(ref mut modal) = self.connect_to_host_modal {
+            modal.address.push_str(text);
+            modal.error = None;
+            cx.notify();
+            return;
+        }
+        if let Some(ref mut modal) = self.command_palette_modal {
+            modal.query.push_str(text);
+            modal.selected_index = 0;
+            self.command_palette_scroll_handle.scroll_to_item(0);
+            cx.notify();
+            return;
+        }
+        if let Some(ref mut modal) = self.commit_modal {
+            modal.message.push_str(text);
+            modal.error = None;
+            cx.notify();
+            return;
+        }
+        if self.welcome_clone_url_active {
+            self.welcome_clone_url.push_str(text);
+            self.welcome_clone_error = None;
+            cx.notify();
+            return;
+        }
+        if self.worktree_notes_active && self.right_pane_tab == RightPaneTab::Notes {
+            self.insert_text_into_selected_worktree_notes(text);
+            cx.notify();
+            return;
+        }
+        let Some(session_id) = self.active_terminal_id_for_selected_worktree() else {
             return;
         };
-
-        self.track_terminal_command_input(active_terminal_id, &event.keystroke);
-        if let Err(error) = self.write_input_to_terminal(active_terminal_id, &input) {
+        self.append_pasted_text_to_pending_command(session_id, text);
+        if let Err(error) = self.write_input_to_terminal(session_id, text.as_bytes()) {
             self.notice = Some(format!("failed to write to terminal: {error}"));
         }
-        cx.stop_propagation();
         cx.notify();
     }
 
-    fn focus_terminal_panel(
+    fn replace_and_mark_text_in_range(
         &mut self,
-        _: &MouseDownEvent,
-        window: &mut Window,
-        _: &mut Context<Self>,
-    ) {
-        self.right_pane_search_active = false;
-        window.focus(&self.terminal_focus);
-        self.focus_terminal_on_next_render = false;
-    }
-
-    fn handle_file_view_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
-        // Always handle Cmd+S for save, even when not in editing mode
-        if event.keystroke.modifiers.platform && event.keystroke.key.as_str() == "s" {
-            self.save_active_file_view(cx);
-            return true;
-        }
-        if !self.file_view_editing {
-            return false;
-        }
-        let Some(session_id) = self.active_file_view_session_id else {
-            return false;
-        };
-        let Some(session) = self
-            .file_view_sessions
-            .iter_mut()
-            .find(|s| s.id == session_id)
-        else {
-            return false;
-        };
-        let FileViewContent::Text {
-            raw_lines, dirty, ..
-        } = &mut session.content
-        else {
-            return false;
-        };
-        if raw_lines.is_empty() {
-            return false;
-        }
-
-        let cursor = &mut session.cursor;
-
-        // Skip platform combos (Cmd+S handled above)
-        if event.keystroke.modifiers.platform {
-            return false;
-        }
-
-        match event.keystroke.key.as_str() {
-            "escape" => {
-                self.file_view_editing = false;
-                cx.notify();
-                return true;
-            },
-            "backspace" => {
-                if cursor.col > 0 {
-                    let line = &mut raw_lines[cursor.line];
-                    let byte_pos = char_to_byte_offset(line, cursor.col);
-                    let prev_byte = char_to_byte_offset(line, cursor.col - 1);
-                    line.replace_range(prev_byte..byte_pos, "");
-                    cursor.col -= 1;
-                } else if cursor.line > 0 {
-                    let removed = raw_lines.remove(cursor.line);
-                    cursor.line -= 1;
-                    cursor.col = raw_lines[cursor.line].chars().count();
-                    raw_lines[cursor.line].push_str(&removed);
-                }
-                *dirty = true;
-                cx.notify();
-                return true;
-            },
-            "delete" => {
-                let line_char_count = raw_lines[cursor.line].chars().count();
-                if cursor.col < line_char_count {
-                    let line = &mut raw_lines[cursor.line];
-                    let byte_pos = char_to_byte_offset(line, cursor.col);
-                    let next_byte = char_to_byte_offset(line, cursor.col + 1);
-                    line.replace_range(byte_pos..next_byte, "");
-                } else if cursor.line + 1 < raw_lines.len() {
-                    let next = raw_lines.remove(cursor.line + 1);
-                    raw_lines[cursor.line].push_str(&next);
-                }
-                *dirty = true;
-                cx.notify();
-                return true;
-            },
-            "enter" | "return" => {
-                let line = &raw_lines[cursor.line];
-                let byte_pos = char_to_byte_offset(line, cursor.col);
-                let rest = line[byte_pos..].to_owned();
-                raw_lines[cursor.line].truncate(byte_pos);
-                cursor.line += 1;
-                cursor.col = 0;
-                raw_lines.insert(cursor.line, rest);
-                *dirty = true;
-                cx.notify();
-                return true;
-            },
-            "left" => {
-                if cursor.col > 0 {
-                    cursor.col -= 1;
-                } else if cursor.line > 0 {
-                    cursor.line -= 1;
-                    cursor.col = raw_lines[cursor.line].chars().count();
-                }
-                cx.notify();
-                return true;
-            },
-            "right" => {
-                let line_len = raw_lines[cursor.line].chars().count();
-                if cursor.col < line_len {
-                    cursor.col += 1;
-                } else if cursor.line + 1 < raw_lines.len() {
-                    cursor.line += 1;
-                    cursor.col = 0;
-                }
-                cx.notify();
-                return true;
-            },
-            "up" => {
-                if cursor.line > 0 {
-                    cursor.line -= 1;
-                    let line_len = raw_lines[cursor.line].chars().count();
-                    cursor.col = cursor.col.min(line_len);
-                }
-                cx.notify();
-                return true;
-            },
-            "down" => {
-                if cursor.line + 1 < raw_lines.len() {
-                    cursor.line += 1;
-                    let line_len = raw_lines[cursor.line].chars().count();
-                    cursor.col = cursor.col.min(line_len);
-                }
-                cx.notify();
-                return true;
-            },
-            "tab" => {
-                let line = &mut raw_lines[cursor.line];
-                let byte_pos = char_to_byte_offset(line, cursor.col);
-                line.insert_str(byte_pos, "    ");
-                cursor.col += 4;
-                *dirty = true;
-                cx.notify();
-                return true;
-            },
-            "home" => {
-                cursor.col = 0;
-                cx.notify();
-                return true;
-            },
-            "end" => {
-                cursor.col = raw_lines[cursor.line].chars().count();
-                cx.notify();
-                return true;
-            },
-            _ => {},
-        }
-
-        if event.keystroke.modifiers.control || event.keystroke.modifiers.alt {
-            return false;
-        }
-
-        // Character input
-        if let Some(key_char) = event.keystroke.key_char.as_ref() {
-            let line = &mut raw_lines[cursor.line];
-            let byte_pos = char_to_byte_offset(line, cursor.col);
-            line.insert_str(byte_pos, key_char);
-            cursor.col += key_char.chars().count();
-            *dirty = true;
-            cx.notify();
-            return true;
-        }
-
-        false
-    }
-
-    fn save_active_file_view(&mut self, cx: &mut Context<Self>) {
-        let Some(session_id) = self.active_file_view_session_id else {
-            return;
-        };
-        let Some(session) = self.file_view_sessions.iter().find(|s| s.id == session_id) else {
-            return;
-        };
-        let FileViewContent::Text {
-            raw_lines, dirty, ..
-        } = &session.content
-        else {
-            return;
-        };
-        if !dirty {
-            return;
-        }
-        let content = raw_lines.join("\n");
-        let full_path = session.worktree_path.join(&session.file_path);
-        let ext = session
-            .file_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_lowercase();
-        let raw_clone = raw_lines.clone();
-        match fs::write(&full_path, &content) {
-            Ok(()) => {
-                let highlighted = highlight_lines_with_syntect(&raw_clone, &ext, 0xc8ccd4);
-                if let Some(s) = self
-                    .file_view_sessions
-                    .iter_mut()
-                    .find(|s| s.id == session_id)
-                    && let FileViewContent::Text {
-                        highlighted: h,
-                        dirty: d,
-                        ..
-                    } = &mut s.content
-                {
-                    *h = Arc::from(highlighted);
-                    *d = false;
-                }
-            },
-            Err(error) => {
-                self.notice = Some(format!("Failed to save: {error}"));
-            },
-        }
-        cx.notify();
-    }
-
-    fn clamp_pane_widths_for_workspace(&mut self, workspace_width: f32) {
-        let available_side_width =
-            (workspace_width - (2. * PANE_RESIZE_HANDLE_WIDTH) - PANE_CENTER_MIN_WIDTH).max(0.);
-
-        self.left_pane_width = self
-            .left_pane_width
-            .clamp(LEFT_PANE_MIN_WIDTH, LEFT_PANE_MAX_WIDTH);
-        self.right_pane_width = self
-            .right_pane_width
-            .clamp(RIGHT_PANE_MIN_WIDTH, RIGHT_PANE_MAX_WIDTH);
-
-        let side_total = self.left_pane_width + self.right_pane_width;
-        if side_total <= available_side_width {
-            return;
-        }
-
-        let mut overflow = side_total - available_side_width;
-
-        let right_reducible = (self.right_pane_width - RIGHT_PANE_MIN_WIDTH).max(0.);
-        let right_reduction = overflow.min(right_reducible);
-        self.right_pane_width -= right_reduction;
-        overflow -= right_reduction;
-
-        if overflow <= 0. {
-            return;
-        }
-
-        let left_reducible = (self.left_pane_width - LEFT_PANE_MIN_WIDTH).max(0.);
-        let left_reduction = overflow.min(left_reducible);
-        self.left_pane_width -= left_reduction;
-    }
-
-    fn estimated_diff_wrap_columns(&self, cell_width_px: f32) -> usize {
-        let fallback_window_width = self.left_pane_width
-            + self.right_pane_width
-            + PANE_CENTER_MIN_WIDTH
-            + (2. * PANE_RESIZE_HANDLE_WIDTH);
-        let window_width = self
-            .last_persisted_ui_state
-            .window
-            .map(|window| window.width as f32)
-            .unwrap_or(fallback_window_width)
-            .max(600.);
-        self.estimated_diff_wrap_columns_for_window_width(window_width, cell_width_px)
-    }
-
-    fn estimated_diff_wrap_columns_for_window_width(
-        &self,
-        window_width: f32,
-        cell_width_px: f32,
-    ) -> usize {
-        let center_width = (window_width
-            - self.left_pane_width
-            - self.right_pane_width
-            - (2. * PANE_RESIZE_HANDLE_WIDTH))
-            .max(PANE_CENTER_MIN_WIDTH);
-        let list_width =
-            (center_width - DIFF_ZONEMAP_WIDTH_PX - (DIFF_ZONEMAP_MARGIN_PX * 2.)).max(80.);
-        self.estimated_diff_wrap_columns_for_list_width(list_width, cell_width_px)
-    }
-
-    fn estimated_diff_wrap_columns_for_list_width(
-        &self,
-        list_width: f32,
-        cell_width_px: f32,
-    ) -> usize {
-        let column_width = (list_width / 2.).max(40.);
-        let safe_cell_width = cell_width_px.max(1.);
-        let line_number_width = (DIFF_LINE_NUMBER_WIDTH_CHARS as f32 * safe_cell_width) + 12.;
-        let marker_width = 10.;
-        let horizontal_padding = 16.;
-        let horizontal_gaps = 16.;
-        let text_width = (column_width
-            - line_number_width
-            - marker_width
-            - horizontal_padding
-            - horizontal_gaps)
-            .max(safe_cell_width);
-        let estimated_columns = (text_width / safe_cell_width).floor() as usize;
-        estimated_columns.saturating_add(2).clamp(12, 320)
-    }
-
-    fn live_diff_list_width_px(&self) -> Option<f32> {
-        let width = self
-            .diff_scroll_handle
-            .0
-            .borrow()
-            .base_handle
-            .bounds()
-            .size
-            .width
-            .to_f64() as f32;
-        (width.is_finite() && width >= 80.).then_some(width)
-    }
-
-    fn rewrap_diff_sessions_if_needed(&mut self, wrap_columns: usize) {
-        for session in &mut self.diff_sessions {
-            if session.is_loading
-                || session.raw_lines.is_empty()
-                || session.wrapped_columns == wrap_columns
-            {
-                continue;
-            }
-
-            let (wrapped_lines, wrapped_indices) = wrap_diff_document_lines(
-                session.raw_lines.as_ref(),
-                &session.raw_file_row_indices,
-                wrap_columns,
-            );
-            session.lines = Arc::<[DiffLine]>::from(wrapped_lines);
-            session.file_row_indices = wrapped_indices;
-            session.wrapped_columns = wrap_columns;
-        }
-    }
-
-    fn ui_state_snapshot(&self, window: &Window) -> ui_state_store::UiState {
-        let bounds = window.window_bounds().get_bounds();
-        let x = f32::from(bounds.origin.x).round() as i32;
-        let y = f32::from(bounds.origin.y).round() as i32;
-        let width = f32::from(bounds.size.width).round().max(1.) as u32;
-        let height = f32::from(bounds.size.height).round().max(1.) as u32;
-
-        ui_state_store::UiState {
-            left_pane_width: Some(self.left_pane_width.round() as i32),
-            right_pane_width: Some(self.right_pane_width.round() as i32),
-            window: Some(ui_state_store::WindowGeometry {
-                x,
-                y,
-                width,
-                height,
-            }),
-            left_pane_visible: Some(self.left_pane_visible),
-            preferred_checkout_kind: Some(self.preferred_checkout_kind),
-            sidebar_order: self.sidebar_order.clone(),
-        }
-    }
-
-    fn sync_ui_state_store(&mut self, window: &Window) {
-        let next_state = self.ui_state_snapshot(window);
-        if self.last_persisted_ui_state == next_state {
-            return;
-        }
-
-        match self.ui_state_store.save(&next_state) {
-            Ok(()) => {
-                self.last_persisted_ui_state = next_state;
-                self.last_ui_state_error = None;
-            },
-            Err(error) => {
-                if self.last_ui_state_error.as_deref() != Some(error.as_str()) {
-                    self.notice = Some(format!("failed to persist UI state: {error}"));
-                    self.last_ui_state_error = Some(error);
-                }
-            },
-        }
-    }
-
-    fn build_sidebar_order_for_group(
-        &self,
-        group_key: &str,
-        repo_root: &Path,
-    ) -> Vec<SidebarItemId> {
-        let worktree_ids: Vec<SidebarItemId> = self
-            .worktrees
-            .iter()
-            .filter(|w| w.group_key == group_key)
-            .map(|w| SidebarItemId::Worktree(w.path.clone()))
-            .collect();
-        let outpost_ids: Vec<SidebarItemId> = self
-            .outposts
-            .iter()
-            .filter(|o| o.repo_root == repo_root)
-            .map(|o| SidebarItemId::Outpost(o.outpost_id.clone()))
-            .collect();
-
-        let all_current: HashSet<_> = worktree_ids.iter().chain(&outpost_ids).cloned().collect();
-
-        if let Some(saved) = self.sidebar_order.get(group_key) {
-            let mut ordered: Vec<SidebarItemId> = saved
-                .iter()
-                .filter(|id| all_current.contains(id))
-                .cloned()
-                .collect();
-            let ordered_set: HashSet<_> = ordered.iter().cloned().collect();
-            for id in worktree_ids.into_iter().chain(outpost_ids) {
-                if !ordered_set.contains(&id) {
-                    ordered.push(id);
-                }
-            }
-            ordered
-        } else {
-            worktree_ids.into_iter().chain(outpost_ids).collect()
-        }
-    }
-
-    fn handle_sidebar_item_drop(
-        &mut self,
-        source_id: &SidebarItemId,
-        insert_before: usize,
-        group_key: &str,
-        repo_root: &Path,
-        window: &mut Window,
+        _range: Option<std::ops::Range<usize>>,
+        new_text: &str,
+        _new_selected_range: Option<std::ops::Range<usize>>,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let mut items = self.build_sidebar_order_for_group(group_key, repo_root);
-
-        let Some(source_pos) = items.iter().position(|id| id == source_id) else {
-            return;
-        };
-
-        // Compute effective insertion index after removal
-        let target_pos = if insert_before > source_pos {
-            insert_before - 1
+        self.ime_marked_text = if new_text.is_empty() {
+            None
         } else {
-            insert_before
+            Some(new_text.to_owned())
         };
-
-        if source_pos == target_pos {
-            return;
-        }
-
-        let item = items.remove(source_pos);
-        items.insert(target_pos, item);
-
-        self.sidebar_order.insert(group_key.to_owned(), items);
-        self.sync_ui_state_store(window);
         cx.notify();
     }
 
-    fn handle_pane_divider_drag_move(
+    fn bounds_for_range(
         &mut self,
-        event: &DragMoveEvent<DraggedPaneDivider>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let workspace_width = f32::from(event.bounds.size.width);
-        let available_side_width =
-            (workspace_width - (2. * PANE_RESIZE_HANDLE_WIDTH) - PANE_CENTER_MIN_WIDTH).max(0.);
+        _range_utf16: std::ops::Range<usize>,
+        _element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        None
+    }
 
-        match event.drag(cx) {
-            DraggedPaneDivider::Left => {
-                let proposed = f32::from(event.event.position.x - event.bounds.left());
-                let max_width =
-                    (available_side_width - self.right_pane_width).min(LEFT_PANE_MAX_WIDTH);
-                let min_width = LEFT_PANE_MIN_WIDTH.min(max_width);
-                self.left_pane_width = proposed.clamp(min_width, max_width);
-            },
-            DraggedPaneDivider::Right => {
-                let proposed = f32::from(event.bounds.right() - event.event.position.x);
-                let max_width =
-                    (available_side_width - self.left_pane_width).min(RIGHT_PANE_MAX_WIDTH);
-                let min_width = RIGHT_PANE_MIN_WIDTH.min(max_width);
-                self.right_pane_width = proposed.clamp(min_width, max_width);
-            },
+    fn character_index_for_point(
+        &mut self,
+        _point: gpui::Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
+}
+
+impl Render for ArborWindow {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Update window title to reflect connected daemon
+        let title = match &self.connected_daemon_label {
+            Some(label) => format!("Arbor \u{2014} {label}"),
+            None => "Arbor".to_owned(),
+        };
+        window.set_window_title(&title);
+
+        self.window_is_active = window.is_window_active();
+        if self.focus_terminal_on_next_render && self.active_terminal().is_some() {
+            window.focus(&self.terminal_focus);
+            self.focus_terminal_on_next_render = false;
         }
-
+        let workspace_width = f32::from(window.window_bounds().get_bounds().size.width);
         self.clamp_pane_widths_for_workspace(workspace_width);
         self.sync_ui_state_store(window);
-        cx.stop_propagation();
-        cx.notify();
-    }
 
-    fn render_pane_resize_handle(
-        &self,
-        id: &'static str,
-        divider: DraggedPaneDivider,
-        theme: ThemePalette,
-    ) -> impl IntoElement {
-        div()
-            .id(id)
-            .w(px(PANE_RESIZE_HANDLE_WIDTH))
-            .h_full()
-            .flex_none()
-            .cursor_col_resize()
-            .on_drag(divider, |dragged_divider, _, _, cx| {
-                cx.stop_propagation();
-                cx.new(|_| *dragged_divider)
-            })
-            .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                cx.stop_propagation();
-            })
-            .child(div().w(px(1.)).h_full().mx_auto().bg(rgb(theme.border)))
-            .occlude()
-    }
-
-    fn render_top_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme();
-        let repository = self.selected_repository_label();
-        let branch = self
-            .active_worktree()
-            .map(|worktree| worktree.branch.clone())
-            .unwrap_or_else(|| "no-worktree".to_owned());
-        let centered_title = format!("{repository} · {branch}");
-        let back_enabled = !self.worktree_nav_back.is_empty();
-        let forward_enabled = !self.worktree_nav_forward.is_empty();
-        let sidebar_hidden = !self.left_pane_visible;
-        let worktree_quick_actions_enabled = self.selected_local_worktree_path().is_some();
-        let worktree_quick_actions_open =
-            worktree_quick_actions_enabled && self.top_bar_quick_actions_open;
-        let github_saved_token = self.has_persisted_github_token();
-        let github_env_token = github_access_token_from_env().is_some();
-        let github_auth_busy = self.github_auth_in_progress;
-        let github_auth_label = if github_auth_busy {
-            "Authorizing"
-        } else if github_saved_token {
-            "Disconnect"
-        } else if github_env_token {
-            "Connected (env)"
-        } else {
-            "Sign in"
-        };
-        let github_auth_icon_color = if github_auth_busy {
-            theme.accent
-        } else if github_saved_token || github_env_token {
-            0x68c38d
-        } else {
-            theme.text_muted
-        };
-        let github_auth_text_color = if github_auth_busy || github_saved_token || github_env_token {
-            theme.text_primary
-        } else {
-            theme.text_muted
-        };
-        let github_avatar_url = self.github_auth_state.user_avatar_url.clone();
-
         div()
-            .h(px(TITLEBAR_HEIGHT))
-            .bg(rgb(theme.chrome_bg))
-            .window_control_area(WindowControlArea::Drag)
+            .size_full()
+            .bg(rgb(theme.app_bg))
+            .text_color(rgb(theme.text_primary))
+            .font_family(FONT_UI)
             .relative()
             .flex()
-            .items_center()
-            // Left group: sidebar toggle + back/forward navigation
-            .child(
-                div()
-                    .absolute()
-                    .left(px(TOP_BAR_LEFT_OFFSET))
-                    .top_0()
-                    .bottom_0()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_2()
-                    .child(
-                        div()
-                            .id("toggle-sidebar")
-                            .cursor_pointer()
-                            .font_family(FONT_MONO)
-                            .text_size(px(20.))
-                            .text_color(rgb(if sidebar_hidden {
-                                theme.accent
-                            } else {
-                                theme.text_muted
-                            }))
-                            .size(px(28.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_sm()
-                            .border_1()
-                            .border_color(rgb(theme.border))
-                            .hover(|this| this.bg(rgb(theme.panel_active_bg)))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.action_toggle_left_pane(&ToggleLeftPane, window, cx);
-                            }))
-                            .child("\u{f0c9}"),
-                    )
-                    .child(
-                        div()
-                            .id("nav-back")
-                            .cursor_pointer()
-                            .font_family(FONT_MONO)
-                            .text_size(px(20.))
-                            .text_color(rgb(if back_enabled {
-                                theme.text_primary
-                            } else {
-                                theme.text_disabled
-                            }))
-                            .hover(|this| this.text_color(rgb(theme.accent)))
-                            .when(back_enabled, |this| {
-                                this.on_click(cx.listener(|this, _, window, cx| {
-                                    this.action_navigate_worktree_back(
-                                        &NavigateWorktreeBack,
-                                        window,
-                                        cx,
-                                    );
-                                }))
-                            })
-                            .child("\u{f053}"),
-                    )
-                    .child(
-                        div()
-                            .id("nav-forward")
-                            .cursor_pointer()
-                            .font_family(FONT_MONO)
-                            .text_size(px(20.))
-                            .text_color(rgb(if forward_enabled {
-                                theme.text_primary
-                            } else {
-                                theme.text_disabled
-                            }))
-                            .hover(|this| this.text_color(rgb(theme.accent)))
-                            .when(forward_enabled, |this| {
-                                this.on_click(cx.listener(|this, _, window, cx| {
-                                    this.action_navigate_worktree_forward(
-                                        &NavigateWorktreeForward,
-                                        window,
-                                        cx,
-                                    );
-                                }))
-                            })
-                            .child("\u{f054}"),
-                    ),
-            )
-            // Center: title
-            .child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(theme.text_primary))
-                            .child(centered_title),
-                    ),
-            )
-            // Right group: GitHub auth, worktree quick actions, and report issue button
-            .child(
-                div()
-                    .absolute()
-                    .right(px(16.))
-                    .top_0()
-                    .bottom_0()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .child({
-                        let daemon_connected = self.terminal_daemon.is_some();
-                        let web_ui_url = self.daemon_base_url.clone();
-                        top_bar_button(
-                            theme,
-                            "web-ui-link",
-                            true,
-                            if daemon_connected {
-                                theme.text_muted
-                            } else {
-                                theme.text_disabled
-                            },
-                            theme.text_primary,
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(4.))
-                                .text_size(px(11.))
-                                .child(top_bar_icon_element(
-                                    TopBarIconKind::RemoteControl,
-                                    if daemon_connected {
-                                        TopBarIconTone::Connected
-                                    } else {
-                                        TopBarIconTone::Disabled
-                                    },
-                                    if daemon_connected {
-                                        0x68c38d
-                                    } else {
-                                        theme.text_disabled
-                                    },
-                                    "\u{f0ac}",
-                                ))
-                                .child("Remote Control"),
-                        )
-                        .on_click(cx.listener(move |this, _, _window, cx| {
-                            if this.terminal_daemon.is_some() {
-                                this.open_external_url(&web_ui_url, cx);
-                            } else {
-                                this.start_daemon_modal = true;
-                                cx.notify();
-                            }
-                        }))
-                    })
-                    .child(
-                        top_bar_button(
-                            theme,
-                            "github-auth",
-                            !github_auth_busy,
-                            github_auth_text_color,
-                            theme.text_primary,
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(4.))
-                                .text_size(px(11.))
-                                .child(match github_avatar_url {
-                                    Some(url) => div()
-                                        .size(px(12.))
-                                        .rounded_full()
-                                        .overflow_hidden()
-                                        .child(img(url).size_full().rounded_full().with_fallback(
-                                            move || {
-                                                top_bar_icon_element(
-                                                    TopBarIconKind::GitHub,
-                                                    if github_auth_busy {
-                                                        TopBarIconTone::Busy
-                                                    } else if github_saved_token || github_env_token {
-                                                        TopBarIconTone::Connected
-                                                    } else {
-                                                        TopBarIconTone::Muted
-                                                    },
-                                                    github_auth_icon_color,
-                                                    "\u{f09b}",
-                                                )
-                                                .into_any_element()
-                                            },
-                                        ))
-                                        .into_any_element(),
-                                    None => top_bar_icon_element(
-                                        TopBarIconKind::GitHub,
-                                        if github_auth_busy {
-                                            TopBarIconTone::Busy
-                                        } else if github_saved_token || github_env_token {
-                                            TopBarIconTone::Connected
-                                        } else {
-                                            TopBarIconTone::Muted
-                                        },
-                                        github_auth_icon_color,
-                                        "\u{f09b}",
-                                    )
-                                    .into_any_element(),
-                                })
-                                .child(github_auth_label),
-                        )
-                        .when(!github_auth_busy, |this| {
-                            this.on_click(cx.listener(|this, _, _, cx| {
-                                this.run_github_auth_button_action(cx);
-                            }))
-                        }),
-                    )
-                    .child(
-                        top_bar_button(
-                            theme,
-                            "worktree-quick-actions",
-                            worktree_quick_actions_enabled,
-                            if worktree_quick_actions_enabled {
-                                theme.text_muted
-                            } else {
-                                theme.text_disabled
-                            },
-                            theme.text_primary,
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(4.))
-                                .child(top_bar_icon_element(
-                                    TopBarIconKind::WorktreeActions,
-                                    if worktree_quick_actions_enabled {
-                                        TopBarIconTone::Muted
-                                    } else {
-                                        TopBarIconTone::Disabled
-                                    },
-                                    if worktree_quick_actions_enabled {
-                                        theme.text_muted
-                                    } else {
-                                        theme.text_disabled
-                                    },
-                                    "\u{f0e7}",
-                                ))
-                                .child(div().text_size(px(11.)).child("Action"))
-                                .child(
-                                    div()
-                                        .font_family(FONT_MONO)
-                                        .text_size(px(9.))
-                                        .child(if worktree_quick_actions_open {
-                                            "\u{f077}"
-                                        } else {
-                                            "\u{f078}"
-                                        }),
-                                ),
-                        )
-                        .when(worktree_quick_actions_enabled, |this| {
-                            this.on_click(cx.listener(|this, _, _, cx| {
-                                this.toggle_top_bar_worktree_quick_actions_menu(cx);
-                            }))
-                        }),
-                    )
-                    .child(
-                        top_bar_button(
-                            theme,
-                            "report-issue",
-                            true,
-                            theme.text_muted,
-                            theme.text_primary,
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(4.))
-                                .text_size(px(11.))
-                                .child(top_bar_icon_element(
-                                    TopBarIconKind::ReportIssue,
-                                    TopBarIconTone::Muted,
-                                    theme.text_muted,
-                                    "\u{f188}",
-                                ))
-                                .child("Report issue"),
-                        )
-                        .on_click(cx.listener(|this, _, _window, cx| {
-                            this.close_top_bar_worktree_quick_actions();
-                            cx.open_url("https://github.com/penso/arbor/issues/new");
-                        })),
-                    ),
-            )
-    }
-
-    fn render_top_bar_worktree_quick_actions_menu(&mut self, cx: &mut Context<Self>) -> Div {
-        let theme = self.theme();
-        let menu_open =
-            self.top_bar_quick_actions_open && self.selected_local_worktree_path().is_some();
-
-        if !menu_open {
-            return div();
-        }
-
-        let ide_has_launchers = !self.ide_launchers.is_empty();
-        let terminal_has_launchers = !self.terminal_launchers.is_empty();
-        let submenu = self.top_bar_quick_actions_submenu;
-        let ide_row_active = submenu == Some(QuickActionSubmenu::Ide);
-        let terminal_row_active = submenu == Some(QuickActionSubmenu::Terminal);
-
-        let mut overlay = div()
-            .absolute()
-            .right(px(16.))
-            .top(px(TITLEBAR_HEIGHT))
-            .mt(px(4.))
-            .child(
-                div()
-                    .w(px(192.))
-                    .py(px(4.))
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(rgb(theme.border))
-                    .bg(rgb(theme.chrome_bg))
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                        cx.stop_propagation();
-                    })
-                    .child(
-                        div()
-                            .id("quick-action-open-finder")
-                            .h(px(24.))
-                            .mx(px(4.))
-                            .px(px(8.))
-                            .rounded_sm()
-                            .cursor_pointer()
-                            .hover(|this| this.bg(rgb(theme.panel_active_bg)))
-                            .flex()
-                            .items_center()
-                            .gap(px(6.))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.run_worktree_quick_action(WorktreeQuickAction::OpenFinder, cx);
-                            }))
-                            .child(
-                                div()
-                                    .font_family(FONT_MONO)
-                                    .text_size(px(12.))
-                                    .text_color(rgb(0xe5c07b))
-                                    .child("\u{f07b}"),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(11.))
-                                    .text_color(rgb(theme.text_primary))
-                                    .child("Open in Finder"),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id("quick-action-open-ide-submenu")
-                            .h(px(24.))
-                            .mx(px(4.))
-                            .px(px(8.))
-                            .rounded_sm()
-                            .text_color(rgb(if ide_has_launchers {
-                                theme.text_primary
-                            } else {
-                                theme.text_disabled
-                            }))
-                            .when(ide_has_launchers, |this| {
-                                this.cursor_pointer()
-                                    .hover(|this| this.bg(rgb(theme.panel_active_bg)))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.toggle_top_bar_worktree_quick_actions_submenu(
-                                            QuickActionSubmenu::Ide,
-                                            cx,
-                                        );
-                                    }))
-                            })
-                            .when(ide_row_active, |this| this.bg(rgb(theme.panel_active_bg)))
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(6.))
-                                    .child(
-                                        div()
-                                            .font_family(FONT_MONO)
-                                            .text_size(px(12.))
-                                            .text_color(rgb(0x39a0ed))
-                                            .child("\u{f121}"),
-                                    )
-                                    .child(div().text_size(px(11.)).child("IDE")),
-                            )
-                            .child(
-                                div()
-                                    .font_family(FONT_MONO)
-                                    .text_size(px(10.))
-                                    .text_color(rgb(if ide_has_launchers {
-                                        theme.text_muted
-                                    } else {
-                                        theme.text_disabled
-                                    }))
-                                    .child("\u{f054}"),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id("quick-action-open-terminal-submenu")
-                            .h(px(24.))
-                            .mx(px(4.))
-                            .px(px(8.))
-                            .rounded_sm()
-                            .text_color(rgb(if terminal_has_launchers {
-                                theme.text_primary
-                            } else {
-                                theme.text_disabled
-                            }))
-                            .when(terminal_has_launchers, |this| {
-                                this.cursor_pointer()
-                                    .hover(|this| this.bg(rgb(theme.panel_active_bg)))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.toggle_top_bar_worktree_quick_actions_submenu(
-                                            QuickActionSubmenu::Terminal,
-                                            cx,
-                                        );
-                                    }))
-                            })
-                            .when(terminal_row_active, |this| {
-                                this.bg(rgb(theme.panel_active_bg))
-                            })
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(6.))
-                                    .child(terminal_quick_action_icon_element(0x68c38d, 12.0))
-                                    .child(div().text_size(px(11.)).child("Terminal")),
-                            )
-                            .child(
-                                div()
-                                    .font_family(FONT_MONO)
-                                    .text_size(px(10.))
-                                    .text_color(rgb(if terminal_has_launchers {
-                                        theme.text_muted
-                                    } else {
-                                        theme.text_disabled
-                                    }))
-                                    .child("\u{f054}"),
-                            ),
-                    )
-                    .child(div().h(px(1.)).mx(px(8.)).my(px(4.)).bg(rgb(theme.border)))
-                    .child(
-                        div()
-                            .id("quick-action-copy-path")
-                            .h(px(24.))
-                            .mx(px(4.))
-                            .px(px(8.))
-                            .rounded_sm()
-                            .cursor_pointer()
-                            .hover(|this| this.bg(rgb(theme.panel_active_bg)))
-                            .flex()
-                            .items_center()
-                            .gap(px(6.))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.run_worktree_quick_action(WorktreeQuickAction::CopyPath, cx);
-                            }))
-                            .child(
-                                div()
-                                    .font_family(FONT_MONO)
-                                    .text_size(px(12.))
-                                    .text_color(rgb(theme.text_muted))
-                                    .child("\u{f0c5}"),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(11.))
-                                    .text_color(rgb(theme.text_primary))
-                                    .child("Copy path"),
-                            ),
-                    ),
-            );
-
-        if let Some(submenu) = submenu {
-            let launchers: &[ExternalLauncher] = match submenu {
-                QuickActionSubmenu::Ide => &self.ide_launchers,
-                QuickActionSubmenu::Terminal => &self.terminal_launchers,
-            };
-            if launchers.is_empty() {
-                return overlay;
-            }
-            let submenu_top = match submenu {
-                QuickActionSubmenu::Ide => px(28.),
-                QuickActionSubmenu::Terminal => px(52.),
-            };
-
-            overlay = overlay.child(
-                div()
-                    .id("quick-action-launcher-submenu")
-                    .absolute()
-                    .right(px(200.))
-                    .top(submenu_top)
-                    .w(px(220.))
-                    .py(px(4.))
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(rgb(theme.border))
-                    .bg(rgb(theme.chrome_bg))
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                        cx.stop_propagation();
-                    })
-                    .children(launchers.iter().enumerate().map(|(index, launcher)| {
-                        let launcher = *launcher;
-                        div()
-                            .id(ElementId::NamedInteger(
-                                "quick-action-launcher-item".into(),
-                                index as u64,
-                            ))
-                            .h(px(24.))
-                            .mx(px(4.))
-                            .px(px(8.))
-                            .rounded_sm()
-                            .cursor_pointer()
-                            .hover(|this| this.bg(rgb(theme.panel_active_bg)))
-                            .flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.run_worktree_external_launcher(submenu, index, cx);
-                            }))
-                            .child(
-                                div()
-                                    .w(px(20.))
-                                    .flex_none()
-                                    .font_family(FONT_MONO)
-                                    .text_size(px(12.))
-                                    .text_center()
-                                    .text_color(rgb(launcher.icon_color))
-                                    .child(launcher.icon),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(11.))
-                                    .text_color(rgb(theme.text_primary))
-                                    .child(launcher.label),
-                            )
-                    })),
-            );
-        }
-
-        div()
-            .absolute()
-            .inset_0()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                    this.close_top_bar_worktree_quick_actions();
-                    cx.stop_propagation();
-                    cx.notify();
-                }),
-            )
-            .child(overlay)
-    }
-
-    fn render_notice_toast(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let Some(notice) = self.notice.clone() else {
-            return div();
-        };
-
-        let theme = self.theme();
-        let is_error = notice_looks_like_error(&notice);
-        let background = if is_error {
-            theme.notice_bg
-        } else {
-            theme.chrome_bg
-        };
-        let text_color = if is_error {
-            theme.notice_text
-        } else {
-            theme.text_primary
-        };
-        let border_color = if is_error {
-            0xb95d5d
-        } else {
-            theme.accent
-        };
-        let icon = if is_error {
-            "\u{f06a}"
-        } else {
-            "\u{f05a}"
-        };
-        let icon_color = if is_error {
-            theme.notice_text
-        } else {
-            theme.accent
-        };
-
-        div()
-            .absolute()
-            .right(px(16.))
-            .bottom(px(36.))
-            .w(px(420.))
-            .max_w(px(420.))
-            .rounded_sm()
-            .border_1()
-            .border_color(rgb(border_color))
-            .bg(rgb(background))
-            .px_2()
-            .py(px(8.))
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap_2()
-            .child(
-                div()
-                    .min_w_0()
-                    .flex_1()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .font_family(FONT_MONO)
-                            .text_size(px(12.))
-                            .text_color(rgb(icon_color))
-                            .child(icon),
-                    )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .text_size(px(12.))
-                            .text_color(rgb(text_color))
-                            .child(notice),
-                    ),
-            )
-            .child(
-                div()
-                    .id("notice-toast-dismiss")
-                    .cursor_pointer()
-                    .font_family(FONT_MONO)
-                    .text_size(px(11.))
-                    .text_color(rgb(theme.text_muted))
-                    .hover(|this| this.text_color(rgb(theme.text_primary)))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.notice = None;
-                        cx.notify();
-                    }))
-                    .child("\u{f00d}"),
-            )
-    }
-
-    fn render_left_pane(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        if !self.left_pane_visible {
-            let theme = self.theme();
-            let repositories = self.repositories.clone();
-            let worktrees = self.worktrees.clone();
-            let mut pane = div()
-                .id("collapsed-left-pane")
-                .w(px(40.))
-                .h_full()
-                .flex_none()
-                .bg(rgb(theme.sidebar_bg))
-                .flex()
-                .flex_col()
-                .items_center()
-                .pt_2()
-                .gap_1()
-                .overflow_y_scroll();
-
-            for (repo_index, repository) in repositories.iter().enumerate() {
-                let repository_github_url = repository
-                    .github_repo_slug
-                    .as_ref()
-                    .map(|repo_slug| github_repo_url(repo_slug));
-                let repo_worktrees: Vec<(usize, &WorktreeSummary)> = worktrees
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, w)| w.group_key == repository.group_key)
-                    .collect();
-
-                // Add spacing between repo groups (not before the first)
-                if repo_index > 0 {
-                    pane = pane.child(div().h(px(4.)));
-                }
-
-                // Repo icon row: circular avatar or GitHub icon
-                let repo_icon = match (repository.avatar_url.clone(), repository_github_url.clone())
-                {
-                    (Some(url), Some(github_url)) => div()
-                        .id(("collapsed-repository-github-link", repo_index))
-                        .size(px(32.))
-                        .rounded_md()
-                        .overflow_hidden()
-                        .cursor_pointer()
-                        .hover(|this| this.opacity(0.9))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.open_external_url(&github_url, cx);
-                            cx.stop_propagation();
-                        }))
-                        .child(img(url).size_full().rounded_md().with_fallback(move || {
-                            div()
-                                .size_full()
-                                .font_family(FONT_MONO)
-                                .text_size(px(14.))
-                                .text_color(rgb(theme.text_muted))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child("\u{f09b}")
-                                .into_any_element()
-                        }))
-                        .into_any_element(),
-                    (Some(url), None) => div()
-                        .size(px(32.))
-                        .rounded_md()
-                        .overflow_hidden()
-                        .child(img(url).size_full().rounded_md().with_fallback(move || {
-                            div()
-                                .size_full()
-                                .font_family(FONT_MONO)
-                                .text_size(px(14.))
-                                .text_color(rgb(theme.text_muted))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child("\u{f09b}")
-                                .into_any_element()
-                        }))
-                        .into_any_element(),
-                    (None, Some(github_url)) => div()
-                        .id(("collapsed-repository-github-link", repo_index))
-                        .size(px(24.))
-                        .font_family(FONT_MONO)
-                        .text_size(px(14.))
-                        .text_color(rgb(theme.text_muted))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .cursor_pointer()
-                        .hover(|this| this.opacity(0.9))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.open_external_url(&github_url, cx);
-                            cx.stop_propagation();
-                        }))
-                        .child("\u{f09b}")
-                        .into_any_element(),
-                    (None, None) => div()
-                        .size(px(24.))
-                        .font_family(FONT_MONO)
-                        .text_size(px(14.))
-                        .text_color(rgb(theme.text_muted))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child("\u{f09b}")
-                        .into_any_element(),
-                };
-                pane = pane.child(repo_icon);
-
-                let selection_epoch = self.worktree_selection_epoch;
-                for (wt_index, worktree) in repo_worktrees {
-                    let is_active = self.active_worktree_index == Some(wt_index);
-                    let first_char: String = worktree
-                        .branch
-                        .chars()
-                        .next()
-                        .unwrap_or('?')
-                        .to_uppercase()
-                        .collect();
-
-                    let cell = div()
-                        .id(("collapsed-worktree", wt_index))
-                        .cursor_pointer()
-                        .size(px(30.))
-                        .rounded_sm()
-                        .border_1()
-                        .border_color(rgb(if is_active {
-                            theme.accent
-                        } else {
-                            theme.border
-                        }))
-                        .bg(rgb(if is_active {
-                            theme.panel_active_bg
-                        } else {
-                            theme.panel_bg
-                        }))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_xs()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(if is_active {
-                            theme.text_primary
-                        } else {
-                            theme.text_muted
-                        }))
-                        .child(first_char)
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.select_worktree(wt_index, window, cx);
-                        }));
-                    if is_active {
-                        pane = pane.child(cell.with_animation(
-                            ("collapsed-wt-select", selection_epoch),
-                            Animation::new(Duration::from_millis(150)).with_easing(ease_in_out),
-                            |el, delta| el.opacity(0.8 + 0.2 * delta),
-                        ));
-                    } else {
-                        pane = pane.child(cell.opacity(0.8));
-                    }
-                }
-            }
-
-            return pane;
-        }
-        let theme = self.theme();
-        let repositories = self.repositories.clone();
-        let worktrees = self.worktrees.clone();
-        div()
-            .id("left-pane")
-            .w(px(self.left_pane_width))
-            .h_full()
-            .bg(rgb(theme.sidebar_bg))
-            .flex()
             .flex_col()
-            .child(
-                div()
-                    .id("worktrees-scroll")
-                    .flex_1()
-                    .overflow_y_scroll()
-                    .px_2()
-                    .pt_2()
-                    .pb_2()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .children(repositories.into_iter().enumerate().map(
-                        |(repository_index, repository)| {
-                            let is_collapsed =
-                                self.collapsed_repositories.contains(&repository_index);
-                            let repository_avatar_url = repository.avatar_url.clone();
-                            let repository_github_url = repository
-                                .github_repo_slug
-                                .as_ref()
-                                .map(|repo_slug| github_repo_url(repo_slug));
-                            let repo_worktrees: Vec<(usize, WorktreeSummary)> = worktrees
-                                .iter()
-                                .cloned()
-                                .enumerate()
-                                .filter(|(_, worktree)| {
-                                    worktree.group_key == repository.group_key
-                                })
-                                .collect();
-                            let repo_agent_dot_color = if is_collapsed {
-                                if repo_worktrees
-                                    .iter()
-                                    .any(|(_, wt)| wt.agent_state == Some(AgentState::Working))
-                                {
-                                    Some(0xe5c07b_u32)
-                                } else if repo_worktrees
-                                    .iter()
-                                    .any(|(_, wt)| wt.agent_state == Some(AgentState::Waiting))
-                                {
-                                    Some(0x61afef_u32)
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            };
-                            let repo_outposts: Vec<(usize, OutpostSummary)> = self
-                                .outposts
-                                .iter()
-                                .cloned()
-                                .enumerate()
-                                .filter(|(_, outpost)| outpost.repo_root == repository.root)
-                                .collect();
-
+            .on_key_down(cx.listener(Self::handle_global_key_down))
+            .on_action(cx.listener(Self::action_spawn_terminal))
+            .on_action(cx.listener(Self::action_close_active_terminal))
+            .on_action(cx.listener(Self::action_open_manage_presets))
+            .on_action(cx.listener(Self::action_open_manage_repo_presets))
+            .on_action(cx.listener(Self::action_open_command_palette))
+            .on_action(cx.listener(Self::action_refresh_worktrees))
+            .on_action(cx.listener(Self::action_refresh_changes))
+            .on_action(cx.listener(Self::action_open_add_repository))
+            .on_action(cx.listener(Self::action_open_create_worktree))
+            .on_action(cx.listener(Self::action_use_embedded_backend))
+            .on_action(cx.listener(Self::action_use_alacritty_backend))
+            .on_action(cx.listener(Self::action_use_ghostty_backend))
+            .on_action(cx.listener(Self::action_toggle_left_pane))
+            .on_action(cx.listener(Self::action_navigate_worktree_back))
+            .on_action(cx.listener(Self::action_navigate_worktree_forward))
+            .on_action(cx.listener(Self::action_collapse_all_repositories))
+            .on_action(cx.listener(Self::action_view_logs))
+            .on_action(cx.listener(Self::action_show_about))
+            .on_action(cx.listener(Self::action_open_theme_picker))
+            .on_action(cx.listener(Self::action_open_settings))
+            .on_action(cx.listener(Self::action_open_manage_hosts))
+            .on_action(cx.listener(Self::action_connect_to_lan_daemon))
+            .on_action(cx.listener(Self::action_connect_to_host))
+            .on_action(cx.listener(Self::action_request_quit))
+            .on_action(cx.listener(Self::action_immediate_quit))
+            .child(self.render_top_bar(cx))
+            .child(div().h(px(1.)).bg(rgb(theme.chrome_border)))
+            .when(self.repositories.is_empty(), |this| {
+                this.child(self.render_welcome_pane(cx))
+            })
+            .when(!self.repositories.is_empty(), |this| {
+                this.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .min_h_0()
+                        .overflow_hidden()
+                        .flex()
+                        .flex_row()
+                        .on_drag_move(cx.listener(Self::handle_pane_divider_drag_move))
+                        .child(self.render_left_pane(cx))
+                        .when(self.left_pane_visible, |this| {
+                            this.child(self.render_pane_resize_handle(
+                                "left-pane-resize",
+                                DraggedPaneDivider::Left,
+                                theme,
+                            ))
+                        })
+                        .child(self.render_center_pane(window, cx))
+                        .child(self.render_pane_resize_handle(
+                            "right-pane-resize",
+                            DraggedPaneDivider::Right,
+                            theme,
+                        ))
+                        .child(self.render_right_pane(cx)),
+                )
+            })
+            .child(self.render_status_bar())
+            .child(self.render_top_bar_worktree_quick_actions_menu(cx))
+            .child(self.render_notice_toast(cx))
+            .child(self.render_create_modal(cx))
+            .child(self.render_github_auth_modal(cx))
+            .child(self.render_repository_context_menu(cx))
+            .child(self.render_worktree_context_menu(cx))
+            .child(self.render_worktree_hover_popover(cx))
+            .child(self.render_outpost_context_menu(cx))
+            .child(self.render_delete_modal(cx))
+            .child(self.render_manage_hosts_modal(cx))
+            .child(self.render_manage_presets_modal(cx))
+            .child(self.render_manage_repo_presets_modal(cx))
+            .child(self.render_commit_modal(cx))
+            .child(self.render_command_palette_modal(cx))
+            .child(self.render_about_modal(cx))
+            .child(self.render_theme_picker_modal(cx))
+            .child(self.render_settings_modal(cx))
+            .child(self.render_daemon_auth_modal(cx))
+            .child(self.render_start_daemon_modal(cx))
+            .child(self.render_connect_to_host_modal(cx))
+            .child(div().when_some(self.theme_toast.clone(), |this, toast| {
+                this.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_end()
+                        .justify_end()
+                        .px_3()
+                        .pb(px(34.))
+                        .child(
                             div()
-                                .id(("repository-group", repository_index))
+                                .rounded_md()
+                                .border_1()
+                                .border_color(rgb(theme.accent))
+                                .bg(rgb(theme.panel_active_bg))
+                                .px_3()
+                                .py_2()
+                                .text_xs()
+                                .text_color(rgb(theme.text_primary))
+                                .child(toast),
+                        ),
+                )
+            }))
+            .when(self.quit_overlay_until.is_some(), |this| {
+                this.child(
+                    div()
+                        .id("quit-backdrop")
+                        .absolute()
+                        .inset_0()
+                        .bg(rgb(0x000000))
+                        .opacity(0.5)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.action_dismiss_quit(window, cx);
+                        })),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .occlude()
+                        .child(
+                            div()
+                                .px_6()
+                                .py_4()
+                                .rounded_lg()
+                                .bg(rgb(theme.chrome_bg))
+                                .border_1()
+                                .border_color(rgb(theme.border))
                                 .flex()
                                 .flex_col()
-                                .gap_1()
+                                .items_center()
+                                .gap_3()
                                 .child(
                                     div()
-                                        .id(("repository-row", repository_index))
-                                        .cursor_pointer()
+                                        .text_sm()
+                                        .text_color(rgb(theme.text_primary))
+                                        .child("Are you sure you want to quit Arbor?"),
+                                )
+                                .child(
+                                    div()
                                         .flex()
-                                        .items_center()
-                                        .gap_1()
-                                        .h(px(32.))
-                                        .hover(|this| this.bg(rgb(theme.panel_active_bg)))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.select_repository(repository_index, cx);
-                                        }))
-                                        .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                            cx.stop_propagation();
-                                            this.repository_context_menu = Some(RepositoryContextMenu {
-                                                repository_index,
-                                                position: event.position,
-                                            });
-                                            cx.notify();
-                                        }))
-                                        // GitHub icon or avatar outside the cell
+                                        .gap_2()
                                         .child(
-                                            match (
-                                                repository_avatar_url.clone(),
-                                                repository_github_url.clone(),
-                                            ) {
-                                                (Some(url), Some(github_url)) => div()
-                                                    .id((
-                                                        "repository-github-link",
-                                                        repository_index,
-                                                    ))
-                                                    .flex_none()
-                                                    .size(px(20.))
-                                                    .rounded_sm()
-                                                    .overflow_hidden()
-                                                    .cursor_pointer()
-                                                    .hover(|this| this.opacity(0.9))
-                                                    .on_click(cx.listener(
-                                                        move |this, _, _, cx| {
-                                                            this.open_external_url(
-                                                                &github_url,
-                                                                cx,
-                                                            );
-                                                            cx.stop_propagation();
-                                                        },
-                                                    ))
-                                                    .child(
-                                                        img(url)
-                                                            .size_full()
-                                                            .rounded_sm()
-                                                            .with_fallback(move || {
-                                                                div()
-                                                                    .size_full()
-                                                                    .font_family(FONT_MONO)
-                                                                    .text_size(px(12.))
-                                                                    .text_color(rgb(
-                                                                        theme.text_muted,
-                                                                    ))
-                                                                    .flex()
-                                                                    .items_center()
-                                                                    .justify_center()
-                                                                    .child("\u{f09b}")
-                                                                    .into_any_element()
-                                                            }),
-                                                    )
-                                                    .into_any_element(),
-                                                (Some(url), None) => div()
-                                                    .flex_none()
-                                                    .size(px(20.))
-                                                    .rounded_sm()
-                                                    .overflow_hidden()
-                                                    .child(
-                                                        img(url)
-                                                            .size_full()
-                                                            .rounded_sm()
-                                                            .with_fallback(move || {
-                                                                div()
-                                                                    .size_full()
-                                                                    .font_family(FONT_MONO)
-                                                                    .text_size(px(12.))
-                                                                    .text_color(rgb(
-                                                                        theme.text_muted,
-                                                                    ))
-                                                                    .flex()
-                                                                    .items_center()
-                                                                    .justify_center()
-                                                                    .child("\u{f09b}")
-                                                                    .into_any_element()
-                                                            }),
-                                                    )
-                                                    .into_any_element(),
-                                                (None, Some(github_url)) => div()
-                                                    .id((
-                                                        "repository-github-link",
-                                                        repository_index,
-                                                    ))
-                                                    .flex_none()
-                                                    .font_family(FONT_MONO)
-                                                    .text_size(px(12.))
-                                                    .text_color(rgb(theme.text_muted))
-                                                    .cursor_pointer()
-                                                    .hover(|this| this.opacity(0.9))
-                                                    .on_click(cx.listener(
-                                                        move |this, _, _, cx| {
-                                                            this.open_external_url(
-                                                                &github_url,
-                                                                cx,
-                                                            );
-                                                            cx.stop_propagation();
-                                                        },
-                                                    ))
-                                                    .child("\u{f09b}")
-                                                    .into_any_element(),
-                                                (None, None) => div()
-                                                    .flex_none()
-                                                    .font_family(FONT_MONO)
-                                                    .text_size(px(12.))
-                                                    .text_color(rgb(theme.text_muted))
-                                                    .child("\u{f09b}")
-                                                    .into_any_element(),
-                                            },
-                                        )
-                                        // Cell with chevron, name, count, etc.
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .min_w_0()
-                                                .flex()
-                                                .items_center()
-                                                .justify_between()
-                                                .child(
-                                                    div()
-                                                        .min_w_0()
-                                                        .flex_1()
-                                                        .flex()
-                                                        .items_center()
-                                                        .gap_1()
-                                                        // Chevron toggle
-                                                        .child(
-                                                            div()
-                                                                .id(("repo-chevron", repository_index))
-                                                                .cursor_pointer()
-                                                                .hover(|this| this.text_color(rgb(theme.text_primary)))
-                                                                .text_size(px(16.))
-                                                                .text_color(rgb(theme.text_muted))
-                                                                .w(px(14.))
-                                                                .flex()
-                                                                .items_center()
-                                                                .justify_center()
-                                                                .child(if is_collapsed {
-                                                                    "\u{25B8}"
-                                                                } else {
-                                                                    "\u{25BE}"
-                                                                })
-                                                                .on_click(cx.listener(
-                                                                    move |this, _, _, cx| {
-                                                                        if this
-                                                                            .collapsed_repositories
-                                                                            .contains(&repository_index)
-                                                                        {
-                                                                            this.collapsed_repositories
-                                                                                .remove(&repository_index);
-                                                                        } else {
-                                                                            this.collapsed_repositories
-                                                                                .insert(repository_index);
-                                                                        }
-                                                                        cx.stop_propagation();
-                                                                        cx.notify();
-                                                                    },
-                                                                )),
-                                                        )
-                                                        // Repository name
-                                                .child(
-                                                    div()
-                                                        .min_w_0()
-                                                        .overflow_hidden()
-                                                        .whitespace_nowrap()
-                                                        .text_ellipsis()
-                                                        .text_sm()
-                                                        .font_weight(FontWeight::MEDIUM)
-                                                        .text_color(rgb(theme.text_primary))
-                                                        .child(repository.label.clone()),
-                                                )
-                                                // Sidebar item count badge
-                                                .child(
-                                                    div()
-                                                        .text_sm()
-                                                        .text_color(rgb(theme.text_disabled))
-                                                        .child(format!(
-                                                            "{}",
-                                                            repo_worktrees.len() + repo_outposts.len()
-                                                        )),
-                                                ),
-                                        )
-                                        .when_some(repo_agent_dot_color, |this, color| {
-                                            this.child(
-                                                div()
-                                                    .flex_none()
-                                                    .size(px(6.))
-                                                    .rounded_full()
-                                                    .bg(rgb(color)),
+                                            action_button(
+                                                theme,
+                                                "quit-cancel",
+                                                "Cancel",
+                                                ActionButtonStyle::Secondary,
+                                                true,
                                             )
-                                        })
-                                        .child(
-                                            div()
-                                                .id(("repository-add-worktree", repository_index))
-                                                .size(px(20.))
-                                                .rounded_sm()
-                                                .cursor_pointer()
-                                                .flex_none()
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .text_sm()
-                                                .font_weight(FontWeight::SEMIBOLD)
-                                                .text_color(rgb(theme.text_muted))
-                                                .hover(|this| this.text_color(rgb(theme.text_primary)))
-                                                .child("+")
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    if this.active_repository_index
-                                                        != Some(repository_index)
-                                                    {
-                                                        this.select_repository(repository_index, cx);
-                                                    }
-                                                    this.open_create_modal(
-                                                        repository_index,
-                                                        CreateModalTab::LocalWorktree,
-                                                        cx,
-                                                    );
-                                                    cx.stop_propagation();
-                                                })),
-                                        ),
-                                        )
-                                )
-                                .when(!is_collapsed, |this| {
-                                    let selection_epoch = self.worktree_selection_epoch;
-                                    let group_key = repository.group_key.clone();
-                                    let repo_root = repository.root.clone();
-
-                                    // Build worktree/outpost index maps for lookup
-                                    let worktree_map: HashMap<PathBuf, (usize, WorktreeSummary)> =
-                                        repo_worktrees.into_iter()
-                                            .map(|(i, w)| (w.path.clone(), (i, w)))
-                                            .collect();
-                                    let outpost_map: HashMap<String, (usize, OutpostSummary)> =
-                                        repo_outposts.into_iter()
-                                            .map(|(i, o)| (o.outpost_id.clone(), (i, o)))
-                                            .collect();
-
-                                    // Build the unified ordered sidebar item list
-                                    let sidebar_order = self.build_sidebar_order_for_group(&group_key, &repo_root);
-                                    let item_count = sidebar_order.len();
-
-                                    let mut elements: Vec<AnyElement> = Vec::with_capacity(item_count * 2 + 1);
-                                    for (slot, item_id) in sidebar_order.into_iter().enumerate() {
-                                        // Drop zone before this item
-                                        {
-                                            let dz_group = group_key.clone();
-                                            let dz_root = repo_root.clone();
-                                            let accent = theme.accent;
-                                            elements.push(
-                                                div()
-                                                    .id(SharedString::from(format!("sidebar-drop-zone-{repository_index}-{slot}")))
-                                                    .h(px(6.))
-                                                    .mx(px(4.))
-                                                    .rounded_sm()
-                                                    .drag_over::<DraggedSidebarItem>({
-                                                        move |style, _, _, _| style.bg(rgb(accent)).h(px(3.)).my(px(1.5))
-                                                    })
-                                                    .on_drop(cx.listener(move |this, dragged: &DraggedSidebarItem, window, cx| {
-                                                        if dragged.group_key == dz_group {
-                                                            this.handle_sidebar_item_drop(&dragged.item_id, slot, &dz_group, &dz_root, window, cx);
-                                                        }
-                                                    }))
-                                                    .into_any_element(),
-                                            );
-                                        }
-
-                                        match &item_id {
-                                            SidebarItemId::Worktree(path) => {
-                                                let Some((index, worktree)) = worktree_map.get(path).cloned() else { continue };
-                                                let is_active =
-                                                    self.active_worktree_index == Some(index);
-                                                let diff_summary = worktree.diff_summary;
-                                                let pr_number = worktree.pr_number;
-                                                let pr_url = worktree.pr_url.clone();
-                                                let is_merged_pr = worktree
-                                                    .pr_details
-                                                    .as_ref()
-                                                    .is_some_and(|pr| {
-                                                        pr.state == github_service::PrState::Merged
-                                                    });
-                                                let pr_badge_color = if is_merged_pr {
-                                                    0xbb9af7_u32
-                                                } else {
-                                                    theme.accent
-                                                };
-                                                let is_primary = worktree.is_primary_checkout;
-                                                let agent_dot_color = match worktree.agent_state {
-                                                    Some(AgentState::Working) => Some(0xe5c07b_u32),
-                                                    Some(AgentState::Waiting) => Some(0x61afef_u32),
-                                                    None => None,
-                                                };
-                                                let drag_item_id = item_id.clone();
-                                                let drag_group_key = group_key.clone();
-                                                let drop_group_key = group_key.clone();
-                                                let drop_repo_root = repo_root.clone();
-                                                let drag_label = worktree.branch.clone();
-                                                let drag_icon = worktree.checkout_kind.icon().to_owned();
-                                                let drag_icon_color = theme.text_muted;
-                                                let row = div()
-                                                    .id(("worktree-row", index))
-                                                    .font_family(FONT_MONO)
-                                                    .cursor_pointer()
-                                                    .rounded_sm()
-                                                    .hover(|this| this.bg(rgb(theme.panel_active_bg)))
-                                                    .flex()
-                                                    .items_center()
-                                                    .on_drag(DraggedSidebarItem { item_id: drag_item_id, group_key: drag_group_key, label: drag_label, icon: drag_icon, icon_color: drag_icon_color, bg_color: theme.panel_active_bg, border_color: theme.accent, text_color: theme.text_primary }, |dragged, _, _, cx| {
-                                                        cx.stop_propagation();
-                                                        cx.new(|_| dragged.clone())
-                                                    })
-                                                    .drag_over::<DraggedSidebarItem>({
-                                                        let accent = theme.accent;
-                                                        move |style, _, _, _| style.border_color(rgb(accent)).border_t_2()
-                                                    })
-                                                    .on_drop(cx.listener(move |this, dragged: &DraggedSidebarItem, window, cx| {
-                                                        if dragged.group_key == drop_group_key {
-                                                            this.handle_sidebar_item_drop(&dragged.item_id, slot, &drop_group_key, &drop_repo_root, window, cx);
-                                                        }
-                                                    }))
-                                                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, _| {
-                                                        this.update_worktree_hover_mouse_position(event.position);
-                                                    }))
-                                                    .on_click(
-                                                        cx.listener(move |this, _, window, cx| {
-                                                            this.select_worktree(index, window, cx)
-                                                        }),
-                                                    )
-                                                    .when(
-                                                        !is_primary
-                                                            || worktree.checkout_kind
-                                                                == CheckoutKind::DiscreteClone,
-                                                        |this| {
-                                                        this.on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                                            cx.stop_propagation();
-                                                            this.worktree_context_menu = Some(WorktreeContextMenu {
-                                                                worktree_index: index,
-                                                                position: event.position,
-                                                            });
-                                                            this.worktree_hover_popover = None;
-                                                            this._hover_show_task = None;
-                                                            cx.notify();
-                                                        }))
-                                                    },
-                                                    )
-                                                    .on_hover(cx.listener(move |this, hovered: &bool, window, cx| {
-                                                        this.update_worktree_hover_mouse_position(window.mouse_position());
-                                                        if *hovered {
-                                                            let mouse_position = window.mouse_position();
-                                                            this.schedule_worktree_hover_popover_show(index, mouse_position.y, cx);
-                                                        } else if this.worktree_hover_popover.as_ref().is_some_and(|p| p.worktree_index == index) {
-                                                            this.schedule_worktree_hover_popover_dismiss(index, cx);
-                                                        } else {
-                                                            this.cancel_worktree_hover_popover_show();
-                                                        }
-                                                    }))
-                                                    // Bordered cell
-                                                    .child(
-                                                    div()
-                                                        .flex_1()
-                                                        .min_w_0()
-                                                        .rounded_sm()
-                                                        .border_1()
-                                                        .border_color(rgb(if is_active {
-                                                            theme.accent
-                                                        } else {
-                                                            theme.border
-                                                        }))
-                                                        .bg(rgb(theme.panel_bg))
-                                                        .px_2()
-                                                        .py_1()
-                                                        .flex()
-                                                        .flex_row()
-                                                        .items_center()
-                                                        .gap(px(4.))
-                                                        .hover(|this| {
-                                                            this.bg(rgb(theme.panel_active_bg))
-                                                        })
-                                                        .when(is_active, |this| {
-                                                            this.bg(rgb(theme.panel_active_bg))
-                                                                .border_color(rgb(theme.accent))
-                                                        })
-                                                        .when(is_merged_pr && !is_active, |this| {
-                                                            this.opacity(0.72)
-                                                        })
-                                                    // Git branch icon — vertically centered
-                                                    .child(
-                                                        div()
-                                                            .flex_none()
-                                                            .w(px(18.))
-                                                            .flex()
-                                                            .items_center()
-                                                            .justify_center()
-                                                            .text_size(px(16.))
-                                                            .text_color(rgb(theme.text_muted))
-                                                            .child(worktree.checkout_kind.icon()),
-                                                    )
-                                                    // Two-line text column
-                                                    .child(
-                                                        div()
-                                                            .flex_1()
-                                                            .min_w_0()
-                                                            .flex()
-                                                            .flex_col()
-                                                            .gap(px(1.))
-                                                    // Line 1: [spinner] [name] ... [+- lines] [time ago]
-                                                    .child(
-                                                        div()
-                                                            .flex()
-                                                            .items_center()
-                                                            .gap(px(2.))
-                                                            // Activity spinner dot
-                                                            .when_some(agent_dot_color, |this, color| {
-                                                                this.child(
-                                                                    div()
-                                                                        .flex_none()
-                                                                        .size(px(6.))
-                                                                        .rounded_full()
-                                                                        .bg(rgb(color)),
-                                                                )
-                                                            })
-                                                            // Name/label
-                                                            .child(
-                                                                div()
-                                                                    .min_w_0()
-                                                                    .flex_1()
-                                                                    .overflow_hidden()
-                                                                    .whitespace_nowrap()
-                                                                    .text_ellipsis()
-                                                                    .text_xs()
-                                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                                    .text_color(rgb(theme.text_primary))
-                                                                    .child(worktree.branch.clone()),
-                                                            )
-                                                            // Right side: [+- lines] [time ago]
-                                                            .child({
-                                                                let summary =
-                                                                    diff_summary.unwrap_or_default();
-                                                                let show_diff_summary =
-                                                                    summary.additions > 0
-                                                                        || summary.deletions > 0;
-                                                                let mut right = div()
-                                                                    .flex_none()
-                                                                    .flex()
-                                                                    .items_center()
-                                                                    .gap_1();
-
-                                                                if self.worktree_stats_loading
-                                                                    && diff_summary.is_none()
-                                                                {
-                                                                    right = right.child(
-                                                                        div()
-                                                                            .text_xs()
-                                                                            .text_color(rgb(
-                                                                                theme.text_muted,
-                                                                            ))
-                                                                            .child("..."),
-                                                                    );
-                                                                } else if show_diff_summary {
-                                                                    if summary.additions > 0 {
-                                                                        right = right.child(
-                                                                            div()
-                                                                                .text_xs()
-                                                                                .text_color(rgb(
-                                                                                    0x72d69c,
-                                                                                ))
-                                                                                .child(format!(
-                                                                                    "+{}",
-                                                                                    summary
-                                                                                        .additions
-                                                                                )),
-                                                                        );
-                                                                    }
-                                                                    if summary.deletions > 0 {
-                                                                        right = right.child(
-                                                                            div()
-                                                                                .text_xs()
-                                                                                .text_color(rgb(
-                                                                                    0xeb6f92,
-                                                                                ))
-                                                                                .child(format!(
-                                                                                    "-{}",
-                                                                                    summary
-                                                                                        .deletions
-                                                                                )),
-                                                                        );
-                                                                    }
-                                                                }
-
-                                                                if let Some(activity_ms) = worktree.last_activity_unix_ms {
-                                                                    right = right.child(
-                                                                        div()
-                                                                            .text_xs()
-                                                                            .text_color(rgb(
-                                                                                theme.text_disabled,
-                                                                            ))
-                                                                            .child(format_relative_time(activity_ms)),
-                                                                    );
-                                                                }
-
-                                                                right
-                                                            }),
-                                                    )
-                                                    // Line 2: [agent task or dir name] ... [PR number]
-                                                    .child(
-                                                        div()
-                                                            .flex()
-                                                            .items_center()
-                                                            .gap_2()
-                                                            .child(
-                                                                div()
-                                                                    .min_w_0()
-                                                                    .flex_1()
-                                                                    .overflow_hidden()
-                                                                    .whitespace_nowrap()
-                                                                    .text_ellipsis()
-                                                                    .text_xs()
-                                                                    .text_color(rgb(theme.text_disabled))
-                                                                    .child(
-                                                                        worktree
-                                                                            .agent_task
-                                                                            .clone()
-                                                                            .unwrap_or_else(|| worktree.label.clone()),
-                                                                    ),
-                                                            )
-                                                            .when_some(pr_number, |this, pr_num| {
-                                                                let pr_text = format!("#{pr_num}");
-                                                                if let Some(pr_url) = pr_url.clone() {
-                                                                    this.child(
-                                                                        div()
-                                                                            .id(("worktree-pr-link", index))
-                                                                            .cursor_pointer()
-                                                                            .flex_none()
-                                                                            .text_xs()
-                                                                            .text_color(rgb(pr_badge_color))
-                                                                            .hover(|this| this.text_color(rgb(theme.text_primary)))
-                                                                            .child(pr_text)
-                                                                            .on_click(cx.listener(
-                                                                                move |this, _, _, cx| {
-                                                                                    this.open_external_url(
-                                                                                        &pr_url,
-                                                                                        cx,
-                                                                                    );
-                                                                                    cx.stop_propagation();
-                                                                                },
-                                                                            )),
-                                                                    )
-                                                                } else {
-                                                                    this.child(
-                                                                        div()
-                                                                            .flex_none()
-                                                                            .text_xs()
-                                                                            .text_color(rgb(pr_badge_color))
-                                                                            .child(pr_text),
-                                                                    )
-                                                                }
-                                                            }),
-                                                    )
-                                                    ) // text column
-                                                    ); // bordered cell
-                                                if is_active {
-                                                    elements.push(row.with_animation(
-                                                        ("worktree-select", selection_epoch),
-                                                        Animation::new(Duration::from_millis(150))
-                                                            .with_easing(ease_in_out),
-                                                        |el, delta| {
-                                                            el.opacity(0.8 + 0.2 * delta)
-                                                        },
-                                                    )
-                                                    .into_any_element());
-                                                } else {
-                                                    elements.push(row.opacity(0.8).into_any_element());
-                                                }
-                                            },
-                                            SidebarItemId::Outpost(outpost_id) => {
-                                                let Some((outpost_index, outpost)) = outpost_map.get(outpost_id).cloned() else { continue };
-                                                    let is_active = self.active_outpost_index == Some(outpost_index);
-                                                    let status_color = match outpost.status {
-                                                        arbor_core::outpost::OutpostStatus::Available => theme.accent,
-                                                        arbor_core::outpost::OutpostStatus::Unreachable => 0xeb6f92,
-                                                        arbor_core::outpost::OutpostStatus::NotCloned | arbor_core::outpost::OutpostStatus::Provisioning => theme.text_muted,
-                                                    };
-                                                    let drag_item_id = item_id.clone();
-                                                    let drag_group_key = group_key.clone();
-                                                    let drop_group_key = group_key.clone();
-                                                    let drop_repo_root = repo_root.clone();
-                                                    let drag_label = format!("{}@{}", outpost.branch, outpost.hostname);
-                                                    let drag_icon_color = status_color;
-                                                    elements.push(div()
-                                                        .id(("outpost-row", outpost_index))
-                                                        .font_family(FONT_MONO)
-                                                        .cursor_pointer()
-                                                        .hover(|this| this.bg(rgb(theme.panel_active_bg)))
-                                                        .flex()
-                                                        .items_center()
-                                                        .on_drag(DraggedSidebarItem { item_id: drag_item_id, group_key: drag_group_key, label: drag_label, icon: "\u{f0ac}".to_owned(), icon_color: drag_icon_color, bg_color: theme.panel_active_bg, border_color: theme.accent, text_color: theme.text_primary }, |dragged, _, _, cx| {
-                                                            cx.stop_propagation();
-                                                            cx.new(|_| dragged.clone())
-                                                        })
-                                                        .drag_over::<DraggedSidebarItem>({
-                                                            let accent = theme.accent;
-                                                            move |style, _, _, _| style.border_color(rgb(accent)).border_t_2()
-                                                        })
-                                                        .on_drop(cx.listener(move |this, dragged: &DraggedSidebarItem, window, cx| {
-                                                            if dragged.group_key == drop_group_key {
-                                                                this.handle_sidebar_item_drop(&dragged.item_id, slot, &drop_group_key, &drop_repo_root, window, cx);
-                                                            }
-                                                        }))
-                                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                                            this.select_outpost(outpost_index, window, cx);
-                                                        }))
-                                                        .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                                            cx.stop_propagation();
-                                                            this.outpost_context_menu = Some(OutpostContextMenu {
-                                                                outpost_index,
-                                                                position: event.position,
-                                                            });
-                                                            cx.notify();
-                                                        }))
-                                                        // Bordered cell
-                                                        .child(
-                                                        div()
-                                                            .flex_1()
-                                                            .min_w_0()
-                                                            .rounded_sm()
-                                                            .border_1()
-                                                            .border_color(rgb(if is_active { theme.accent } else { theme.border }))
-                                                            .bg(rgb(theme.panel_bg))
-                                                            .px_2()
-                                                            .py_1()
-                                                            .flex()
-                                                            .flex_row()
-                                                            .items_center()
-                                                            .gap(px(4.))
-                                                            .when(is_active, |this| this.bg(rgb(theme.panel_active_bg)))
-                                                        // Globe icon — vertically centered
-                                                        .child(
-                                                            div()
-                                                                .flex_none()
-                                                                .w(px(18.))
-                                                                .flex()
-                                                                .items_center()
-                                                                .justify_center()
-                                                                .text_size(px(18.))
-                                                                .text_color(rgb(status_color))
-                                                                .child("\u{f0ac}"),
-                                                        )
-                                                        // Two-line text column
-                                                        .child(
-                                                            div()
-                                                                .flex_1()
-                                                                .min_w_0()
-                                                                .flex()
-                                                                .flex_col()
-                                                                .gap(px(1.))
-                                                        // Line 1: branch@host
-                                                        .child(
-                                                            div()
-                                                                .flex()
-                                                                .items_center()
-                                                                .child(
-                                                                    div()
-                                                                        .min_w_0()
-                                                                        .flex_1()
-                                                                        .overflow_hidden()
-                                                                        .whitespace_nowrap()
-                                                                        .text_ellipsis()
-                                                                        .text_xs()
-                                                                        .font_weight(FontWeight::SEMIBOLD)
-                                                                        .text_color(rgb(theme.text_primary))
-                                                                        .child(format!("{}@{}", outpost.branch, outpost.hostname)),
-                                                                ),
-                                                        )
-                                                        // Line 2: outpost label
-                                                        .child(
-                                                            div()
-                                                                .flex()
-                                                                .items_center()
-                                                                .gap_2()
-                                                                .child(
-                                                                    div()
-                                                                        .min_w_0()
-                                                                        .flex_1()
-                                                                        .overflow_hidden()
-                                                                        .whitespace_nowrap()
-                                                                        .text_ellipsis()
-                                                                        .text_xs()
-                                                                        .text_color(rgb(theme.text_disabled))
-                                                                        .child(outpost.label.clone()),
-                                                                ),
-                                                        )
-                                                        )
-                                                        )
-                                                        .opacity(0.8)
-                                                        .into_any_element());
-                                            },
-                                        }
-                                    }
-
-                                    // Final drop zone after last item
-                                    {
-                                        let dz_group = group_key;
-                                        let dz_root = repo_root;
-                                        let accent = theme.accent;
-                                        elements.push(
-                                            div()
-                                                .id(SharedString::from(format!("sidebar-drop-zone-{repository_index}-{item_count}")))
-                                                .h(px(6.))
-                                                .mx(px(4.))
-                                                .rounded_sm()
-                                                .drag_over::<DraggedSidebarItem>({
-                                                    move |style, _, _, _| style.bg(rgb(accent)).h(px(3.)).my(px(1.5))
-                                                })
-                                                .on_drop(cx.listener(move |this, dragged: &DraggedSidebarItem, window, cx| {
-                                                    if dragged.group_key == dz_group {
-                                                        this.handle_sidebar_item_drop(&dragged.item_id, item_count, &dz_group, &dz_root, window, cx);
-                                                    }
-                                                }))
-                                                .into_any_element(),
-                                        );
-                                    }
-
-                                    this.child(
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .children(elements),
-                                )
-                                })
-                        },
-                    ))
-                    // ── Remote repos from expanded LAN daemons ───────────
-                    .children({
-                        // Build remote repo group elements imperatively so we can use cx.listener()
-                        let mut remote_elements: Vec<AnyElement> = Vec::new();
-                        let mut remote_wt_id = 0_usize;
-                        for (&daemon_index, state) in &self.remote_daemon_states {
-                            if !state.expanded {
-                                continue;
-                            }
-                            let daemon_url = state.client.base_url();
-                            // Show loading placeholder in the repo list
-                            if state.loading {
-                                remote_elements.push(
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .gap_1()
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .items_center()
-                                                .gap_1()
-                                                .h(px(32.))
-                                                .child(
-                                                    div()
-                                                        .flex_none()
-                                                        .font_family(FONT_MONO)
-                                                        .text_size(px(12.))
-                                                        .text_color(rgb(theme.text_muted))
-                                                        .child("\u{f233}"),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .text_sm()
-                                                        .text_color(rgb(theme.text_disabled))
-                                                        .child(format!("{}@{} — loading…", "", state.hostname)),
-                                                ),
-                                        )
-                                        .into_any_element(),
-                                );
-                                continue;
-                            }
-                            if let Some(ref err) = state.error {
-                                remote_elements.push(
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(rgb(0xe06c75_u32))
-                                                .child(format!("{}@{}: {err}", "", state.hostname)),
-                                        )
-                                        .into_any_element(),
-                                );
-                                continue;
-                            }
-                            for repo in &state.repositories {
-                                let repo_label = format!("{}@{}", repo.label, state.hostname);
-                                let repo_wts: Vec<_> = state
-                                    .worktrees
-                                    .iter()
-                                    .filter(|w| w.repo_root == repo.root)
-                                    .collect();
-                                let wt_count = repo_wts.len();
-
-                                // Build worktree row elements
-                                let mut wt_rows: Vec<AnyElement> = Vec::new();
-                                for wt in &repo_wts {
-                                    let branch = wt.branch.clone();
-                                    let dir_label = wt.path.rsplit('/').next()
-                                        .unwrap_or(&wt.path).to_owned();
-                                    let additions = wt.diff_additions.unwrap_or(0);
-                                    let deletions = wt.diff_deletions.unwrap_or(0);
-                                    let has_diff = additions > 0 || deletions > 0;
-                                    let pr_number = wt.pr_number;
-                                    let last_activity = wt.last_activity_unix_ms;
-                                    let click_path = wt.path.clone();
-                                    let row_id = remote_wt_id;
-                                    remote_wt_id += 1;
-                                    let is_active = self.active_remote_worktree.as_ref().is_some_and(
-                                        |arw| arw.daemon_index == daemon_index && arw.worktree_path == Path::new(&wt.path),
-                                    );
-
-                                    wt_rows.push(
-                                        div()
-                                            .id(("remote-wt-row", row_id))
-                                            .font_family(FONT_MONO)
-                                            .cursor_pointer()
-                                            .hover(|this| this.bg(rgb(theme.panel_active_bg)))
+                                            .min_w(px(64.))
                                             .flex()
-                                            .items_center()
-                                            .on_click(cx.listener(
-                                                move |this, _, window, cx| {
-                                                    this.select_remote_worktree(
-                                                        daemon_index,
-                                                        click_path.clone(),
-                                                        window,
-                                                        cx,
-                                                    );
-                                                },
-                                            ))
-                                            .child(
+                                            .justify_center()
+                                            .on_click(
+                                                cx.listener(|this, _, window, cx| {
+                                                    this.action_dismiss_quit(window, cx);
+                                                }),
+                                            ),
+                                        )
+                                        .child(
                                             div()
-                                                .flex_1()
-                                                .min_w_0()
+                                                .id("quit-confirm")
+                                                .cursor_pointer()
                                                 .rounded_sm()
                                                 .border_1()
-                                                .border_color(rgb(if is_active { theme.accent } else { theme.border }))
-                                                .bg(rgb(theme.panel_bg))
+                                                .border_color(rgb(0xc94040))
+                                                .bg(rgb(0xc94040))
+                                                .min_w(px(64.))
+                                                .flex()
+                                                .justify_center()
                                                 .px_2()
                                                 .py_1()
-                                                .flex()
-                                                .flex_row()
-                                                .items_center()
-                                                .gap(px(4.))
-                                                .hover(|this| this.bg(rgb(theme.panel_active_bg)))
-                                                .when(is_active, |this| {
-                                                    this.bg(rgb(theme.panel_active_bg))
-                                                        .border_color(rgb(theme.accent))
-                                                })
-                                            .child(
-                                                div()
-                                                    .flex_none()
-                                                    .w(px(18.))
-                                                    .flex()
-                                                    .items_center()
-                                                    .justify_center()
-                                                    .text_size(px(16.))
-                                                    .text_color(rgb(theme.text_muted))
-                                                    .child("\u{e725}"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .flex_1()
-                                                    .min_w_0()
-                                                    .flex()
-                                                    .flex_col()
-                                                    .gap(px(1.))
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .items_center()
-                                                    .gap(px(2.))
-                                                    .child(
-                                                        div()
-                                                            .min_w_0()
-                                                            .flex_1()
-                                                            .overflow_hidden()
-                                                            .whitespace_nowrap()
-                                                            .text_ellipsis()
-                                                            .text_xs()
-                                                            .font_weight(FontWeight::SEMIBOLD)
-                                                            .text_color(rgb(theme.text_primary))
-                                                            .child(branch),
-                                                    )
-                                                    .child({
-                                                        let mut right = div()
-                                                            .flex_none()
-                                                            .flex()
-                                                            .items_center()
-                                                            .gap_1();
-                                                        if has_diff {
-                                                            if additions > 0 {
-                                                                right = right.child(
-                                                                    div()
-                                                                        .text_xs()
-                                                                        .text_color(rgb(0x72d69c))
-                                                                        .child(format!("+{additions}")),
-                                                                );
-                                                            }
-                                                            if deletions > 0 {
-                                                                right = right.child(
-                                                                    div()
-                                                                        .text_xs()
-                                                                        .text_color(rgb(0xeb6f92))
-                                                                        .child(format!("-{deletions}")),
-                                                                );
-                                                            }
-                                                        }
-                                                        if let Some(activity_ms) = last_activity {
-                                                            right = right.child(
-                                                                div()
-                                                                    .text_xs()
-                                                                    .text_color(rgb(theme.text_disabled))
-                                                                    .child(format_relative_time(activity_ms)),
-                                                            );
-                                                        }
-                                                        right
-                                                    }),
-                                            )
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .items_center()
-                                                    .gap_2()
-                                                    .child(
-                                                        div()
-                                                            .min_w_0()
-                                                            .flex_1()
-                                                            .overflow_hidden()
-                                                            .whitespace_nowrap()
-                                                            .text_ellipsis()
-                                                            .text_xs()
-                                                            .text_color(rgb(theme.text_disabled))
-                                                            .child(dir_label),
-                                                    )
-                                                    .when_some(pr_number, |el, pr_num| {
-                                                        el.child(
-                                                            div()
-                                                                .flex_none()
-                                                                .text_xs()
-                                                                .text_color(rgb(theme.accent))
-                                                                .child(format!("#{pr_num}")),
-                                                        )
-                                                    }),
-                                            )
-                                            ) // text column
-                                            ) // bordered cell
-                                            .when(!is_active, |el| el.opacity(0.8))
-                                            .into_any_element(),
-                                    );
-                                }
-
-                                // Repo header + worktree rows
-                                let avatar_url = repo.avatar_url.clone();
-                                let icon: AnyElement = if let Some(url) = avatar_url {
-                                    div()
-                                        .flex_none()
-                                        .size(px(20.))
-                                        .rounded_sm()
-                                        .overflow_hidden()
-                                        .child(
-                                            img(url)
-                                                .size_full()
-                                                .rounded_sm()
-                                                .with_fallback(move || {
-                                                    div()
-                                                        .size_full()
-                                                        .font_family(FONT_MONO)
-                                                        .text_size(px(12.))
-                                                        .text_color(rgb(theme.text_muted))
-                                                        .flex()
-                                                        .items_center()
-                                                        .justify_center()
-                                                        .child("\u{f233}")
-                                                        .into_any_element()
-                                                }),
-                                        )
-                                        .into_any_element()
-                                } else {
-                                    div()
-                                        .flex_none()
-                                        .font_family(FONT_MONO)
-                                        .text_size(px(12.))
-                                        .text_color(rgb(theme.text_muted))
-                                        .child("\u{f233}")
-                                        .into_any_element()
-                                };
-
-                                // "+" button to create worktree on remote
-                                let plus_url = daemon_url.clone();
-                                let plus_hostname = state.hostname.clone();
-                                let plus_repo_root = repo.root.clone();
-                                let plus_id = remote_wt_id;
-                                remote_wt_id += 1;
-
-                                remote_elements.push(
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .gap_1()
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .items_center()
-                                                .gap_1()
-                                                .h(px(32.))
-                                                .child(icon)
-                                                .child(
-                                                    div()
-                                                        .flex_1()
-                                                        .min_w_0()
-                                                        .flex()
-                                                        .items_center()
-                                                        .justify_between()
-                                                        .child(
-                                                            div()
-                                                                .min_w_0()
-                                                                .flex_1()
-                                                                .flex()
-                                                                .items_center()
-                                                                .gap_1()
-                                                                .child(
-                                                                    div()
-                                                                        .text_size(px(16.))
-                                                                        .text_color(rgb(theme.text_muted))
-                                                                        .w(px(14.))
-                                                                        .flex()
-                                                                        .items_center()
-                                                                        .justify_center()
-                                                                        .child("\u{25BE}"),
-                                                                )
-                                                                .child(
-                                                                    div()
-                                                                        .min_w_0()
-                                                                        .overflow_hidden()
-                                                                        .whitespace_nowrap()
-                                                                        .text_ellipsis()
-                                                                        .text_sm()
-                                                                        .font_weight(FontWeight::MEDIUM)
-                                                                        .text_color(rgb(theme.text_primary))
-                                                                        .child(repo_label),
-                                                                )
-                                                                .child(
-                                                                    div()
-                                                                        .text_sm()
-                                                                        .text_color(rgb(theme.text_disabled))
-                                                                        .child(format!("{wt_count}")),
-                                                                ),
-                                                        )
-                                                        // "+" button
-                                                        .child(
-                                                            div()
-                                                                .id(("remote-repo-add-wt", plus_id))
-                                                                .size(px(20.))
-                                                                .rounded_sm()
-                                                                .cursor_pointer()
-                                                                .flex_none()
-                                                                .flex()
-                                                                .items_center()
-                                                                .justify_center()
-                                                                .text_sm()
-                                                                .font_weight(FontWeight::SEMIBOLD)
-                                                                .text_color(rgb(theme.text_muted))
-                                                                .hover(|this| this.text_color(rgb(theme.text_primary)))
-                                                                .child("+")
-                                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                                    this.open_remote_create_modal(
-                                                                        plus_url.clone(),
-                                                                        plus_hostname.clone(),
-                                                                        plus_repo_root.clone(),
-                                                                        cx,
-                                                                    );
-                                                                    cx.stop_propagation();
-                                                                })),
-                                                        ),
-                                                ),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .flex_col()
-                                                .gap(px(6.))
-                                                .children(wt_rows),
-                                        )
-                                        .into_any_element(),
-                                );
-                            }
-                        }
-                        remote_elements
-                    }),
-            )
-            // ── LAN Daemons section ──────────────────────────────────────
-            .when(!self.discovered_daemons.is_empty(), |pane| {
-                let daemons = self.discovered_daemons.clone();
-                pane.child(div().h(px(1.)).bg(rgb(theme.border)))
-                    .child(
-                        div()
-                            .px_2()
-                            .pt_2()
-                            .pb_1()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .child(
-                                        div()
-                                            .font_family(FONT_MONO)
-                                            .text_size(px(14.))
-                                            .text_color(rgb(theme.text_muted))
-                                            .child("\u{f0ac}"), // globe/network icon
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .text_color(rgb(theme.text_muted))
-                                            .child("LAN Daemons"),
-                                    ),
-                            )
-                            .children(daemons.into_iter().enumerate().map(
-                                |(daemon_index, daemon)| {
-                                    let remote_state = self.remote_daemon_states.get(&daemon_index);
-                                    let is_expanded = remote_state.is_some_and(|s| s.expanded);
-                                    let is_loading = remote_state.is_some_and(|s| s.loading);
-                                    let display_name = daemon.display_name().to_owned();
-                                    let chevron = if is_expanded { "\u{f078}" } else { "\u{f054}" };
-                                    let mut col = div()
-                                        .flex()
-                                        .flex_col()
-                                        .child(
-                                            div()
-                                                .id(("lan-daemon-row", daemon_index))
-                                                .cursor_pointer()
-                                                .hover(|this| this.bg(rgb(theme.panel_active_bg)))
-                                                .flex()
-                                                .items_center()
-                                                .on_click(cx.listener(
-                                                    move |this, _, _, cx| {
-                                                        this.toggle_discovered_daemon(
-                                                            daemon_index,
-                                                            cx,
-                                                        );
-                                                    },
-                                                ))
-                                                .child(
-                                                    div()
-                                                        .flex_1()
-                                                        .min_w_0()
-                                                        .rounded_sm()
-                                                        .border_1()
-                                                        .border_color(rgb(if is_expanded {
-                                                            theme.accent
-                                                        } else {
-                                                            theme.border
-                                                        }))
-                                                        .bg(rgb(if is_expanded {
-                                                            theme.panel_active_bg
-                                                        } else {
-                                                            theme.panel_bg
-                                                        }))
-                                                        .px_2()
-                                                        .py_1()
-                                                        .flex()
-                                                        .flex_row()
-                                                        .items_center()
-                                                        .gap(px(4.))
-                                                        .child(
-                                                            div()
-                                                                .flex_none()
-                                                                .w(px(12.))
-                                                                .font_family(FONT_MONO)
-                                                                .text_size(px(10.))
-                                                                .text_color(rgb(theme.text_muted))
-                                                                .child(chevron),
-                                                        )
-                                                        .child(
-                                                            div()
-                                                                .flex_none()
-                                                                .w(px(18.))
-                                                                .flex()
-                                                                .items_center()
-                                                                .justify_center()
-                                                                .font_family(FONT_MONO)
-                                                                .text_size(px(18.))
-                                                                .text_color(rgb(theme.accent))
-                                                                .child("\u{f233}"),
-                                                        )
-                                                        .child(
-                                                            div()
-                                                                .flex_1()
-                                                                .min_w_0()
-                                                                .text_xs()
-                                                                .font_weight(FontWeight::SEMIBOLD)
-                                                                .text_color(rgb(theme.text_primary))
-                                                                .child(display_name),
-                                                        ),
-                                                ),
-                                        );
-
-                                    // Loading/error status below the toggle
-                                    if let Some(state) = remote_state
-                                        && state.expanded
-                                    {
-                                        if is_loading {
-                                            col = col.child(
-                                                div()
-                                                    .pl(px(30.))
-                                                    .py_1()
-                                                    .text_xs()
-                                                    .text_color(rgb(theme.text_disabled))
-                                                    .child("Loading…"),
-                                            );
-                                        } else if let Some(ref err) = state.error {
-                                            col = col.child(
-                                                div()
-                                                    .pl(px(30.))
-                                                    .py_1()
-                                                    .text_xs()
-                                                    .text_color(rgb(0xe06c75_u32))
-                                                    .child(err.clone()),
-                                            );
-                                        }
-                                    }
-
-                                    col
-                                },
-                            )),
-                    )
-            })
-            // ── Bottom bar ───────────────────────────────────────────────
-            .child(div().h(px(1.)).bg(rgb(theme.border)))
-            .child(
-                div()
-                    .h(px(36.))
-                    .px_3()
-                    .flex()
-                    .items_center()
-                    .child(
-                        div()
-                            .id("open-add-repository")
-                            .cursor_pointer()
-                            .h(px(24.))
-                            .w_full()
-                            .rounded_sm()
-                            .border_1()
-                            .border_color(rgb(theme.border))
-                            .bg(rgb(theme.panel_bg))
-                            .hover(|s| {
-                                s.bg(rgb(theme.panel_active_bg))
-                                    .border_color(rgb(theme.accent))
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.open_add_repository_picker(cx);
-                            }))
-                            .child(
-                                div()
-                                    .h_full()
-                                    .w_full()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .gap_1()
-                                    .child(
-                                        div()
-                                            .font_family(FONT_MONO)
-                                            .text_size(px(11.))
-                                            .text_color(rgb(theme.accent))
-                                            .child("\u{f067}"),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(rgb(theme.text_primary))
-                                            .child("Add Repository"),
-                                    ),
-                            ),
-                    ),
-            )
-    }
-
-    fn render_terminal_panel(
-        &mut self,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let cell_width = diff_cell_width_px(cx);
-        let wrap_columns = if let Some(list_width) = self.live_diff_list_width_px() {
-            self.estimated_diff_wrap_columns_for_list_width(list_width, cell_width)
-        } else {
-            let window_width = f32::from(window.window_bounds().get_bounds().size.width).max(600.);
-            self.estimated_diff_wrap_columns_for_window_width(window_width, cell_width)
-        };
-        self.rewrap_diff_sessions_if_needed(wrap_columns);
-
-        let theme = self.theme();
-        let terminals = self.selected_worktree_terminals();
-        let diff_sessions = self.selected_worktree_diff_sessions();
-        let file_view_sessions = self.selected_worktree_file_view_sessions();
-        let mut tabs: Vec<CenterTab> = terminals
-            .iter()
-            .map(|session| CenterTab::Terminal(session.id))
-            .collect();
-        tabs.extend(
-            diff_sessions
-                .iter()
-                .map(|session| CenterTab::Diff(session.id)),
-        );
-        tabs.extend(
-            file_view_sessions
-                .iter()
-                .map(|session| CenterTab::FileView(session.id)),
-        );
-        if self.logs_tab_open {
-            tabs.push(CenterTab::Logs);
-        }
-
-        let mut active_tab = self.active_center_tab_for_selected_worktree();
-        if active_tab.is_some_and(|tab| !tabs.contains(&tab)) {
-            active_tab = None;
-        }
-        if active_tab.is_none() {
-            active_tab = tabs.first().copied();
-            self.active_diff_session_id = match active_tab {
-                Some(CenterTab::Diff(diff_id)) => Some(diff_id),
-                _ => None,
-            };
-            self.active_file_view_session_id = match active_tab {
-                Some(CenterTab::FileView(fv_id)) => Some(fv_id),
-                _ => None,
-            };
-        }
-
-        let active_tab_index =
-            active_tab.and_then(|tab| tabs.iter().position(|entry| *entry == tab));
-        if let Some(index) = active_tab_index {
-            self.center_tabs_scroll_handle.scroll_to_item(index);
-        }
-        let active_terminal = match active_tab {
-            Some(CenterTab::Terminal(session_id)) => self
-                .terminals
-                .iter()
-                .find(|session| session.id == session_id)
-                .cloned(),
-            _ => None,
-        };
-        let active_diff_session = match active_tab {
-            Some(CenterTab::Diff(diff_id)) => self
-                .diff_sessions
-                .iter()
-                .find(|session| session.id == diff_id)
-                .cloned(),
-            _ => None,
-        };
-        let active_file_view_session = match active_tab {
-            Some(CenterTab::FileView(fv_id)) => self
-                .file_view_sessions
-                .iter()
-                .find(|session| session.id == fv_id)
-                .cloned(),
-            _ => None,
-        };
-        let active_preset_tab = self.active_preset_tab;
-        let preset_button = |kind: AgentPresetKind| {
-            let is_active = active_preset_tab == Some(kind);
-            let text_color = if is_active {
-                theme.text_primary
-            } else {
-                theme.text_muted
-            };
-            div()
-                .id(ElementId::Name(
-                    format!("terminal-preset-tab-{}", kind.key()).into(),
-                ))
-                .cursor_pointer()
-                .h(px(22.))
-                .px_2()
-                .flex()
-                .items_center()
-                .rounded_sm()
-                .border_b_1()
-                .border_color(rgb(if is_active {
-                    theme.accent
-                } else {
-                    theme.tab_bg
-                }))
-                .text_color(rgb(text_color))
-                .hover(|s| {
-                    s.bg(rgb(theme.panel_active_bg))
-                        .text_color(rgb(theme.text_primary))
-                })
-                .child(agent_preset_button_content(kind, text_color))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _: &MouseDownEvent, window, cx| {
-                        this.active_preset_tab = Some(kind);
-                        this.launch_agent_preset(kind, window, cx);
-                    }),
-                )
-        };
-
-        div()
-            .flex_1()
-            .h_full()
-            .min_w_0()
-            .min_h_0()
-            .bg(rgb(theme.terminal_bg))
-            .border_l_1()
-            .border_r_1()
-            .border_color(rgb(theme.border))
-            .flex()
-            .flex_col()
-            .track_focus(&self.terminal_focus)
-            .on_any_mouse_down(cx.listener(Self::focus_terminal_panel))
-            .on_key_down(cx.listener(Self::handle_terminal_key_down))
-            .child({
-                let entity = cx.entity().clone();
-                let focus = self.terminal_focus.clone();
-                canvas(
-                    move |_, _, _| {},
-                    move |_, _, window, cx| {
-                        window.handle_input(
-                            &focus,
-                            ElementInputHandler::new(
-                                Bounds {
-                                    origin: point(px(0.), px(0.)),
-                                    size: size(px(0.), px(0.)),
-                                },
-                                entity.clone(),
-                            ),
-                            cx,
-                        );
-                    },
-                )
-                .size(px(0.))
-            })
-            .child(
-                div()
-                    .h(px(32.))
-                    .bg(rgb(theme.tab_bg))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .id("center-tabs-scroll")
-                            .track_scroll(&self.center_tabs_scroll_handle)
-                            .h_full()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .items_center()
-                            .child(
-                                div()
-                                    .h_full()
-                                    .flex_1()
-                                    .flex()
-                                    .items_center()
-                                    .overflow_hidden()
-                                    .when(tabs.is_empty(), |this| {
-                                        this.child(
-                                            div()
-                                                .px_3()
                                                 .text_xs()
-                                                .text_color(rgb(theme.text_muted))
-                                                .child("No tabs"),
-                                        )
-                                    })
-                                    .children(tabs.iter().copied().enumerate().map(|(index, tab)| {
-                                        let is_active = active_tab == Some(tab);
-                                        let tab_count = tabs.len();
-                                        let relation =
-                                            active_tab_index.map(|active_index| index.cmp(&active_index));
-                                        let (tab_icon, tab_label) = match tab {
-                                            CenterTab::Terminal(session_id) => (
-                                                terminal_tab_icon_element(
-                                                    is_active,
-                                                    if is_active {
-                                                        theme.text_primary
-                                                    } else {
-                                                        theme.text_muted
-                                                    },
-                                                    16.0,
-                                                )
-                                                .into_any_element(),
-                                                self.terminals
-                                                    .iter()
-                                                    .find(|session| session.id == session_id)
-                                                    .map(terminal_tab_title)
-                                                    .unwrap_or_else(|| "terminal".to_owned()),
-                                            ),
-                                            CenterTab::Diff(diff_id) => (
-                                                div()
-                                                    .font_family(FONT_MONO)
-                                                    .text_xs()
-                                                    .text_color(rgb(if is_active {
-                                                        theme.text_primary
-                                                    } else {
-                                                        theme.text_muted
-                                                    }))
-                                                    .child(TAB_ICON_DIFF)
-                                                    .into_any_element(),
-                                                self.diff_sessions
-                                                    .iter()
-                                                    .find(|session| session.id == diff_id)
-                                                    .map(diff_tab_title)
-                                                    .unwrap_or_else(|| "diff".to_owned()),
-                                            ),
-                                            CenterTab::FileView(fv_id) => (
-                                                div()
-                                                    .font_family(FONT_MONO)
-                                                    .text_xs()
-                                                    .text_color(rgb(if is_active {
-                                                        theme.text_primary
-                                                    } else {
-                                                        theme.text_muted
-                                                    }))
-                                                    .child(TAB_ICON_FILE)
-                                                    .into_any_element(),
-                                                self.file_view_sessions
-                                                    .iter()
-                                                    .find(|session| session.id == fv_id)
-                                                    .map(|s| s.title.clone())
-                                                    .unwrap_or_else(|| "file".to_owned()),
-                                            ),
-                                            CenterTab::Logs => (
-                                                logs_tab_icon_element(
-                                                    is_active,
-                                                    if is_active {
-                                                        theme.text_primary
-                                                    } else {
-                                                        theme.text_muted
-                                                    },
-                                                    16.0,
-                                                )
-                                                .into_any_element(),
-                                                "Logs".to_owned(),
-                                            ),
-                                        };
-                                        let tab_id = match tab {
-                                            CenterTab::Terminal(id) => ("center-tab-terminal", id),
-                                            CenterTab::Diff(id) => ("center-tab-diff", id),
-                                            CenterTab::FileView(id) => ("center-tab-fileview", id),
-                                            CenterTab::Logs => ("center-tab-logs", 0),
-                                        };
-
-                                        div()
-                                            .id(tab_id)
-                                            .group("tab")
-                                            .relative()
-                                            .h_full()
-                                            .cursor_pointer()
-                                            .w(px(160.))
-                                            .px_4()
-                                            .flex()
-                                            .items_center()
-                                            .gap_2()
-                                            .border_color(rgb(theme.border))
-                                            .bg(rgb(if is_active {
-                                                theme.tab_active_bg
-                                            } else {
-                                                theme.tab_bg
-                                            }))
-                                            .when(!is_active, |this| {
-                                                this.hover(|this| this.bg(rgb(theme.panel_active_bg)))
-                                            })
-                                            .child(tab_icon)
-                                            .child(
-                                                div()
-                                                    .text_sm()
-                                                    .text_color(rgb(if is_active {
-                                                        theme.text_primary
-                                                    } else {
-                                                        theme.text_muted
-                                                    }))
-                                                    .child(tab_label),
-                                            )
-                                            .child(
-                                                div()
-                                                    .id(match tab {
-                                                        CenterTab::Terminal(id) => ("tab-close-terminal", id),
-                                                        CenterTab::Diff(id) => ("tab-close-diff", id),
-                                                        CenterTab::FileView(id) => ("tab-close-fileview", id),
-                                                        CenterTab::Logs => ("tab-close-logs", 0),
-                                                    })
-                                                    .absolute()
-                                                    .right(px(4.))
-                                                    .top_0()
-                                                    .bottom_0()
-                                                    .w(px(24.))
-                                                    .flex()
-                                                    .items_center()
-                                                    .justify_center()
-                                                    .font_family(FONT_MONO)
-                                                    .text_size(px(24.))
-                                                    .text_color(rgb(theme.text_muted))
-                                                    .invisible()
-                                                    .group_hover("tab", |s| s.visible())
-                                                    .child("×")
-                                                    .on_mouse_down(
-                                                        MouseButton::Left,
-                                                        cx.listener(move |this, _: &MouseDownEvent, window, cx| {
-                                                            cx.stop_propagation();
-                                                            match tab {
-                                                                CenterTab::Terminal(session_id) => {
-                                                                    if this.close_terminal_session_by_id(session_id) {
-                                                                        this.sync_daemon_session_store(cx);
-                                                                        this.terminal_scroll_handle.scroll_to_bottom();
-                                                                        window.focus(&this.terminal_focus);
-                                                                        this.focus_terminal_on_next_render = false;
-                                                                        cx.notify();
-                                                                    }
-                                                                },
-                                                                CenterTab::Diff(diff_id) => {
-                                                                    if this.close_diff_session_by_id(diff_id) {
-                                                                        cx.notify();
-                                                                    }
-                                                                },
-                                                                CenterTab::FileView(fv_id) => {
-                                                                    if this.close_file_view_session_by_id(fv_id) {
-                                                                        cx.notify();
-                                                                    }
-                                                                },
-                                                                CenterTab::Logs => {
-                                                                    this.logs_tab_open = false;
-                                                                    this.logs_tab_active = false;
-                                                                    cx.notify();
-                                                                },
-                                                            }
-                                                        }),
-                                                    ),
-                                            )
-                                            .when(index + 1 == tab_count, |this| this.border_r_1())
-                                            .map(|this| match relation {
-                                                Some(std::cmp::Ordering::Equal) => {
-                                                    let el = this.border_r_1();
-                                                    if index == 0 { el } else { el.border_l_1() }
-                                                },
-                                                Some(std::cmp::Ordering::Less) => {
-                                                    let el = this.border_b_1();
-                                                    if index == 0 { el } else { el.border_l_1() }
-                                                },
-                                                Some(std::cmp::Ordering::Greater) => {
-                                                    this.border_r_1().border_b_1()
-                                                },
-                                                None => this.border_b_1(),
-                                            })
-                                            .on_click(cx.listener(move |this, _, window, cx| match tab {
-                                                CenterTab::Terminal(session_id) => {
-                                                    this.logs_tab_active = false;
-                                                    this.select_terminal(session_id, window, cx);
-                                                },
-                                                CenterTab::Diff(diff_id) => {
-                                                    this.logs_tab_active = false;
-                                                    this.select_diff_tab(diff_id, cx);
-                                                },
-                                                CenterTab::FileView(fv_id) => {
-                                                    this.logs_tab_active = false;
-                                                    this.select_file_view_tab(fv_id, cx);
-                                                },
-                                                CenterTab::Logs => {
-                                                    this.logs_tab_active = true;
-                                                    this.active_diff_session_id = None;
-                                                    cx.notify();
-                                                },
-                                            }))
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .h_full()
-                                    .flex_none()
-                                    .flex()
-                                    .items_center()
-                                    .px_2()
-                                    .border_l_1()
-                                    .border_color(rgb(theme.border))
-                                    .border_b_1()
-                                    .child(
-                                        div()
-                                            .id("terminal-tab-new")
-                                            .size(px(20.))
-                                            .cursor_pointer()
-                                            .rounded_sm()
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .text_sm()
-                                            .text_color(rgb(theme.text_muted))
-                                            .hover(|this| this.text_color(rgb(theme.text_primary)))
-                                            .child("+")
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(
-                                                    |this, _: &MouseDownEvent, window, cx| {
-                                                        this.spawn_terminal_session(window, cx)
-                                                    },
-                                                ),
-                                            ),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .h_full()
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .px_2()
-                            .border_l_1()
-                            .border_color(rgb(theme.border))
-                            .border_b_1()
-                            .children(
-                                AgentPresetKind::ORDER
-                                    .iter()
-                                    .copied()
-                                    .filter(|kind| installed_preset_kinds().contains(kind))
-                                    .map(&preset_button),
-                            )
-                            .children(self.repo_presets.iter().enumerate().map(|(index, preset)| {
-                                let icon_text = preset.icon.clone();
-                                let name_text = preset.name.clone();
-                                div()
-                                    .id(ElementId::Name(
-                                        format!("terminal-repo-preset-tab-{index}").into(),
-                                    ))
-                                    .cursor_pointer()
-                                    .h(px(22.))
-                                    .px_2()
-                                    .flex()
-                                    .items_center()
-                                    .rounded_sm()
-                                    .border_b_1()
-                                    .border_color(rgb(theme.tab_bg))
-                                    .text_color(rgb(theme.text_muted))
-                                    .hover(|s| {
-                                        s.bg(rgb(theme.panel_active_bg))
-                                            .text_color(rgb(theme.text_primary))
-                                    })
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(4.))
-                                            .child(
-                                                div()
-                                                    .text_size(px(12.))
-                                                    .line_height(px(14.))
-                                                    .child(if icon_text.is_empty() {
-                                                        "\u{f013}".to_owned()
-                                                    } else {
-                                                        icon_text
-                                                    }),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_size(px(12.))
-                                                    .line_height(px(14.))
-                                                    .child(name_text),
-                                            ),
-                                    )
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _: &MouseDownEvent, window, cx| {
-                                            this.launch_repo_preset(index, window, cx);
-                                        }),
-                                    )
-                                    .on_mouse_down(
-                                        MouseButton::Right,
-                                        cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                                            this.open_manage_repo_presets_modal(Some(index), cx);
-                                        }),
-                                    )
-                            })),
-                    ),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .bg(rgb(theme.terminal_bg))
-                    .when(
-                        active_terminal.is_none() && active_diff_session.is_none() && active_file_view_session.is_none() && active_tab != Some(CenterTab::Logs),
-                        |this| {
-                            this.child(
-                                div()
-                                    .h_full()
-                                    .flex()
-                                    .flex_col()
-                                    .items_center()
-                                    .justify_center()
-                                    .gap_2()
-                                    .text_center()
-                                    .child(
-                                        div()
-                                            .text_lg()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(rgb(theme.text_primary))
-                                            .child("Workspace"),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .text_color(rgb(theme.text_muted))
-                                            .child("Press Cmd-T to open a terminal tab."),
-                                    )
-                                    .child(
-                                        action_button(
-                                            theme,
-                                            "spawn-terminal-empty-state",
-                                            "Open Terminal Tab",
-                                            ActionButtonStyle::Secondary,
-                                            true,
-                                        )
-                                        .on_click(
-                                            cx.listener(|this, _, window, cx| {
-                                                this.spawn_terminal_session(window, cx)
-                                            }),
-                                        ),
-                                    ),
-                            )
-                        },
-                    )
-                    .when_some(active_terminal, |this, session| {
-                        let selection = self.terminal_selection_for_session(session.id);
-                        let ime_text = self.ime_marked_text.as_deref();
-                        let styled_lines =
-                            styled_lines_for_session(&session, theme, true, selection, ime_text);
-                        let mono_font = terminal_mono_font(cx);
-                        let cell_width = terminal_cell_width_px(cx);
-                        let line_height = terminal_line_height_px(cx);
-
-                        this.child(
-                            div()
-                                .h_full()
-                                .w_full()
-                                .min_w_0()
-                                .min_h_0()
-                                .overflow_hidden()
-                                .font(mono_font.clone())
-                                .text_size(px(TERMINAL_FONT_SIZE_PX))
-                                .line_height(px(line_height))
-                                .px_2()
-                                .pt_1()
-                                .flex()
-                                .flex_col()
-                                .gap_0()
-                                .child(
-                                    div()
-                                        .id("terminal-output-scroll")
-                                        .flex_1()
-                                        .w_full()
-                                        .min_w_0()
-                                        .min_h_0()
-                                        .overflow_x_hidden()
-                                        .overflow_y_scroll()
-                                        .scrollbar_width(px(12.))
-                                        .track_scroll(&self.terminal_scroll_handle)
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(Self::handle_terminal_output_mouse_down),
-                                        )
-                                        .on_mouse_move(
-                                            cx.listener(Self::handle_terminal_output_mouse_move),
-                                        )
-                                        .on_mouse_up(
-                                            MouseButton::Left,
-                                            cx.listener(Self::handle_terminal_output_mouse_up),
-                                        )
-                                        .child(
-                                            div()
-                                                .w_full()
-                                                .min_w_0()
-                                                .flex_none()
-                                                .flex()
-                                                .flex_col()
-                                                .gap_0()
-                                                .children(styled_lines.into_iter().map(|line| {
-                                                    render_terminal_line(
-                                                        line,
-                                                        theme,
-                                                        cell_width,
-                                                        line_height,
-                                                        mono_font.clone(),
-                                                    )
+                                                .text_color(rgb(0xffffff))
+                                                .child("Quit")
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.action_confirm_quit(window, cx);
                                                 })),
                                         ),
                                 ),
-                        )
-                    })
-                    .when_some(active_diff_session, |this, session| {
-                        let mono_font = terminal_mono_font(cx);
-                        let diff_cell_width = diff_cell_width_px(cx);
-                        let is_pr_mode =
-                            self.changes_view_mode == ChangesViewMode::PrChanges;
-                        let on_comment_click: Option<
-                            Arc<dyn Fn(usize, usize, &mut App) + 'static>,
-                        > = if is_pr_mode {
-                            let session_id = session.id;
-                            let entity = cx.entity().clone();
-                            Some(Arc::new(
-                                move |row_index: usize, side: usize, app: &mut App| {
-                                    entity.update(app, |this, cx| {
-                                        this.start_inline_comment(
-                                            session_id, row_index, side, cx,
-                                        );
-                                    });
-                                },
-                            ))
-                        } else {
-                            None
-                        };
-                        let pending = self.pending_comment.as_ref();
-                        let on_submit: Option<Arc<dyn Fn(&mut App) + 'static>> =
-                            if pending.is_some() {
-                                let entity = cx.entity().clone();
-                                Some(Arc::new(move |app: &mut App| {
-                                    entity.update(app, |this, cx| {
-                                        this.submit_inline_comment(cx);
-                                    });
-                                }))
-                            } else {
-                                None
-                            };
-                        let on_cancel: Option<Arc<dyn Fn(&mut App) + 'static>> =
-                            if pending.is_some() {
-                                let entity = cx.entity().clone();
-                                Some(Arc::new(move |app: &mut App| {
-                                    entity.update(app, |this, cx| {
-                                        this.cancel_inline_comment(cx);
-                                    });
-                                }))
-                            } else {
-                                None
-                            };
-                        this.child(render_diff_session(
-                            session,
-                            theme,
-                            &self.diff_scroll_handle,
-                            mono_font,
-                            diff_cell_width,
-                            on_comment_click,
-                            pending,
-                            on_submit,
-                            on_cancel,
-                        ))
-                    })
-                    .when_some(active_file_view_session, |this, session| {
-                        let mono_font = terminal_mono_font(cx);
-                        let editing = self.file_view_editing;
-                        this.child(render_file_view_session(
-                            session,
-                            theme,
-                            &self.file_view_scroll_handle,
-                            mono_font,
-                            editing,
-                            cx,
-                        ))
-                    })
-                    .when(active_tab == Some(CenterTab::Logs), |this| {
-                        this.child(self.render_logs_content(cx))
-                    }),
-            )
-    }
-
-    fn render_logs_content(&mut self, cx: &mut Context<Self>) -> Div {
-        let theme = self.theme();
-        let entry_count = self.log_entries.len();
-        let auto_scroll = self.log_auto_scroll;
-
-        div()
-            .h_full()
-            .w_full()
-            .flex()
-            .flex_col()
-            .child(
-                div()
-                    .h(px(28.))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .px_3()
-                    .border_b_1()
-                    .border_color(rgb(theme.border))
-                    .bg(rgb(theme.tab_bg))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(theme.text_muted))
-                            .child(format!("{entry_count} entries")),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .id("log-copy-all")
-                                    .cursor_pointer()
-                                    .text_xs()
-                                    .px(px(4.))
-                                    .py(px(1.))
-                                    .rounded_sm()
-                                    .text_color(rgb(theme.text_muted))
-                                    .hover(|this| {
-                                        this.text_color(rgb(theme.text_primary))
-                                            .bg(rgb(theme.panel_active_bg))
-                                    })
-                                    .child("Copy All")
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                                            let text = this
-                                                .log_entries
-                                                .iter()
-                                                .map(format_log_entry)
-                                                .collect::<Vec<_>>()
-                                                .join("\n");
-                                            cx.write_to_clipboard(ClipboardItem::new_string(text));
-                                        }),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .id("log-auto-scroll-toggle")
-                                    .cursor_pointer()
-                                    .text_xs()
-                                    .text_color(rgb(if auto_scroll {
-                                        theme.accent
-                                    } else {
-                                        theme.text_muted
-                                    }))
-                                    .hover(|this| this.text_color(rgb(theme.text_primary)))
-                                    .child(if auto_scroll {
-                                        "Auto-scroll: ON"
-                                    } else {
-                                        "Auto-scroll: OFF"
-                                    })
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                                            this.log_auto_scroll = !this.log_auto_scroll;
-                                            cx.notify();
-                                        }),
-                                    ),
-                            ),
-                    ),
-            )
-            .child(div().flex_1().min_h_0().child(if entry_count > 0 {
-                let entries = self.log_entries.clone();
-                div()
-                    .id("log-entries")
-                    .size_full()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.log_scroll_handle)
-                    .children(
-                        entries
-                            .iter()
-                            .enumerate()
-                            .map(|(ix, entry)| render_log_row(entry, ix, theme)),
-                    )
-                    .into_any_element()
-            } else {
-                div()
-                    .h_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_sm()
-                    .text_color(rgb(theme.text_muted))
-                    .child("No log entries yet")
-                    .into_any_element()
-            }))
-    }
-
-    fn render_center_pane(&mut self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme();
-        div()
-            .flex_1()
-            .h_full()
-            .min_w_0()
-            .min_h_0()
-            .bg(rgb(theme.app_bg))
-            .flex()
-            .flex_col()
-            .child(self.render_terminal_panel(window, cx))
-    }
-
-    fn render_right_pane(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme();
-        let content: Div = match self.right_pane_tab {
-            RightPaneTab::Changes => self.render_changes_content(cx),
-            RightPaneTab::FileTree => self.render_file_tree(cx),
-        };
-        let search_active = self.right_pane_search_active;
-        let search_text = self.right_pane_search.clone();
-
-        div()
-            .w(px(self.right_pane_width))
-            .h_full()
-            .min_h_0()
-            .bg(rgb(theme.sidebar_bg))
-            .flex()
-            .flex_col()
-            .child(self.render_right_pane_tabs(cx))
-            .child(
-                div()
-                    .id("right-pane-search")
-                    .h(px(28.))
-                    .mx_1()
-                    .my(px(4.))
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(rgb(if search_active {
-                        theme.accent
-                    } else {
-                        theme.border
-                    }))
-                    .bg(rgb(theme.panel_bg))
-                    .cursor_text()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                            this.right_pane_search_active = true;
-                            this.right_pane_search_cursor = char_count(&this.right_pane_search);
-                            cx.notify();
-                        }),
-                    )
-                    .child(
-                        div()
-                            .font_family(FONT_MONO)
-                            .text_xs()
-                            .min_w_0()
-                            .flex_1()
-                            .child(if search_active {
-                                if search_text.is_empty() {
-                                    active_input_display(
-                                        theme,
-                                        "",
-                                        "Filter files…",
-                                        theme.text_disabled,
-                                        self.right_pane_search_cursor,
-                                        28,
-                                    )
-                                } else {
-                                    active_input_display(
-                                        theme,
-                                        &search_text,
-                                        "Filter files…",
-                                        theme.text_primary,
-                                        self.right_pane_search_cursor,
-                                        28,
-                                    )
-                                }
-                            } else if search_text.is_empty() {
-                                div()
-                                    .text_color(rgb(theme.text_disabled))
-                                    .child("Filter files…")
-                                    .into_any_element()
-                            } else {
-                                div()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
-                                    .text_color(rgb(theme.text_primary))
-                                    .child(search_text)
-                                    .into_any_element()
-                            }),
-                    ),
-            )
-            .child(content)
-    }
-
-    fn render_right_pane_tabs(&self, cx: &mut Context<Self>) -> Div {
-        let theme = self.theme();
-        let active_tab = self.right_pane_tab;
-
-        let tab_button = |label: &'static str, tab: RightPaneTab| {
-            let is_active = active_tab == tab;
-            div()
-                .id(ElementId::Name(
-                    format!("right-tab-{label}").to_lowercase().into(),
-                ))
-                .flex_1()
-                .h(px(28.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .cursor_pointer()
-                .text_xs()
-                .font_family(FONT_UI)
-                .bg(rgb(if is_active {
-                    theme.tab_active_bg
-                } else {
-                    theme.tab_bg
-                }))
-                .text_color(rgb(if is_active {
-                    theme.text_primary
-                } else {
-                    theme.text_muted
-                }))
-                .when(is_active, |this| {
-                    this.border_b_2().border_color(rgb(theme.accent))
-                })
-                .when(!is_active, |this| {
-                    this.hover(|this| {
-                        this.bg(rgb(theme.panel_active_bg))
-                            .text_color(rgb(theme.text_primary))
-                    })
-                })
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                        this.set_right_pane_tab(tab, cx);
-                    }),
-                )
-                .child(label)
-        };
-
-        div()
-            .h(px(28.))
-            .flex()
-            .flex_row()
-            .border_b_1()
-            .border_color(rgb(theme.border))
-            .child(tab_button("Changes", RightPaneTab::Changes))
-            .child(tab_button("Files", RightPaneTab::FileTree))
-    }
-
-    fn render_changes_content(&mut self, cx: &mut Context<Self>) -> Div {
-        let theme = self.theme();
-        let selected_path = self.selected_changed_file.clone();
-        let has_pr = self
-            .active_worktree()
-            .is_some_and(|w| w.pr_number.is_some());
-        let view_mode = self.changes_view_mode;
-        let is_pr_mode = view_mode == ChangesViewMode::PrChanges;
-
-        let can_run_actions = self.can_run_local_git_actions();
-        let is_busy = self.git_action_in_flight.is_some();
-        let commit_enabled = can_run_actions && !is_busy && !self.changed_files.is_empty();
-        let push_enabled = can_run_actions && !is_busy;
-        let pr_enabled = can_run_actions && !is_busy;
-        let search_lower = self.right_pane_search.to_lowercase();
-
-        // Mode toggle row (only visible when a PR exists)
-        let mode_toggle_row = div()
-            .h(px(28.))
-            .px_1()
-            .flex()
-            .items_center()
-            .justify_center()
-            .gap_0()
-            .border_b_1()
-            .border_color(rgb(theme.border))
-            .child(self.render_changes_mode_button(
-                "Local",
-                ChangesViewMode::Local,
-                view_mode,
-                theme,
-                cx,
-            ))
-            .child(self.render_changes_mode_button(
-                "PR",
-                ChangesViewMode::PrChanges,
-                view_mode,
-                theme,
-                cx,
-            ));
-
-        let action_header = div()
-            .h(px(32.))
-            .px_1()
-            .gap_1()
-            .flex()
-            .items_center()
-            .justify_between()
-            .border_b_1()
-            .border_color(rgb(theme.border))
-            .when(!is_pr_mode, |this| {
-                this.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .child(
-                            git_action_button(
-                                theme,
-                                "changes-action-commit",
-                                GIT_ACTION_ICON_COMMIT,
-                                "Commit",
-                                commit_enabled,
-                                self.git_action_in_flight == Some(GitActionKind::Commit),
-                            )
-                            .when(commit_enabled, |this| {
-                                this.on_click(cx.listener(|this, _, _, cx| {
-                                    this.run_commit_action(cx);
-                                }))
-                            }),
-                        )
-                        .child(
-                            git_action_button(
-                                theme,
-                                "changes-action-push",
-                                GIT_ACTION_ICON_PUSH,
-                                "Push",
-                                push_enabled,
-                                self.git_action_in_flight == Some(GitActionKind::Push),
-                            )
-                            .when(push_enabled, |this| {
-                                this.on_click(cx.listener(|this, _, _, cx| {
-                                    this.run_push_action(cx);
-                                }))
-                            }),
-                        )
-                        .child(
-                            git_action_button(
-                                theme,
-                                "changes-action-pr",
-                                GIT_ACTION_ICON_PR,
-                                "Create PR",
-                                pr_enabled,
-                                self.git_action_in_flight == Some(GitActionKind::CreatePullRequest),
-                            )
-                            .when(pr_enabled, |this| {
-                                this.on_click(cx.listener(|this, _, _, cx| {
-                                    this.run_create_pr_action(cx);
-                                }))
-                            }),
                         ),
                 )
             })
-            .when(is_pr_mode, |this| {
-                let threads_loading = self.review_threads_loading;
-                this.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(div().text_xs().text_color(rgb(theme.text_muted)).child(
-                            if self.pr_changed_files_loading {
-                                "Loading PR files...".to_owned()
-                            } else {
-                                format!("{} files", self.pr_changed_files.len())
-                            },
-                        ))
-                        .child(
-                            div()
-                                .id("refresh-review-comments")
-                                .cursor_pointer()
-                                .flex()
-                                .items_center()
-                                .gap_1()
-                                .hover(|s| s.opacity(0.8))
-                                .when(threads_loading, |this| this.opacity(0.4))
-                                .child(
-                                    svg()
-                                        .path("icons/ui/refresh-muted.svg")
-                                        .size(px(14.))
-                                        .text_color(rgb(theme.text_muted)),
-                                )
-                                .when(threads_loading, |this| {
-                                    this.child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(rgb(theme.text_disabled))
-                                            .child("..."),
-                                    )
-                                })
-                                .when(!threads_loading, |this| {
-                                    this.on_click(cx.listener(|this, _, _, cx| {
-                                        this.refresh_review_threads_for_worktree(cx);
-                                    }))
-                                }),
-                        ),
-                )
-            });
-
-        let file_list = if is_pr_mode {
-            self.render_pr_changed_files_list(&selected_path, &search_lower, theme, cx)
-        } else {
-            self.render_local_changed_files_list(&selected_path, &search_lower, theme, cx)
-        };
-
-        div()
-            .flex_1()
-            .min_h_0()
-            .flex()
-            .flex_col()
-            .when(has_pr, |this| this.child(mode_toggle_row))
-            .child(action_header)
-            .child(file_list)
     }
+}
 
-    fn render_changes_mode_button(
-        &self,
-        label: &'static str,
-        mode: ChangesViewMode,
-        current: ChangesViewMode,
-        theme: ThemePalette,
-        cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
-        let is_active = mode == current;
-        div()
-            .id(ElementId::Name(format!("mode-{label}").into()))
-            .cursor_pointer()
-            .px(px(6.))
-            .py(px(2.))
-            .text_xs()
-            .font_weight(FontWeight::SEMIBOLD)
-            .rounded_sm()
-            .when(is_active, |this| {
-                this.bg(rgb(theme.panel_active_bg))
-                    .text_color(rgb(theme.text_primary))
-            })
-            .when(!is_active, |this| {
-                this.text_color(rgb(theme.text_muted))
-                    .hover(|this| this.bg(rgb(theme.panel_bg)))
-            })
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                    if this.changes_view_mode != mode {
-                        // Invalidate any open diff session for the active worktree
-                        // so switching modes forces a rebuild with the right diff source.
-                        if let Some(worktree_path) =
-                            this.selected_worktree_path().map(Path::to_path_buf)
-                        {
-                            this.diff_sessions
-                                .retain(|s| s.worktree_path != worktree_path);
-                        }
-                        this.changes_view_mode = mode;
-                        this.selected_changed_file = None;
-                        if mode == ChangesViewMode::PrChanges
-                            && this.pr_changed_files.is_empty()
-                            && !this.pr_changed_files_loading
-                        {
-                            this.refresh_pr_changed_files(cx);
-                        }
-                        cx.notify();
-                    }
-                }),
-            )
-            .child(label)
-    }
+fn process_agent_ws_message(
+    this: &gpui::WeakEntity<ArborWindow>,
+    cx: &mut gpui::AsyncApp,
+    text: &str,
+) {
+    let parsed: Result<serde_json::Value, _> = serde_json::from_str(text);
+    let Ok(value) = parsed else {
+        tracing::warn!(raw = text, "agent WS: failed to parse message");
+        return;
+    };
 
-    fn render_local_changed_files_list(
-        &self,
-        selected_path: &Option<PathBuf>,
-        search_lower: &str,
-        theme: ThemePalette,
-        cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
-        let filtered_changes: Vec<_> = self
-            .changed_files
-            .iter()
-            .filter(|change| {
-                search_lower.is_empty()
-                    || change
-                        .path
-                        .to_string_lossy()
-                        .to_lowercase()
-                        .contains(search_lower)
-            })
-            .cloned()
-            .collect();
-
-        div()
-            .id("changes-scroll")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .scrollbar_width(px(10.))
-            .flex()
-            .flex_col()
-            .font_family(FONT_MONO)
-            .p_1()
-            .children(filtered_changes.iter().map(|change| {
-                let is_selected = selected_path
-                    .as_ref()
-                    .is_some_and(|selected| selected.as_path() == change.path.as_path());
-                let status_color = match change.kind {
-                    ChangeKind::Added => 0xa6e3a1,
-                    ChangeKind::Modified => 0xf9e2af,
-                    ChangeKind::Removed => 0xf38ba8,
-                    ChangeKind::Renamed => 0x89dceb,
-                    ChangeKind::Copied => 0x74c7ec,
-                    ChangeKind::TypeChange => 0xcba6f7,
-                    ChangeKind::Conflict => 0xf38ba8,
-                    ChangeKind::IntentToAdd => 0x94e2d5,
-                };
-                let path_color = match change.kind {
-                    ChangeKind::Added => 0x8fd7ad,
-                    ChangeKind::Removed => 0xf2a4b7,
-                    ChangeKind::Modified => 0xd9d7cf,
-                    ChangeKind::Renamed => 0x8ecae6,
-                    ChangeKind::Copied => 0x91d7e3,
-                    ChangeKind::TypeChange => 0xc4b1ee,
-                    ChangeKind::Conflict => 0xf38ba8,
-                    ChangeKind::IntentToAdd => 0x94e2d5,
-                };
-                let display_path =
-                    truncate_middle_path_for_width(change.path.as_path(), self.right_pane_width);
-                let file_path = change.path.clone();
-
-                div()
-                    .id(ElementId::Name(
-                        format!("changed-file-{}", display_path).into(),
-                    ))
-                    .h(px(24.))
-                    .pl(px(4.))
-                    .pr_1()
-                    .cursor_pointer()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .when(is_selected, |this| this.bg(rgb(theme.panel_active_bg)))
-                    .when(!is_selected, |this| {
-                        this.hover(|this| this.bg(rgb(theme.panel_active_bg)))
-                    })
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                            this.select_changed_file(file_path.clone(), cx);
-                            this.open_diff_tab_for_selected_file(cx);
-                        }),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(px(10.))
-                            .text_color(rgb(status_color))
-                            .child(change_code(change.kind)),
-                    )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .text_xs()
-                            .text_color(rgb(path_color))
-                            .child(display_path),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_end()
-                            .gap_1()
-                            .when(change.additions > 0, |this| {
-                                this.child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(0x72d69c))
-                                        .child(format!("+{}", change.additions)),
-                                )
-                            })
-                            .when(change.deletions > 0, |this| {
-                                this.child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(0xeb6f92))
-                                        .child(format!("-{}", change.deletions)),
-                                )
-                            }),
-                    )
-            }))
-    }
-
-    fn render_pr_changed_files_list(
-        &self,
-        selected_path: &Option<PathBuf>,
-        search_lower: &str,
-        theme: ThemePalette,
-        cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
-        let filtered_files: Vec<_> = self
-            .pr_changed_files
-            .iter()
-            .filter(|file| {
-                search_lower.is_empty()
-                    || file
-                        .path
-                        .to_string_lossy()
-                        .to_lowercase()
-                        .contains(search_lower)
-            })
-            .cloned()
-            .collect();
-
-        div()
-            .id("changes-scroll")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .scrollbar_width(px(10.))
-            .flex()
-            .flex_col()
-            .font_family(FONT_MONO)
-            .p_1()
-            .children(filtered_files.iter().map(|file| {
-                let is_selected = selected_path
-                    .as_ref()
-                    .is_some_and(|selected| selected.as_path() == file.path.as_path());
-                let display_path =
-                    truncate_middle_path_for_width(file.path.as_path(), self.right_pane_width);
-                let file_path = file.path.clone();
-
-                div()
-                    .id(ElementId::Name(format!("pr-file-{}", display_path).into()))
-                    .h(px(24.))
-                    .pl(px(4.))
-                    .pr_1()
-                    .cursor_pointer()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .when(is_selected, |this| this.bg(rgb(theme.panel_active_bg)))
-                    .when(!is_selected, |this| {
-                        this.hover(|this| this.bg(rgb(theme.panel_active_bg)))
-                    })
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                            this.selected_changed_file = Some(file_path.clone());
-                            this.open_pr_diff_tab_for_selected_file(cx);
-                        }),
-                    )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .text_xs()
-                            .text_color(rgb(theme.text_muted))
-                            .child(display_path),
-                    )
-            }))
-    }
-
-    fn render_file_tree(&self, cx: &mut Context<Self>) -> Div {
-        let theme = self.theme();
-        let selected_entry = self.selected_file_tree_entry.clone();
-        let expanded_dirs = &self.expanded_dirs;
-        let search_lower = self.right_pane_search.to_lowercase();
-        let is_filtering = !search_lower.is_empty();
-        let filtered_entries: Vec<_> = self
-            .file_tree_entries
-            .iter()
-            .filter(|entry| {
-                if !is_filtering {
-                    return true;
-                }
-                if entry.is_dir {
-                    return false;
-                }
-                entry
-                    .path
-                    .to_string_lossy()
-                    .to_lowercase()
-                    .contains(&search_lower)
-            })
-            .collect();
-
-        div().flex_1().min_h_0().flex().flex_col().child(
-            div()
-                .id("file-tree-scroll")
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scroll()
-                .scrollbar_width(px(10.))
-                .flex()
-                .flex_col()
-                .font_family(FONT_MONO)
-                .p_1()
-                .children(filtered_entries.iter().map(|entry| {
-                    let is_selected = selected_entry
-                        .as_ref()
-                        .is_some_and(|selected| selected == &entry.path);
-                    let indent = if is_filtering {
-                        4.
-                    } else {
-                        entry.depth as f32 * 16. + 4.
-                    };
-                    let entry_path = entry.path.clone();
-                    let is_dir = entry.is_dir;
-
-                    let chevron = if is_dir {
-                        if expanded_dirs.contains(&entry.path) {
-                            "\u{f078}" // chevron down
-                        } else {
-                            "\u{f054}" // chevron right
-                        }
-                    } else {
-                        " "
-                    };
-
-                    let (file_icon, icon_color) = file_icon_and_color(&entry.name, is_dir);
-
-                    div()
-                        .id(ElementId::Name(
-                            format!("ft-{}", entry.path.display()).into(),
-                        ))
-                        .h(px(24.))
-                        .pl(px(indent))
-                        .pr_1()
-                        .cursor_pointer()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .bg(rgb(if is_selected {
-                            theme.panel_active_bg
-                        } else {
-                            theme.sidebar_bg
-                        }))
-                        .when(!is_selected, |this| {
-                            this.hover(|this| this.bg(rgb(theme.panel_active_bg)))
-                        })
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                                if is_dir {
-                                    this.toggle_file_tree_dir(entry_path.clone(), cx);
-                                } else {
-                                    this.select_file_tree_entry(entry_path.clone(), cx);
-                                }
-                            }),
-                        )
-                        .child(
-                            div()
-                                .w(px(12.))
-                                .flex_none()
-                                .text_size(px(10.))
-                                .text_color(rgb(theme.text_muted))
-                                .child(chevron),
-                        )
-                        .child(
-                            div()
-                                .w(px(20.))
-                                .flex_none()
-                                .text_size(px(18.))
-                                .text_color(rgb(icon_color))
-                                .child(file_icon),
-                        )
-                        .child(
-                            div()
-                                .min_w_0()
-                                .flex_1()
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .text_ellipsis()
-                                .text_xs()
-                                .text_color(rgb(icon_color))
-                                .when(is_dir, |this| this.font_weight(FontWeight::SEMIBOLD))
-                                .child(if is_filtering {
-                                    entry.path.to_string_lossy().into_owned()
-                                } else {
-                                    entry.name.clone()
-                                }),
-                        )
-                })),
-        )
-    }
-
-    fn render_status_bar(&self) -> impl IntoElement {
-        let theme = self.theme();
-        let repo_name = self
-            .repo_root
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| self.repo_root.display().to_string());
-        let worktree = self
-            .active_worktree()
-            .map(|entry| entry.label.clone())
-            .unwrap_or_else(|| "none".to_owned());
-        let terminal_count = self.selected_worktree_path().map_or(0, |worktree_path| {
-            self.terminals
+    let msg_type = value.get("type").and_then(|v| v.as_str());
+    match msg_type {
+        Some("snapshot") => {
+            let sessions = value
+                .get("sessions")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let entries: Vec<(String, AgentState, Option<u64>)> = sessions
                 .iter()
-                .filter(|session| session.worktree_path.as_path() == worktree_path)
-                .count()
-        });
-
-        div()
-            .h(px(26.))
-            .bg(rgb(theme.chrome_bg))
-            .border_t_1()
-            .border_color(rgb(theme.chrome_border))
-            .px_2()
-            .flex()
-            .items_center()
-            .justify_between()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(status_text(theme, "●"))
-                    .child(status_text(theme, format!("repo {repo_name}")))
-                    .child(status_text(theme, "•"))
-                    .child(status_text(theme, format!("worktree {worktree}"))),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(status_text(
-                        theme,
-                        format!("changes {}", self.changed_files.len()),
-                    ))
-                    .child(status_text(theme, "•"))
-                    .child(status_text(theme, format!("terminals {terminal_count}")))
-                    .child(status_text(theme, "•"))
-                    .child(status_text(
-                        theme,
-                        format!("theme {}", self.theme_kind.label()),
-                    ))
-                    .child(
-                        if self.worktree_stats_loading || self.worktree_prs_loading {
-                            let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-                            let frame_index = (SystemTime::now()
-                                .duration_since(SystemTime::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_millis()
-                                / 100) as usize
-                                % frames.len();
-                            status_text(theme, format!("{} loading", frames[frame_index]))
-                        } else {
-                            status_text(theme, "ready")
-                        },
-                    ),
-            )
-    }
-
-    fn render_create_modal(&mut self, cx: &mut Context<Self>) -> Div {
-        let Some(modal) = self.create_modal.clone() else {
-            return div();
-        };
-
-        let theme = self.theme();
-        let has_remote_hosts = !self.remote_hosts.is_empty();
-        let is_worktree_tab = modal.tab == CreateModalTab::LocalWorktree;
-        let is_outpost_tab = modal.tab == CreateModalTab::RemoteOutpost;
-
-        // Worktree tab data
-        let branch_name = derive_branch_name(&modal.worktree_name);
-        let target_path_preview =
-            preview_managed_worktree_path(modal.repository_path.trim(), modal.worktree_name.trim())
-                .unwrap_or_else(|_| "-".to_owned());
-        let checkout_kind = modal.checkout_kind;
-        let is_discrete_clone = checkout_kind == CheckoutKind::DiscreteClone;
-        let repository_active = modal.worktree_active_field == CreateWorktreeField::RepositoryPath;
-        let worktree_active = modal.worktree_active_field == CreateWorktreeField::WorktreeName;
-        let worktree_create_disabled = modal.is_creating
-            || modal.repository_path.trim().is_empty()
-            || modal.worktree_name.trim().is_empty();
-
-        // Outpost tab data
-        let host_name = self
-            .remote_hosts
-            .get(modal.host_index)
-            .map(|h| h.name.clone())
-            .unwrap_or_else(|| "-".to_owned());
-        let remote_preview = self
-            .remote_hosts
-            .get(modal.host_index)
-            .map(|h| {
-                let dir_name =
-                    arbor_ssh::provisioner::sanitize_outpost_dir_name(&modal.outpost_name);
-                format!("{}/{dir_name}", h.remote_base_path)
-            })
-            .unwrap_or_else(|| "-".to_owned());
-        let host_active = modal.outpost_active_field == CreateOutpostField::HostSelector;
-        let host_dropdown_open = modal.host_dropdown_open;
-        let host_names: Vec<(usize, String)> = self
-            .remote_hosts
-            .iter()
-            .enumerate()
-            .map(|(i, h)| (i, h.name.clone()))
-            .collect();
-        let selected_host_index = modal.host_index;
-        let clone_url_active = modal.outpost_active_field == CreateOutpostField::CloneUrl;
-        let outpost_name_active = modal.outpost_active_field == CreateOutpostField::OutpostName;
-        let outpost_branch_preview = derive_branch_name(&modal.outpost_name);
-        let outpost_create_disabled = modal.is_creating
-            || modal.clone_url.trim().is_empty()
-            || modal.outpost_name.trim().is_empty()
-            || self.remote_hosts.is_empty();
-
-        let create_disabled = if is_worktree_tab {
-            worktree_create_disabled
-        } else {
-            outpost_create_disabled
-        };
-        let creating_status = modal.creating_status.clone();
-        let submit_label: String = if modal.is_creating {
-            creating_status.as_deref().unwrap_or("Creating…").to_owned()
-        } else if is_worktree_tab {
-            checkout_kind.action_label().to_owned()
-        } else {
-            "Create Outpost".to_owned()
-        };
-
-        div()
-            .absolute()
-            .inset_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.close_create_modal(cx);
-                    cx.stop_propagation();
-                }),
-            )
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(|this, _, _, cx| {
-                    this.close_create_modal(cx);
-                    cx.stop_propagation();
-                }),
-            )
-            .child(modal_backdrop())
-            .child(
-                div()
-                    .w(px(620.))
-                    .max_w(px(620.))
-                    .flex_none()
-                    .overflow_hidden()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(rgb(theme.border))
-                    .bg(rgb(theme.sidebar_bg))
-                    .p_3()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                        cx.stop_propagation();
-                    })
-                    .on_mouse_down(MouseButton::Right, |_, _, cx| {
-                        cx.stop_propagation();
-                    })
-                    // Header
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(theme.text_primary))
-                            .child("Add"),
-                    )
-                    // Tab bar
-                    .child(
-                        div()
-                            .flex_none()
-                            .flex()
-                            .gap_0()
-                            .border_b_1()
-                            .border_color(rgb(theme.border))
-                            .child(
-                                div()
-                                    .id("tab-local-worktree")
-                                    .cursor_pointer()
-                                    .px_3()
-                                    .py_1()
-                                    .text_xs()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(if is_worktree_tab {
-                                        theme.text_primary
-                                    } else {
-                                        theme.text_muted
-                                    }))
-                                    .when(is_worktree_tab, |this| {
-                                        this.border_b_2()
-                                            .border_color(rgb(theme.accent))
-                                    })
-                                    .when(!is_worktree_tab, |this| {
-                                        this.hover(|this| this.text_color(rgb(theme.text_primary)))
-                                    })
-                                    .child("Local Worktree")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        if let Some(modal) = this.create_modal.as_mut()
-                                            && !modal.is_creating
-                                        {
-                                            modal.tab = CreateModalTab::LocalWorktree;
-                                            modal.error = None;
-                                            cx.notify();
-                                        }
-                                    })),
-                            )
-                            .when(has_remote_hosts, |this| {
-                                this.child(
-                                    div()
-                                        .id("tab-remote-outpost")
-                                        .cursor_pointer()
-                                        .px_3()
-                                        .py_1()
-                                        .text_xs()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(rgb(if is_outpost_tab {
-                                            theme.text_primary
-                                        } else {
-                                            theme.text_muted
-                                        }))
-                                        .when(is_outpost_tab, |this| {
-                                            this.border_b_2()
-                                                .border_color(rgb(theme.accent))
-                                        })
-                                        .when(!is_outpost_tab, |this| {
-                                            this.hover(|this| this.text_color(rgb(theme.text_primary)))
-                                        })
-                                        .child("Remote Outpost")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            if let Some(modal) = this.create_modal.as_mut()
-                                                && !modal.is_creating
-                                            {
-                                                modal.tab = CreateModalTab::RemoteOutpost;
-                                                modal.error = None;
-                                                cx.notify();
-                                            }
-                                        })),
-                                )
-                            }),
-                    )
-                    // Local Worktree tab content
-                    .when(is_worktree_tab, |this| {
-                        this.child(
-                            div()
-                                .flex_none()
-                                .text_xs()
-                                .text_color(rgb(theme.text_muted))
-                                .child("Target base: ~/.arbor/worktrees/<repo>/<worktree>/"),
-                        )
-                        .child(
-                            div()
-                                .flex_none()
-                                .id("create-discrete-clone-checkbox")
-                                .cursor_pointer()
-                                .rounded_sm()
-                                .border_1()
-                                .border_color(rgb(if is_discrete_clone {
-                                    theme.accent
-                                } else {
-                                    theme.border
-                                }))
-                                .bg(rgb(theme.panel_bg))
-                                .hover(|this| this.bg(rgb(theme.panel_active_bg)))
-                                .px_2()
-                                .py_2()
-                                .flex()
-                                .items_start()
-                                .gap_2()
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    let next_kind = if is_discrete_clone {
-                                        CheckoutKind::LinkedWorktree
-                                    } else {
-                                        CheckoutKind::DiscreteClone
-                                    };
-                                    this.set_create_modal_checkout_kind(next_kind, cx);
-                                }))
-                                .child(
-                                    div()
-                                        .mt(px(1.))
-                                        .w(px(14.))
-                                        .h(px(14.))
-                                        .rounded_sm()
-                                        .border_1()
-                                        .border_color(rgb(if is_discrete_clone {
-                                            theme.accent
-                                        } else {
-                                            theme.border
-                                        }))
-                                        .bg(rgb(if is_discrete_clone {
-                                            theme.accent
-                                        } else {
-                                            theme.panel_bg
-                                        }))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .child(
-                                            div()
-                                                .font_family(FONT_MONO)
-                                                .text_size(px(9.))
-                                                .text_color(rgb(if is_discrete_clone {
-                                                    theme.sidebar_bg
-                                                } else {
-                                                    theme.panel_bg
-                                                }))
-                                                .child(if is_discrete_clone {
-                                                    "\u{f00c}"
-                                                } else {
-                                                    ""
-                                                }),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .flex()
-                                        .flex_col()
-                                        .gap(px(2.))
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .font_weight(FontWeight::SEMIBOLD)
-                                                .text_color(rgb(theme.text_primary))
-                                                .child("Discrete clone"),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(rgb(theme.text_muted))
-                                                .child(checkout_kind.description()),
-                                        ),
-                                ),
-                        )
-                        .child(
-                            modal_input_field(
-                                theme,
-                                "create-worktree-repo-input",
-                                "Repository",
-                                &modal.repository_path,
-                                modal.repository_path_cursor,
-                                "Path to git repository",
-                                repository_active,
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.update_create_worktree_modal_input(
-                                    ModalInputEvent::SetActiveField(
-                                        CreateWorktreeField::RepositoryPath,
-                                    ),
-                                    cx,
-                                );
-                            })),
-                        )
-                        .child(
-                            modal_input_field(
-                                theme,
-                                "create-worktree-name-input",
-                                "Worktree Name",
-                                &modal.worktree_name,
-                                modal.worktree_name_cursor,
-                                "e.g. remote-ssh",
-                                worktree_active,
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.update_create_worktree_modal_input(
-                                    ModalInputEvent::SetActiveField(
-                                        CreateWorktreeField::WorktreeName,
-                                    ),
-                                    cx,
-                                );
-                            })),
-                        )
-                        .child(
-                            div()
-                                .flex_none()
-                                .rounded_sm()
-                                .border_1()
-                                .border_color(rgb(theme.border))
-                                .bg(rgb(theme.panel_bg))
-                                .p_2()
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(theme.text_muted))
-                                        .child("Branch"),
-                                )
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_family(FONT_MONO)
-                                        .text_color(rgb(theme.text_primary))
-                                        .child(branch_name),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .flex_none()
-                                .rounded_sm()
-                                .border_1()
-                                .border_color(rgb(theme.border))
-                                .bg(rgb(theme.panel_bg))
-                                .p_2()
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(theme.text_muted))
-                                        .child("Path"),
-                                )
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_family(FONT_MONO)
-                                        .text_color(rgb(theme.text_primary))
-                                        .child(target_path_preview),
-                                ),
-                        )
-                    })
-                    // Remote Outpost tab content
-                    .when(is_outpost_tab, |this| {
-                        this.child(
-                            div()
-                                .flex_none()
-                                .id("outpost-host-selector")
-                                .cursor_pointer()
-                                .rounded_sm()
-                                .border_1()
-                                .border_color(rgb(if host_active {
-                                    theme.accent
-                                } else {
-                                    theme.border
-                                }))
-                                .bg(rgb(theme.panel_bg))
-                                .hover(|this| this.bg(rgb(theme.panel_active_bg)))
-                                .p_2()
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(theme.text_muted))
-                                        .child("Host"),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .justify_between()
-                                        .child(
-                                            div()
-                                                .text_sm()
-                                                .font_family(FONT_MONO)
-                                                .text_color(rgb(theme.text_primary))
-                                                .child(host_name),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(rgb(theme.text_muted))
-                                                .child(if host_dropdown_open {
-                                                    "\u{25b2}"
-                                                } else {
-                                                    "\u{25bc}"
-                                                }),
-                                        ),
-                                )
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.update_create_outpost_modal_input(
-                                        OutpostModalInputEvent::ToggleHostDropdown,
-                                        cx,
-                                    );
-                                })),
-                        )
-                        .when(host_dropdown_open, |this| {
-                            this.child(
-                                div()
-                                    .id("outpost-host-dropdown")
-                                    .rounded_sm()
-                                    .border_1()
-                                    .border_color(rgb(theme.accent))
-                                    .bg(rgb(theme.panel_bg))
-                                    .py_1()
-                                    .max_h(px(200.))
-                                    .overflow_y_scroll()
-                                    .children(host_names.into_iter().map(
-                                        |(index, name)| {
-                                            let is_selected = index == selected_host_index;
-                                            div()
-                                                .id(("host-option", index))
-                                                .cursor_pointer()
-                                                .px_2()
-                                                .py_1()
-                                                .text_sm()
-                                                .font_family(FONT_MONO)
-                                                .rounded_sm()
-                                                .mx_1()
-                                                .text_color(rgb(theme.text_primary))
-                                                .when(is_selected, |this| {
-                                                    this.bg(rgb(theme.panel_active_bg))
-                                                })
-                                                .hover(|this| {
-                                                    this.bg(rgb(theme.panel_active_bg))
-                                                })
-                                                .child(name)
-                                                .on_click(cx.listener(
-                                                    move |this, _, _, cx| {
-                                                        this.update_create_outpost_modal_input(
-                                                            OutpostModalInputEvent::SelectHost(
-                                                                index,
-                                                            ),
-                                                            cx,
-                                                        );
-                                                    },
-                                                ))
-                                        },
-                                    )),
-                            )
-                        })
-                        .child(
-                            modal_input_field(
-                                theme,
-                                "outpost-clone-url-input",
-                                "Clone URL",
-                                &modal.clone_url,
-                                modal.clone_url_cursor,
-                                "git@github.com:user/repo.git",
-                                clone_url_active,
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.update_create_outpost_modal_input(
-                                    OutpostModalInputEvent::SetActiveField(
-                                        CreateOutpostField::CloneUrl,
-                                    ),
-                                    cx,
-                                );
-                            })),
-                        )
-                        .child(
-                            modal_input_field(
-                                theme,
-                                "outpost-name-input",
-                                "Outpost Name",
-                                &modal.outpost_name,
-                                modal.outpost_name_cursor,
-                                "e.g. my-feature",
-                                outpost_name_active,
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.update_create_outpost_modal_input(
-                                    OutpostModalInputEvent::SetActiveField(
-                                        CreateOutpostField::OutpostName,
-                                    ),
-                                    cx,
-                                );
-                            })),
-                        )
-                        .child(
-                            div()
-                                .rounded_sm()
-                                .border_1()
-                                .border_color(rgb(theme.border))
-                                .bg(rgb(theme.panel_bg))
-                                .p_2()
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(theme.text_muted))
-                                        .child("Branch"),
-                                )
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_family(FONT_MONO)
-                                        .text_color(rgb(theme.text_primary))
-                                        .child(outpost_branch_preview),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .rounded_sm()
-                                .border_1()
-                                .border_color(rgb(theme.border))
-                                .bg(rgb(theme.panel_bg))
-                                .p_2()
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(theme.text_muted))
-                                        .child("Remote Path"),
-                                )
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_family(FONT_MONO)
-                                        .text_color(rgb(theme.text_primary))
-                                        .child(remote_preview),
-                                ),
-                        )
-                    })
-                    // Error
-                    .when_some(modal.error.clone(), |this, error| {
-                        this.child(
-                            div()
-                                .flex_none()
-                                .rounded_sm()
-                                .border_1()
-                                .border_color(rgb(0xa44949))
-                                .bg(rgb(0x4d2a2a))
-                                .px_2()
-                                .py_1()
-                                .text_xs()
-                                .text_color(rgb(0xffd7d7))
-                                .child(error),
-                        )
-                    })
-                    // Buttons
-                    .child(
-                        div()
-                            .flex_none()
-                            .w_full()
-                            .min_w_0()
-                            .flex()
-                            .items_center()
-                            .justify_end()
-                            .gap_2()
-                            .child(
-                                action_button(
-                                    theme,
-                                    "cancel-create-modal",
-                                    "Cancel",
-                                    ActionButtonStyle::Secondary,
-                                    true,
-                                )
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.close_create_modal(cx);
-                                })),
-                            )
-                            .child(
-                                action_button(
-                                    theme,
-                                    "submit-create-modal",
-                                    submit_label,
-                                    ActionButtonStyle::Primary,
-                                    !create_disabled,
-                                )
-                                .when(!create_disabled, |this| {
-                                    this.on_click(cx.listener(|this, _, _, cx| {
-                                        if let Some(modal) = this.create_modal.as_ref() {
-                                            match modal.tab {
-                                                CreateModalTab::LocalWorktree => {
-                                                    this.submit_create_worktree_modal(cx);
-                                                },
-                                                CreateModalTab::RemoteOutpost => {
-                                                    this.submit_create_outpost_modal(cx);
-                                                },
-                                            }
-                                        }
-                                    }))
-                                }),
-                            ),
-                    ),
-            )
-    }
-
-    fn render_github_auth_modal(&mut self, cx: &mut Context<Self>) -> Div {
-        let Some(modal) = self.github_auth_modal.clone() else {
-            return div();
-        };
-
-        let theme = self.theme();
-        let copy_feedback_active = self.github_auth_copy_feedback_active;
-        let copy_label = if copy_feedback_active {
-            "Copied"
-        } else {
-            "Copy code"
-        };
-        let status_line = if self.github_auth_in_progress {
-            "Waiting for GitHub authorization..."
-        } else {
-            "Authorization complete."
-        };
-        let detail_line = if self.github_auth_in_progress {
-            "Arbor will continue automatically after you approve access."
-        } else {
-            "You can close this dialog."
-        };
-
-        div()
-            .absolute()
-            .inset_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.close_github_auth_modal(cx);
-                    cx.stop_propagation();
-                }),
-            )
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(|this, _, _, cx| {
-                    this.close_github_auth_modal(cx);
-                    cx.stop_propagation();
-                }),
-            )
-            .child(modal_backdrop())
-            .child(
-                div()
-                    .w(px(560.))
-                    .max_w(px(560.))
-                    .flex_none()
-                    .overflow_hidden()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(rgb(theme.border))
-                    .bg(rgb(theme.sidebar_bg))
-                    .p_3()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                        cx.stop_propagation();
-                    })
-                    .on_mouse_down(MouseButton::Right, |_, _, cx| {
-                        cx.stop_propagation();
-                    })
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(theme.text_primary))
-                                    .child("GitHub Sign In"),
-                            )
-                            .child(
-                                action_button(
-                                    theme,
-                                    "close-github-auth-modal",
-                                    "Close",
-                                    ActionButtonStyle::Secondary,
-                                    true,
-                                )
-                                .on_click(cx.listener(
-                                    |this, _, _, cx| {
-                                        this.close_github_auth_modal(cx);
-                                    },
-                                )),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(theme.text_muted))
-                            .child("1. Open GitHub and enter this device code."),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(theme.text_muted))
-                            .child("2. Return here after approving Arbor."),
-                    )
-                    .child(
-                        div()
-                            .rounded_sm()
-                            .border_1()
-                            .border_color(rgb(theme.border))
-                            .bg(rgb(theme.panel_bg))
-                            .p_2()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(theme.text_muted))
-                                    .child("Device code"),
-                            )
-                            .child(
-                                div()
-                                    .pt_1()
-                                    .text_lg()
-                                    .font_family(FONT_MONO)
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(theme.text_primary))
-                                    .child(modal.user_code),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .rounded_sm()
-                            .border_1()
-                            .border_color(rgb(theme.border))
-                            .bg(rgb(theme.panel_bg))
-                            .p_2()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(theme.text_muted))
-                                    .child("Verification URL"),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_family(FONT_MONO)
-                                    .text_color(rgb(theme.text_primary))
-                                    .child(modal.verification_url),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(if copy_feedback_active {
-                                0x68c38d
-                            } else {
-                                theme.accent
-                            }))
-                            .child(if copy_feedback_active {
-                                "Code copied to clipboard"
-                            } else {
-                                status_line
-                            }),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(theme.text_muted))
-                            .child(detail_line),
-                    )
-                    .child(
-                        div()
-                            .w_full()
-                            .min_w_0()
-                            .flex()
-                            .items_center()
-                            .justify_end()
-                            .gap_2()
-                            .child(
-                                action_button(
-                                    theme,
-                                    "github-auth-copy-code",
-                                    copy_label,
-                                    if copy_feedback_active {
-                                        ActionButtonStyle::Primary
-                                    } else {
-                                        ActionButtonStyle::Secondary
-                                    },
-                                    true,
-                                )
-                                .on_click(cx.listener(
-                                    |this, _, _, cx| {
-                                        this.copy_github_auth_code_to_clipboard(cx);
-                                    },
-                                )),
-                            )
-                            .child(
-                                action_button(
-                                    theme,
-                                    "github-auth-open",
-                                    "Open GitHub",
-                                    ActionButtonStyle::Primary,
-                                    true,
-                                )
-                                .on_click(cx.listener(
-                                    |this, _, _, cx| {
-                                        this.open_github_auth_verification_page(cx);
-                                    },
-                                )),
-                            ),
-                    ),
-            )
-    }
-
-    fn render_repository_context_menu(&mut self, cx: &mut Context<Self>) -> Div {
-        let Some(menu) = self.repository_context_menu.as_ref() else {
-            return div();
-        };
-
-        let theme = self.theme();
-        let index = menu.repository_index;
-        let position = menu.position;
-
-        // Full-screen invisible overlay to dismiss on click outside,
-        // with the menu as a child — same pattern as render_top_bar_worktree_quick_actions_overlay
-        div()
-            .absolute()
-            .inset_0()
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                this.repository_context_menu = None;
-                cx.stop_propagation();
+                .filter_map(|s| {
+                    let cwd = s.get("cwd")?.as_str()?;
+                    let state_str = s.get("state")?.as_str()?;
+                    let state = match state_str {
+                        "working" => AgentState::Working,
+                        "waiting" => AgentState::Waiting,
+                        _ => return None,
+                    };
+                    let updated_at = s.get("updated_at_unix_ms").and_then(|v| v.as_u64());
+                    Some((cwd.to_owned(), state, updated_at))
+                })
+                .collect();
+            tracing::info!(count = entries.len(), "agent WS snapshot received");
+            for (cwd, state, _) in &entries {
+                tracing::info!(cwd = cwd.as_str(), ?state, "  snapshot entry");
+            }
+            let _ = this.update(cx, |this, cx| {
+                apply_agent_ws_snapshot(this, &entries);
                 cx.notify();
-            }))
-            .on_mouse_down(MouseButton::Right, cx.listener(|this, _, _, cx| {
-                this.repository_context_menu = None;
-                cx.stop_propagation();
-                cx.notify();
-            }))
-            .on_mouse_move(cx.listener(|this, _, _, cx| {
-                this.repository_context_menu = None;
-                cx.notify();
-            }))
-            // Absolutely-positioned menu at cursor position
-            .child(
-                div()
-                    .absolute()
-                    .left(position.x)
-                    .top(position.y)
-                    .w(px(180.))
-                    .py(px(4.))
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(rgb(theme.border))
-                    .bg(rgb(theme.chrome_bg))
-                    .on_mouse_move(|_, _, cx| {
-                        cx.stop_propagation();
-                    })
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                        cx.stop_propagation();
-                    })
-                    .on_mouse_down(MouseButton::Right, |_, _, cx| {
-                        cx.stop_propagation();
-                    })
-                    .child(
-                        div()
-                            .id("repository-context-remove")
-                            .h(px(30.))
-                            .mx(px(4.))
-                            .px(px(8.))
-                            .rounded_sm()
-                            .cursor_pointer()
-                            .hover(|this| this.bg(rgb(0x3a2030)))
-                            .flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                let label = this
-                                    .repositories
-                                    .get(index)
-                                    .map(|r| r.label.clone())
-                                    .unwrap_or_default();
-                                this.repository_context_menu = None;
-                                this.delete_modal = Some(DeleteModal {
-                                    target: DeleteTarget::Repository(index),
-                                    label,
-                                    branch: String::new(),
-                                    has_unpushed: None,
-                                    delete_branch: false,
-                                    is_deleting: false,
-                                    error: None,
-                                });
-                                cx.notify();
-                            }))
-                            .child(
-                                div()
-                                    .font_family(FONT_MONO)
-                                    .text_size(px(16.))
-                                    .text_color(rgb(0xeb6f92))
-                                    .child("\u{f1f8}"),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(13.))
-                                    .text_color(rgb(0xeb6f92))
-                                    .child("Remove"),
-                            ),
-                    ),
-            )
-    }
-
-    fn render_worktree_context_menu(&mut self, cx: &mut Context<Self>) -> Div {
-        let Some(menu) = self.worktree_context_menu.as_ref() else {
-            return div();
-        };
-
-        let theme = self.theme();
-        let index = menu.worktree_index;
-        let position = menu.position;
-
-        div()
-            .absolute()
-            .inset_0()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.worktree_context_menu = None;
-                    cx.stop_propagation();
-                    cx.notify();
-                }),
-            )
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(|this, _, _, cx| {
-                    this.worktree_context_menu = None;
-                    cx.stop_propagation();
-                    cx.notify();
-                }),
-            )
-            .on_mouse_move(cx.listener(|this, _, _, cx| {
-                this.worktree_context_menu = None;
-                cx.notify();
-            }))
-            .child(
-                div()
-                    .absolute()
-                    .left(position.x)
-                    .top(position.y)
-                    .w(px(180.))
-                    .py(px(4.))
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(rgb(theme.border))
-                    .bg(rgb(theme.chrome_bg))
-                    .on_mouse_move(|_, _, cx| {
-                        cx.stop_propagation();
-                    })
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                        cx.stop_propagation();
-                    })
-                    .on_mouse_down(MouseButton::Right, |_, _, cx| {
-                        cx.stop_propagation();
-                    })
-                    .child(
-                        div()
-                            .id("worktree-context-delete")
-                            .h(px(30.))
-                            .mx(px(4.))
-                            .px(px(8.))
-                            .rounded_sm()
-                            .cursor_pointer()
-                            .hover(|this| this.bg(rgb(0x3a2030)))
-                            .flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.worktree_context_menu = None;
-                                let wt_label = this
-                                    .worktrees
-                                    .get(index)
-                                    .map(|wt| wt.label.clone())
-                                    .unwrap_or_default();
-                                let wt_branch = this
-                                    .worktrees
-                                    .get(index)
-                                    .map(|wt| wt.branch.clone())
-                                    .unwrap_or_default();
-                                this.open_delete_modal(
-                                    DeleteTarget::Worktree(index),
-                                    wt_label,
-                                    wt_branch,
-                                    cx,
-                                );
-                            }))
-                            .child(
-                                div()
-                                    .font_family(FONT_MONO)
-                                    .text_size(px(16.))
-                                    .text_color(rgb(0xeb6f92))
-                                    .child("\u{f1f8}"),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(13.))
-                                    .text_color(rgb(0xeb6f92))
-                                    .child("Delete"),
-                            ),
-                    ),
-            )
-    }
-
-    fn render_worktree_hover_popover(&mut self, cx: &mut Context<Self>) -> Div {
-        let Some(popover) = self.worktree_hover_popover.as_ref() else {
-            return div();
-        };
-        let Some(worktree) = self.worktrees.get(popover.worktree_index) else {
-            return div();
-        };
-
-        let theme = self.theme();
-        let checks_expanded = popover.checks_expanded;
-        let popover_zone_bounds =
-            worktree_hover_popover_zone_bounds(self.left_pane_width, popover, worktree);
-
-        // Build popover card content
-        let popover_wt_index = popover.worktree_index;
-        let mut card = div()
-            .id("worktree-hover-popover-card")
-            .font_family(FONT_MONO)
-            .w(px(WORKTREE_HOVER_POPOVER_CARD_WIDTH_PX))
-            .bg(rgb(theme.panel_bg))
-            .border_1()
-            .border_color(rgb(theme.border))
-            .rounded_md()
-            .p_2()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                if *hovered {
-                    this.cancel_worktree_hover_popover_dismiss();
-                } else {
-                    this.schedule_worktree_hover_popover_dismiss(popover_wt_index, cx);
-                }
-            }))
-            .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                cx.stop_propagation();
             });
-
-        // Header: branch name + relative time (top-right), then directory label
-        card = card.child(
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(1.))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .child(
-                            div()
-                                .text_xs()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(theme.text_primary))
-                                .child(worktree.branch.clone()),
-                        )
-                        .when_some(worktree.last_activity_unix_ms, |el, ms| {
-                            el.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(theme.text_disabled))
-                                    .child(format_relative_time(ms)),
-                            )
-                        }),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(theme.text_muted))
-                        .child(worktree.label.clone()),
-                ),
-        );
-
-        // Diff summary
-        if let Some(summary) = worktree.diff_summary
-            && (summary.additions > 0 || summary.deletions > 0)
-        {
-            let mut diff_row = div().flex().items_center().gap_1();
-            if summary.additions > 0 {
-                diff_row = diff_row.child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(0x72d69c))
-                        .child(format!("+{}", summary.additions)),
-                );
-            }
-            if summary.deletions > 0 {
-                diff_row = diff_row.child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(0xeb6f92))
-                        .child(format!("-{}", summary.deletions)),
-                );
-            }
-            card = card.child(diff_row);
-        }
-
-        // Agent section
-        if let Some(state) = worktree.agent_state {
-            let (dot_color, state_label) = match state {
-                AgentState::Working => (0xe5c07b_u32, "Working"),
-                AgentState::Waiting => (0x61afef_u32, "Waiting"),
-            };
-
-            let mut agent_row = div()
-                .flex()
-                .items_center()
-                .gap_1()
-                .child(
-                    div()
-                        .flex_none()
-                        .size(px(6.))
-                        .rounded_full()
-                        .bg(rgb(dot_color)),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(theme.text_primary))
-                        .child(state_label),
-                );
-
-            if let Some(ref task) = worktree.agent_task {
-                agent_row = agent_row.child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(theme.text_muted))
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .child(task.clone()),
-                );
-            }
-
-            card = card.child(agent_row);
-        }
-
-        // PR section
-        if let Some(ref pr) = worktree.pr_details {
-            card = card.child(div().h(px(1.)).bg(rgb(theme.border)).my_1());
-
-            let (state_label, state_color) = match pr.state {
-                github_service::PrState::Open => ("Open", 0x72d69c_u32),
-                github_service::PrState::Draft => ("Draft", theme.text_disabled),
-                github_service::PrState::Merged => ("Merged", 0xbb9af7_u32),
-                github_service::PrState::Closed => ("Closed", 0xeb6f92_u32),
-            };
-
-            let pr_url = pr.url.clone();
-            let mut pr_header = div()
-                .flex()
-                .items_center()
-                .gap_1()
-                .child(
-                    div()
-                        .id("popover-pr-link")
-                        .cursor_pointer()
-                        .text_xs()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(theme.accent))
-                        .hover(|this| this.text_color(rgb(theme.text_primary)))
-                        .child(format!("#{}", pr.number))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.open_external_url(&pr_url, cx);
-                        })),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .px_1()
-                        .rounded_sm()
-                        .text_color(rgb(state_color))
-                        .child(state_label),
-                );
-
-            if pr.additions > 0 || pr.deletions > 0 {
-                if pr.additions > 0 {
-                    pr_header = pr_header.child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0x72d69c))
-                            .child(format!("+{}", pr.additions)),
-                    );
-                }
-                if pr.deletions > 0 {
-                    pr_header = pr_header.child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0xeb6f92))
-                            .child(format!("-{}", pr.deletions)),
-                    );
-                }
-            }
-            card = card.child(pr_header);
-
-            // PR title
-            card = card.child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(theme.text_muted))
-                    .child(pr.title.clone()),
-            );
-
-            // Checks + review (only for open/draft PRs)
-            if pr.state == github_service::PrState::Open
-                || pr.state == github_service::PrState::Draft
-            {
-                let mut status_row = div().flex().items_center().gap_1();
-
-                if !pr.checks.is_empty() {
-                    let passed = pr
-                        .checks
-                        .iter()
-                        .filter(|(_, s)| *s == github_service::CheckStatus::Success)
-                        .count();
-                    let total = pr.checks.len();
-                    let (check_icon, check_color) = match pr.checks_status {
-                        github_service::CheckStatus::Success => ("\u{f00c}", 0x72d69c_u32),
-                        github_service::CheckStatus::Failure => ("\u{f00d}", 0xeb6f92_u32),
-                        github_service::CheckStatus::Pending => ("\u{f192}", 0xe5c07b_u32),
+        },
+        Some("update") => {
+            if let Some(session) = value.get("session") {
+                let cwd = session.get("cwd").and_then(|v| v.as_str());
+                let state_str = session.get("state").and_then(|v| v.as_str());
+                if let (Some(cwd), Some(state_str)) = (cwd, state_str) {
+                    tracing::info!(cwd, state = state_str, "agent WS update received");
+                    let state = match state_str {
+                        "working" => AgentState::Working,
+                        "waiting" => AgentState::Waiting,
+                        _ => return,
                     };
-                    let chevron = if checks_expanded {
-                        "\u{f078}"
-                    } else {
-                        "\u{f054}"
-                    };
-                    status_row = status_row.child(
-                        div()
-                            .id("popover-checks-toggle")
-                            .cursor_pointer()
-                            .hover(|this| this.bg(rgb(theme.panel_active_bg)))
-                            .flex()
-                            .items_center()
-                            .gap(px(2.))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(check_color))
-                                    .child(check_icon),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(theme.text_muted))
-                                    .child(format!("{passed}/{total} checks")),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(theme.text_disabled))
-                                    .child(chevron),
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if let Some(ref mut p) = this.worktree_hover_popover {
-                                    p.checks_expanded = !p.checks_expanded;
-                                }
-                                cx.notify();
-                            })),
-                    );
-                }
-
-                let (review_label, review_color) = match pr.review_decision {
-                    github_service::ReviewDecision::Approved => ("Approved", 0x72d69c_u32),
-                    github_service::ReviewDecision::ChangesRequested => {
-                        ("Changes requested", 0xeb6f92_u32)
-                    },
-                    github_service::ReviewDecision::Pending => {
-                        ("Review pending", theme.text_disabled)
-                    },
-                };
-                status_row = status_row.child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(review_color))
-                        .child(review_label),
-                );
-
-                card = card.child(status_row);
-
-                // Expanded checks list
-                if checks_expanded {
-                    let mut checks_list = div().flex().flex_col().gap(px(2.)).pl_2();
-                    let mut sorted_checks: Vec<_> = pr.checks.iter().collect();
-                    sorted_checks.sort_by_key(|(_, status)| match status {
-                        github_service::CheckStatus::Failure => 0,
-                        github_service::CheckStatus::Pending => 1,
-                        github_service::CheckStatus::Success => 2,
+                    let updated_at = session.get("updated_at_unix_ms").and_then(|v| v.as_u64());
+                    let entries = vec![(cwd.to_owned(), state, updated_at)];
+                    let _ = this.update(cx, |this, cx| {
+                        apply_agent_ws_update(this, &entries);
+                        cx.notify();
                     });
-                    for (name, status) in sorted_checks {
-                        let (icon, color) = match status {
-                            github_service::CheckStatus::Success => ("\u{f00c}", 0x72d69c_u32),
-                            github_service::CheckStatus::Failure => ("\u{f00d}", 0xeb6f92_u32),
-                            github_service::CheckStatus::Pending => ("\u{f192}", 0xe5c07b_u32),
-                        };
-                        checks_list = checks_list.child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(4.))
-                                .child(div().text_xs().text_color(rgb(color)).child(icon))
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(theme.text_muted))
-                                        .overflow_hidden()
-                                        .whitespace_nowrap()
-                                        .text_ellipsis()
-                                        .child(name.clone()),
-                                ),
-                        );
-                    }
-                    card = card.child(checks_list);
                 }
             }
-        }
-
-        div().absolute().inset_0().child(
-            div()
-                .id("worktree-hover-popover-zone")
-                .absolute()
-                .left(popover_zone_bounds.origin.x)
-                .top(popover_zone_bounds.origin.y)
-                .p(px(WORKTREE_HOVER_POPOVER_ZONE_PADDING_PX))
-                .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, _| {
-                    this.update_worktree_hover_mouse_position(event.position);
-                }))
-                .on_hover(cx.listener(move |this, hovered: &bool, window, cx| {
-                    this.update_worktree_hover_mouse_position(window.mouse_position());
-                    if *hovered {
-                        this.cancel_worktree_hover_popover_dismiss();
-                    } else {
-                        this.schedule_worktree_hover_popover_dismiss(popover_wt_index, cx);
-                    }
-                }))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|_, _, _, cx| {
-                        cx.stop_propagation();
-                    }),
-                )
-                .child(card),
-        )
+        },
+        _ => {},
     }
+}
 
-    fn render_outpost_context_menu(&mut self, cx: &mut Context<Self>) -> Div {
-        let Some(menu) = self.outpost_context_menu.as_ref() else {
-            return div();
-        };
-
-        let theme = self.theme();
-        let index = menu.outpost_index;
-        let position = menu.position;
-
-        div()
-            .absolute()
-            .inset_0()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.outpost_context_menu = None;
-                    cx.stop_propagation();
-                    cx.notify();
-                }),
-            )
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(|this, _, _, cx| {
-                    this.outpost_context_menu = None;
-                    cx.stop_propagation();
-                    cx.notify();
-                }),
-            )
-            .on_mouse_move(cx.listener(|this, _, _, cx| {
-                this.outpost_context_menu = None;
-                cx.notify();
-            }))
-            .child(
-                div()
-                    .absolute()
-                    .left(position.x)
-                    .top(position.y)
-                    .w(px(180.))
-                    .py(px(4.))
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(rgb(theme.border))
-                    .bg(rgb(theme.chrome_bg))
-                    .on_mouse_move(|_, _, cx| {
-                        cx.stop_propagation();
-                    })
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                        cx.stop_propagation();
-                    })
-                    .on_mouse_down(MouseButton::Right, |_, _, cx| {
-                        cx.stop_propagation();
-                    })
-                    .child(
-                        div()
-                            .id("outpost-context-delete")
-                            .h(px(30.))
-                            .mx(px(4.))
-                            .px(px(8.))
-                            .rounded_sm()
-                            .cursor_pointer()
-                            .hover(|this| this.bg(rgb(0x3a2030)))
-                            .flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.outpost_context_menu = None;
-                                let op_label = this
-                                    .outposts
-                                    .get(index)
-                                    .map(|op| op.label.clone())
-                                    .unwrap_or_default();
-                                let op_branch = this
-                                    .outposts
-                                    .get(index)
-                                    .map(|op| op.branch.clone())
-                                    .unwrap_or_default();
-                                this.open_delete_modal(
-                                    DeleteTarget::Outpost(index),
-                                    op_label,
-                                    op_branch,
-                                    cx,
-                                );
-                            }))
-                            .child(
-                                div()
-                                    .font_family(FONT_MONO)
-                                    .text_size(px(16.))
-                                    .text_color(rgb(0xeb6f92))
-                                    .child("\u{f1f8}"),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(13.))
-                                    .text_color(rgb(0xeb6f92))
-                                    .child("Delete"),
-                            ),
-                    ),
-            )
+fn apply_agent_ws_snapshot(app: &mut ArborWindow, entries: &[(String, AgentState, Option<u64>)]) {
+    tracing::info!(
+        count = entries.len(),
+        "agent WS snapshot: resetting all worktree states"
+    );
+    for worktree in &mut app.worktrees {
+        worktree.agent_state = None;
     }
+    apply_agent_ws_update(app, entries);
+}
 
-    fn render_delete_modal(&mut self, cx: &mut Context<Self>) -> Div {
-        let Some(modal) = self.delete_modal.clone() else {
-            return div();
-        };
+fn apply_agent_ws_update(app: &mut ArborWindow, entries: &[(String, AgentState, Option<u64>)]) {
+    let worktree_paths: Vec<PathBuf> = app.worktrees.iter().map(|w| w.path.clone()).collect();
 
-        let theme = self.theme();
-        let delete_worktree = match &modal.target {
-            DeleteTarget::Worktree(index) => self.worktrees.get(*index),
-            _ => None,
-        };
-        let is_worktree = delete_worktree.is_some();
-        let is_discrete_clone = delete_worktree
-            .is_some_and(|worktree| worktree.checkout_kind == CheckoutKind::DiscreteClone);
-        let title = match &modal.target {
-            DeleteTarget::Worktree(_) if is_discrete_clone => "Delete Discrete Clone",
-            DeleteTarget::Worktree(_) => "Delete Worktree",
-            DeleteTarget::Outpost(_) => "Remove Outpost",
-            DeleteTarget::Repository(_) => "Remove Repository",
-        };
-        let label_prefix = match &modal.target {
-            DeleteTarget::Worktree(_) if is_discrete_clone => "Discrete Clone",
-            DeleteTarget::Worktree(_) => "Worktree",
-            DeleteTarget::Outpost(_) => "Outpost",
-            DeleteTarget::Repository(_) => "Repository",
-        };
-        let delete_disabled = modal.is_deleting;
-        let delete_label = if modal.is_deleting {
-            if is_worktree {
-                "Deleting..."
-            } else {
-                "Removing..."
-            }
-        } else if is_worktree {
-            "Delete"
-        } else {
-            "Remove"
-        };
+    for (cwd, state, updated_at) in entries {
+        let cwd_path = Path::new(cwd);
+        // Find the most specific (longest) worktree path that is a prefix of this cwd.
+        let best_match = worktree_paths
+            .iter()
+            .filter(|wt_path| cwd_path.starts_with(wt_path))
+            .max_by_key(|wt_path| wt_path.as_os_str().len());
 
-        div()
-            .absolute()
-            .inset_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.close_delete_modal(cx);
-                    cx.stop_propagation();
-                }),
-            )
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(|this, _, _, cx| {
-                    this.close_delete_modal(cx);
-                    cx.stop_propagation();
-                }),
-            )
-            .child(modal_backdrop())
-            .child(
-                div()
-                    .w(px(440.))
-                    .max_w(px(440.))
-                    .flex_none()
-                    .overflow_hidden()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(rgb(theme.border))
-                    .bg(rgb(theme.sidebar_bg))
-                    .p_3()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                        cx.stop_propagation();
-                    })
-                    .on_mouse_down(MouseButton::Right, |_, _, cx| {
-                        cx.stop_propagation();
-                    })
-                    // Header
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(theme.text_primary))
-                                    .child(title),
-                            )
-                            .child(
-                                action_button(
-                                    theme,
-                                    "close-delete-modal",
-                                    "Close",
-                                    ActionButtonStyle::Secondary,
-                                    true,
-                                )
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.close_delete_modal(cx);
-                                    })),
-                            ),
-                    )
-                    // Label
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(theme.text_muted))
-                            .child(format!("{}: {}", label_prefix, modal.label)),
-                    )
-                    // Unpushed commits warning (worktrees only)
-                    .when(is_worktree, |this| {
-                        match modal.has_unpushed {
-                            None => this.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(theme.text_muted))
-                                    .child("Checking for unpushed commits..."),
-                            ),
-                            Some(true) => this.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(0xe5c07b))
-                                    .child("\u{f071} This worktree has unpushed commits that will be lost."),
-                            ),
-                            Some(false) => this,
-                        }
-                    })
-                    // Branch deletion checkbox (worktrees only)
-                    .when(is_worktree && !is_discrete_clone && !modal.branch.is_empty(), |this| {
-                        this.child(
-                            div()
-                                .id("delete-branch-checkbox")
-                                .cursor_pointer()
-                                .hover(|this| this.bg(rgb(theme.panel_active_bg)))
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .py_1()
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    if let Some(modal) = this.delete_modal.as_mut() {
-                                        modal.delete_branch = !modal.delete_branch;
-                                        cx.notify();
-                                    }
-                                }))
-                                .child(
-                                    div()
-                                        .w(px(14.))
-                                        .h(px(14.))
-                                        .rounded_sm()
-                                        .border_1()
-                                        .border_color(rgb(theme.border))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .when(modal.delete_branch, |this| {
-                                            this.bg(rgb(theme.accent))
-                                                .child(
-                                                    div()
-                                                        .font_family(FONT_MONO)
-                                                        .text_size(px(10.))
-                                                        .text_color(rgb(theme.sidebar_bg))
-                                                        .child("\u{f00c}"),
-                                                )
-                                        }),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(theme.text_primary))
-                                        .child(format!("Also delete branch `{}`", modal.branch)),
-                                ),
-                        )
-                    })
-                    // Error display
-                    .when_some(modal.error.clone(), |this, err| {
-                        this.child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(0xeb6f92))
-                                .child(err),
-                        )
-                    })
-                    // Buttons
-                    .child(
-                        div()
-                            .w_full()
-                            .min_w_0()
-                            .flex()
-                            .justify_end()
-                            .gap_2()
-                            .child(
-                                action_button(
-                                    theme,
-                                    "delete-cancel",
-                                    "Cancel",
-                                    ActionButtonStyle::Secondary,
-                                    true,
-                                )
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.close_delete_modal(cx);
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .id("delete-confirm")
-                                    .cursor_pointer()
-                                    .rounded_sm()
-                                    .border_1()
-                                    .border_color(rgb(0xeb6f92))
-                                    .bg(rgb(theme.panel_bg))
-                                    .px_2()
-                                    .py_1()
-                                    .text_xs()
-                                    .text_color(rgb(0xeb6f92))
-                                    .when(delete_disabled, |this| {
-                                        this.opacity(0.5).cursor_default()
-                                    })
-                                    .when(!delete_disabled, |this| {
-                                        this.hover(|s| s.bg(rgb(0xeb6f92)).text_color(rgb(theme.app_bg)))
-                                    })
-                                    .child(delete_label)
-                                    .when(!delete_disabled, |this| {
-                                        this.on_click(cx.listener(|this, _, _, cx| {
-                                            this.execute_delete(cx);
-                                        }))
-                                    }),
-                            ),
-                    ),
-            )
-    }
-
-    fn render_manage_hosts_modal(&mut self, cx: &mut Context<Self>) -> Div {
-        let Some(modal) = self.manage_hosts_modal.clone() else {
-            return div();
-        };
-
-        let theme = self.theme();
-
-        if modal.adding {
-            let name_active = modal.active_field == ManageHostsField::Name;
-            let hostname_active = modal.active_field == ManageHostsField::Hostname;
-            let user_active = modal.active_field == ManageHostsField::User;
-            let add_disabled = modal.name.trim().is_empty()
-                || modal.hostname.trim().is_empty()
-                || modal.user.trim().is_empty();
-
-            return div()
-                .absolute()
-                .inset_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| {
-                        this.close_manage_hosts_modal(cx);
-                        cx.stop_propagation();
-                    }),
-                )
-                .on_mouse_down(
-                    MouseButton::Right,
-                    cx.listener(|this, _, _, cx| {
-                        this.close_manage_hosts_modal(cx);
-                        cx.stop_propagation();
-                    }),
-                )
-                .child(modal_backdrop())
-                .child(
-                    div()
-                        .w(px(620.))
-                        .max_w(px(620.))
-                        .flex_none()
-                        .overflow_hidden()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(rgb(theme.border))
-                        .bg(rgb(theme.sidebar_bg))
-                        .p_3()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                            cx.stop_propagation();
-                        })
-                        .on_mouse_down(MouseButton::Right, |_, _, cx| {
-                            cx.stop_propagation();
-                        })
-                        // Header
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(rgb(theme.text_primary))
-                                        .child("Add Host"),
-                                )
-                                .child(
-                                    action_button(
-                                        theme,
-                                        "back-manage-hosts",
-                                        "Back",
-                                        ActionButtonStyle::Secondary,
-                                        true,
-                                    )
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        if let Some(modal) = this.manage_hosts_modal.as_mut() {
-                                            modal.adding = false;
-                                            modal.error = None;
-                                            cx.notify();
-                                        }
-                                    })),
-                                ),
-                        )
-                        // Name
-                        .child(
-                            modal_input_field(
-                                theme,
-                                "hosts-name-input",
-                                "Name",
-                                &modal.name,
-                                modal.name_cursor,
-                                "e.g. build-server",
-                                name_active,
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.update_manage_hosts_modal_input(
-                                    HostsModalInputEvent::SetActiveField(ManageHostsField::Name),
-                                    cx,
-                                );
-                            })),
-                        )
-                        // Hostname
-                        .child(
-                            modal_input_field(
-                                theme,
-                                "hosts-hostname-input",
-                                "Hostname",
-                                &modal.hostname,
-                                modal.hostname_cursor,
-                                "e.g. build.example.com",
-                                hostname_active,
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.update_manage_hosts_modal_input(
-                                    HostsModalInputEvent::SetActiveField(
-                                        ManageHostsField::Hostname,
-                                    ),
-                                    cx,
-                                );
-                            })),
-                        )
-                        // User
-                        .child(
-                            modal_input_field(
-                                theme,
-                                "hosts-user-input",
-                                "User",
-                                &modal.user,
-                                modal.user_cursor,
-                                "e.g. dev",
-                                user_active,
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.update_manage_hosts_modal_input(
-                                    HostsModalInputEvent::SetActiveField(ManageHostsField::User),
-                                    cx,
-                                );
-                            })),
-                        )
-                        // Error
-                        .child(div().when_some(modal.error.clone(), |this, error| {
-                            this.rounded_sm()
-                                .border_1()
-                                .border_color(rgb(0xa44949))
-                                .bg(rgb(0x4d2a2a))
-                                .px_2()
-                                .py_1()
-                                .text_xs()
-                                .text_color(rgb(0xffd7d7))
-                                .child(error)
-                        }))
-                        // Buttons
-                        .child(
-                            div()
-                                .w_full()
-                                .min_w_0()
-                                .flex()
-                                .items_center()
-                                .justify_end()
-                                .gap_2()
-                                .child(
-                                    action_button(
-                                        theme,
-                                        "cancel-add-host",
-                                        "Cancel",
-                                        ActionButtonStyle::Secondary,
-                                        true,
-                                    )
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        if let Some(modal) = this.manage_hosts_modal.as_mut() {
-                                            modal.adding = false;
-                                            modal.error = None;
-                                            cx.notify();
-                                        }
-                                    })),
-                                )
-                                .child(
-                                    action_button(
-                                        theme,
-                                        "submit-add-host",
-                                        "Add Host",
-                                        ActionButtonStyle::Primary,
-                                        !add_disabled,
-                                    )
-                                    .when(!add_disabled, |this| {
-                                        this.on_click(cx.listener(|this, _, _, cx| {
-                                            this.submit_add_host(cx);
-                                        }))
-                                    }),
-                                ),
-                        ),
+        if let Some(matched_path) = best_match {
+            let mut notification_worktree: Option<WorktreeSummary> = None;
+            if let Some(worktree) = app.worktrees.iter_mut().find(|w| &w.path == matched_path) {
+                let previous_state = worktree.agent_state;
+                tracing::info!(
+                    cwd = %cwd,
+                    worktree = %worktree.path.display(),
+                    ?state,
+                    "agent activity matched to worktree"
                 );
-        }
-
-        // List view
-        let hosts = self.remote_hosts.clone();
-        div()
-            .absolute()
-            .inset_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.close_manage_hosts_modal(cx);
-                    cx.stop_propagation();
-                }),
-            )
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(|this, _, _, cx| {
-                    this.close_manage_hosts_modal(cx);
-                    cx.stop_propagation();
-                }),
-            )
-            .child(modal_backdrop())
-            .child(
-                div()
-                    .w(px(620.))
-                    .max_w(px(620.))
-                    .flex_none()
-                    .overflow_hidden()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(rgb(theme.border))
-                    .bg(rgb(theme.sidebar_bg))
-                    .p_3()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                        cx.stop_propagation();
-                    })
-                    .on_mouse_down(MouseButton::Right, |_, _, cx| {
-                        cx.stop_propagation();
-                    })
-                    // Header
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(theme.text_primary))
-                                    .child("Manage Hosts"),
-                            )
-                            .child(
-                                action_button(
-                                    theme,
-                                    "close-manage-hosts",
-                                    "Close",
-                                    ActionButtonStyle::Secondary,
-                                    true,
-                                )
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.close_manage_hosts_modal(cx);
-                                })),
-                            ),
-                    )
-                    // Host list
-                    .child(if hosts.is_empty() {
-                        div()
-                            .rounded_sm()
-                            .border_1()
-                            .border_color(rgb(theme.border))
-                            .bg(rgb(theme.panel_bg))
-                            .p_3()
-                            .text_sm()
-                            .text_color(rgb(theme.text_muted))
-                            .child("No remote hosts configured.")
-                            .into_any_element()
-                    } else {
-                        let mut list = div()
-                            .id("manage-hosts-list")
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .max_h(px(300.))
-                            .overflow_y_scroll();
-                        for (i, host) in hosts.iter().enumerate() {
-                            let host_name = host.name.clone();
-                            let display = format!("{}@{}", host.user, host.hostname);
-                            list = list.child(
-                                div()
-                                    .id(ElementId::NamedInteger("host-row".into(), i as u64))
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .rounded_sm()
-                                    .border_1()
-                                    .border_color(rgb(theme.border))
-                                    .bg(rgb(theme.panel_bg))
-                                    .px_2()
-                                    .py_1()
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .flex_col()
-                                            .child(
-                                                div()
-                                                    .text_sm()
-                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                    .text_color(rgb(theme.text_primary))
-                                                    .child(host.name.clone()),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .font_family(FONT_MONO)
-                                                    .text_color(rgb(theme.text_muted))
-                                                    .child(display),
-                                            ),
-                                    )
-                                    .child(
-                                        action_button(
-                                            theme,
-                                            ElementId::NamedInteger(
-                                                "remove-host".into(),
-                                                i as u64,
-                                            ),
-                                            "Remove",
-                                            ActionButtonStyle::Secondary,
-                                            true,
-                                        )
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.remove_host_at(host_name.clone(), cx);
-                                        })),
-                                    ),
-                            );
-                        }
-                        list.into_any_element()
-                    })
-                    // Add Host button
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_end()
-                            .child(
-                                action_button(
-                                    theme,
-                                    "open-add-host-form",
-                                    "+ Add Host",
-                                    ActionButtonStyle::Primary,
-                                    true,
-                                )
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    if let Some(modal) = this.manage_hosts_modal.as_mut() {
-                                        modal.adding = true;
-                                        modal.name.clear();
-                                        modal.hostname.clear();
-                                        modal.user.clear();
-                                        modal.active_field = ManageHostsField::Name;
-                                        modal.error = None;
-                                        cx.notify();
-                                    }
-                                })),
-                            ),
-                    ),
-            )
-    }
-
-    fn render_manage_presets_modal(&mut self, cx: &mut Context<Self>) -> Div {
-        let Some(modal) = self.manage_presets_modal.clone() else {
-            return div();
-        };
-
-        let theme = self.theme();
-        let save_disabled = modal.command.trim().is_empty();
-        let tab_button = |kind: AgentPresetKind| {
-            let is_active = modal.active_preset == kind;
-            let text_color = if is_active {
-                theme.text_primary
-            } else {
-                theme.text_muted
-            };
-            div()
-                .id(ElementId::Name(
-                    format!("preset-modal-tab-{}", kind.key()).into(),
-                ))
-                .cursor_pointer()
-                .px_3()
-                .py_1()
-                .flex()
-                .items_center()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(rgb(text_color))
-                .when(is_active, |this| {
-                    this.border_b_2().border_color(rgb(theme.accent))
-                })
-                .hover(|s| {
-                    s.bg(rgb(theme.panel_active_bg))
-                        .text_color(rgb(theme.text_primary))
-                })
-                .child(agent_preset_button_content(kind, text_color))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.update_manage_presets_modal_input(
-                        PresetsModalInputEvent::SetActivePreset(kind),
-                        cx,
-                    );
-                }))
-        };
-
-        div()
-            .absolute()
-            .inset_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.close_manage_presets_modal(cx);
-                    cx.stop_propagation();
-                }),
-            )
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(|this, _, _, cx| {
-                    this.close_manage_presets_modal(cx);
-                    cx.stop_propagation();
-                }),
-            )
-            .child(modal_backdrop())
-            .child(
-                div()
-                    .w(px(620.))
-                    .max_w(px(620.))
-                    .flex_none()
-                    .overflow_hidden()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(rgb(theme.border))
-                    .bg(rgb(theme.sidebar_bg))
-                    .p_3()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                        cx.stop_propagation();
-                    })
-                    .on_mouse_down(MouseButton::Right, |_, _, cx| {
-                        cx.stop_propagation();
-                    })
-                    .child(
-                        div().flex().items_center().child(
-                            div()
-                                .text_sm()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(theme.text_primary))
-                                .child("Edit Agent Preset"),
-                        ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .gap_0()
-                            .border_b_1()
-                            .border_color(rgb(theme.border))
-                            .children(AgentPresetKind::ORDER.iter().copied().map(&tab_button)),
-                    )
-                    .child(
-                        modal_input_field(
-                            theme,
-                            "preset-command-input",
-                            "Command",
-                            &modal.command,
-                            modal.command_cursor,
-                            modal.active_preset.default_command(),
-                            true,
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.update_manage_presets_modal_input(
-                                PresetsModalInputEvent::ClearError,
-                                cx,
-                            );
-                        })),
-                    )
-                    .child(div().when_some(modal.error.clone(), |this, error| {
-                        this.rounded_sm()
-                            .border_1()
-                            .border_color(rgb(0xa44949))
-                            .bg(rgb(0x4d2a2a))
-                            .px_2()
-                            .py_1()
-                            .text_xs()
-                            .text_color(rgb(0xffd7d7))
-                            .child(error)
-                    }))
-                    .child(
-                        div()
-                            .w_full()
-                            .min_w_0()
-                            .flex()
-                            .items_center()
-                            .justify_end()
-                            .gap_2()
-                            .child(
-                                action_button(
-                                    theme,
-                                    "preset-restore-default",
-                                    "Restore Default",
-                                    ActionButtonStyle::Secondary,
-                                    true,
-                                )
-                                .on_click(cx.listener(
-                                    |this, _, _, cx| {
-                                        this.update_manage_presets_modal_input(
-                                            PresetsModalInputEvent::RestoreDefault,
-                                            cx,
-                                        );
-                                    },
-                                )),
-                            )
-                            .child(
-                                action_button(
-                                    theme,
-                                    "preset-cancel",
-                                    "Cancel",
-                                    ActionButtonStyle::Secondary,
-                                    true,
-                                )
-                                .on_click(cx.listener(
-                                    |this, _, _, cx| {
-                                        this.close_manage_presets_modal(cx);
-                                    },
-                                )),
-                            )
-                            .child(
-                                action_button(
-                                    theme,
-                                    "preset-save",
-                                    "Save",
-                                    ActionButtonStyle::Primary,
-                                    !save_disabled,
-                                )
-                                .when(!save_disabled, |this| {
-                                    this.on_click(cx.listener(|this, _, _, cx| {
-                                        this.submit_manage_presets_modal(cx);
-                                    }))
-                                }),
-                            ),
-                    ),
-            )
-    }
-
-    fn render_about_modal(&mut self, cx: &mut Context<Self>) -> Div {
-        if !self.show_about {
-            return div();
-        }
-
-        let theme = self.theme();
-        let version = APP_VERSION;
-
-        div()
-            .absolute()
-            .inset_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.show_about = false;
-                    cx.stop_propagation();
-                    cx.notify();
-                }),
-            )
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(|this, _, _, cx| {
-                    this.show_about = false;
-                    cx.stop_propagation();
-                    cx.notify();
-                }),
-            )
-            .child(
-                div()
-                    .w(px(340.))
-                    .flex_none()
-                    .overflow_hidden()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(rgb(theme.border))
-                    .bg(rgb(theme.sidebar_bg))
-                    .p_3()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                        cx.stop_propagation();
-                    })
-                    .on_mouse_down(MouseButton::Right, |_, _, cx| {
-                        cx.stop_propagation();
-                    })
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(theme.text_primary))
-                                    .child("About Arbor"),
-                            )
-                            .child(
-                                action_button(
-                                    theme,
-                                    "close-about",
-                                    "Close",
-                                    ActionButtonStyle::Secondary,
-                                    true,
-                                )
-                                .on_click(cx.listener(
-                                    |this, _, _, cx| {
-                                        this.show_about = false;
-                                        cx.notify();
-                                    },
-                                )),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .py_2()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(rgb(theme.text_primary))
-                                    .child(format!("Arbor {version}")),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(theme.text_muted))
-                                    .child("Git worktree manager"),
-                            ),
-                    ),
-            )
-    }
-
-    fn render_theme_picker_modal(&mut self, cx: &mut Context<Self>) -> Div {
-        if !self.show_theme_picker {
-            return div();
-        }
-
-        let theme = self.theme();
-        let current_theme = self.theme_kind;
-
-        div()
-            .absolute()
-            .inset_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.show_theme_picker = false;
-                    cx.stop_propagation();
-                    cx.notify();
-                }),
-            )
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(|this, _, _, cx| {
-                    this.show_theme_picker = false;
-                    cx.stop_propagation();
-                    cx.notify();
-                }),
-            )
-            .child(modal_backdrop())
-            .child(
-                div()
-                    .w(px(820.))
-                    .max_h(px(600.))
-                    .flex_none()
-                    .overflow_hidden()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(rgb(theme.border))
-                    .bg(rgb(theme.sidebar_bg))
-                    .p_4()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| {
-                        cx.stop_propagation();
-                    })
-                    .on_mouse_down(MouseButton::Right, |_: &MouseDownEvent, _, cx| {
-                        cx.stop_propagation();
-                    })
-                    // Header
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(theme.text_primary))
-                            .child("Choose Theme"),
-                    )
-                    // Theme grid
-                    .child(
-                        div()
-                            .flex()
-                            .flex_wrap()
-                            .gap_2()
-                            .children(ThemeKind::ALL.iter().enumerate().map(
-                                |(idx, &kind)| {
-                                let palette = kind.palette();
-                                let is_active = kind == current_theme;
-                                let border_color = if is_active {
-                                    theme.accent
-                                } else {
-                                    theme.border
-                                };
-                                div()
-                                    .id(("theme-card", idx))
-                                    .w(px(148.))
-                                    .rounded_md()
-                                    .border_1()
-                                    .border_color(rgb(border_color))
-                                    .when(is_active, |d| d.border_2())
-                                    .bg(rgb(theme.panel_bg))
-                                    .overflow_hidden()
-                                    .cursor_pointer()
-                                    .hover(|s| s.opacity(0.85))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.switch_theme(kind, cx);
-                                    }))
-                                    // Color swatch strip
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .flex_row()
-                                            .h(px(36.))
-                                            .child(
-                                                div().flex_1().bg(rgb(palette.app_bg)),
-                                            )
-                                            .child(
-                                                div().flex_1().bg(rgb(palette.sidebar_bg)),
-                                            )
-                                            .child(
-                                                div().flex_1().bg(rgb(palette.accent)),
-                                            )
-                                            .child(
-                                                div()
-                                                    .flex_1()
-                                                    .bg(rgb(palette.text_primary)),
-                                            )
-                                            .child(
-                                                div().flex_1().bg(rgb(palette.border)),
-                                            ),
-                                    )
-                                    // Theme name
-                                    .child(
-                                        div()
-                                            .px_2()
-                                            .py(px(6.))
-                                            .text_xs()
-                                            .text_color(rgb(theme.text_primary))
-                                            .when(is_active, |d| {
-                                                d.font_weight(FontWeight::SEMIBOLD)
-                                            })
-                                            .child(kind.label()),
-                                    )
-                            },
-                            )),
-                    ),
-            )
-    }
-
-    fn render_daemon_auth_modal(&mut self, cx: &mut Context<Self>) -> Div {
-        let Some(ref modal) = self.daemon_auth_modal else {
-            return div();
-        };
-        let theme = self.theme();
-        let token_value = modal.token.clone();
-        let error = modal.error.clone();
-        let daemon_url = modal.daemon_url.clone();
-
-        div()
-            .absolute()
-            .inset_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.daemon_auth_modal = None;
-                    cx.stop_propagation();
-                    cx.notify();
-                }),
-            )
-            .child(modal_backdrop())
-            .child(
-                div()
-                    .w(px(420.))
-                    .flex_none()
-                    .overflow_hidden()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(rgb(theme.border))
-                    .bg(rgb(theme.sidebar_bg))
-                    .p_4()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                        cx.stop_propagation();
-                    })
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(theme.text_primary))
-                            .child("Authentication Required"),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(theme.text_muted))
-                            .child(format!(
-                                "Enter the auth token for {daemon_url}. Find it in Settings (\u{2318},) on the remote host, or in ~/.config/arbor/config.toml under [daemon] auth_token."
-                            )),
-                    )
-                    .when_some(error, |this, err| {
-                        this.child(div().text_xs().text_color(rgb(0xf38ba8_u32)).child(err))
-                    })
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(theme.text_muted))
-                                    .child("Auth Token"),
-                            )
-                            .child(
-                                div()
-                                    .id("daemon-auth-token-field")
-                                    .h(px(30.))
-                                    .px_2()
-                                    .flex()
-                                    .items_center()
-                                    .rounded_sm()
-                                    .border_1()
-                                    .border_color(rgb(theme.accent))
-                                    .bg(rgb(theme.panel_bg))
-                                    .text_sm()
-                                    .font_family(FONT_MONO)
-                                    .text_color(rgb(theme.text_primary))
-                                    .child(if token_value.is_empty() {
-                                        active_input_display(
-                                            theme,
-                                            "",
-                                            "paste token here",
-                                            theme.text_disabled,
-                                            modal.token_cursor,
-                                            40,
-                                        )
-                                    } else {
-                                        active_input_display(
-                                            theme,
-                                            &"\u{2022}".repeat(token_value.len()),
-                                            "paste token here",
-                                            theme.text_primary,
-                                            modal.token_cursor,
-                                            40,
-                                        )
-                                    }),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .w_full()
-                            .min_w_0()
-                            .flex()
-                            .justify_end()
-                            .gap_2()
-                            .child(
-                                action_button(
-                                    theme,
-                                    "cancel-auth",
-                                    "Cancel",
-                                    ActionButtonStyle::Secondary,
-                                    true,
-                                )
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.daemon_auth_modal = None;
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                action_button(
-                                    theme,
-                                    "submit-auth",
-                                    "Connect",
-                                    ActionButtonStyle::Primary,
-                                    true,
-                                )
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.submit_daemon_auth(cx);
-                                    })),
-                            ),
-                    ),
-            )
-    }
-
-    fn render_start_daemon_modal(&mut self, cx: &mut Context<Self>) -> Div {
-        if !self.start_daemon_modal {
-            return div();
-        }
-        let theme = self.theme();
-
-        div()
-            .absolute()
-            .inset_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.start_daemon_modal = false;
-                    cx.stop_propagation();
-                    cx.notify();
-                }),
-            )
-            .child(modal_backdrop())
-            .child(
-                div()
-                    .w(px(420.))
-                    .flex_none()
-                    .overflow_hidden()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(rgb(theme.border))
-                    .bg(rgb(theme.sidebar_bg))
-                    .p_4()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                        cx.stop_propagation();
-                    })
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(theme.text_primary))
-                            .child("Start Daemon"),
-                    )
-                    .child(div().text_xs().text_color(rgb(theme.text_muted)).child(
-                        "The terminal daemon (arbor-httpd) is not running. \
-                                 Start it to enable remote control and terminal persistence.",
-                    ))
-                    .child(
-                        div()
-                            .w_full()
-                            .min_w_0()
-                            .flex()
-                            .justify_end()
-                            .gap_2()
-                            .child(
-                                action_button(
-                                    theme,
-                                    "cancel-start-daemon",
-                                    "Cancel",
-                                    ActionButtonStyle::Secondary,
-                                    true,
-                                )
-                                .on_click(cx.listener(
-                                    |this, _, _, cx| {
-                                        this.start_daemon_modal = false;
-                                        cx.notify();
-                                    },
-                                )),
-                            )
-                            .child(
-                                action_button(
-                                    theme,
-                                    "confirm-start-daemon",
-                                    "Start",
-                                    ActionButtonStyle::Primary,
-                                    true,
-                                )
-                                .on_click(cx.listener(
-                                    |this, _, _, cx| {
-                                        this.start_daemon_modal = false;
-                                        this.try_start_and_connect_daemon(cx);
-                                    },
-                                )),
-                            ),
-                    ),
-            )
-    }
-
-    fn render_connect_to_host_modal(&mut self, cx: &mut Context<Self>) -> Div {
-        let Some(ref modal) = self.connect_to_host_modal else {
-            return div();
-        };
-        let theme = self.theme();
-        let address = modal.address.clone();
-        let address_empty = address.is_empty();
-        let error = modal.error.clone();
-        let history = self.connection_history.clone();
-        let has_history = !history.is_empty();
-        let has_daemons = !self.discovered_daemons.is_empty();
-
-        div()
-            .absolute()
-            .inset_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.connect_to_host_modal = None;
-                    cx.stop_propagation();
-                    cx.notify();
-                }),
-            )
-            .child(modal_backdrop())
-            .child(
-                div()
-                    .w(px(420.))
-                    .flex_none()
-                    .overflow_hidden()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(rgb(theme.border))
-                    .bg(rgb(theme.sidebar_bg))
-                    .p_4()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                        cx.stop_propagation();
-                    })
-                    // Title
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(theme.text_primary))
-                            .child("Connect to Host"),
-                    )
-                    // Recent section
-                    .when(has_history, |modal_div| {
-                        modal_div.child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap_1()
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap_1()
-                                        .child(
-                                            div()
-                                                .font_family(FONT_MONO)
-                                                .text_size(px(15.))
-                                                .text_color(rgb(theme.text_muted))
-                                                .child("\u{f1da}"),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .font_weight(FontWeight::MEDIUM)
-                                                .text_color(rgb(theme.text_muted))
-                                                .child("Recent"),
-                                        ),
-                                )
-                                .children(history.into_iter().enumerate().map(|(idx, entry)| {
-                                    let display = entry
-                                        .label
-                                        .clone()
-                                        .unwrap_or_else(|| entry.address.clone());
-                                    let subtitle = entry.address.clone();
-                                    let has_label = entry.label.is_some();
-                                    let connect_addr = entry.address.clone();
-                                    let remove_addr = entry.address.clone();
-                                    div()
-                                        .id(("connect-modal-history", idx))
-                                        .cursor_pointer()
-                                        .px_2()
-                                        .py_1()
-                                        .rounded_sm()
-                                        .border_1()
-                                        .border_color(rgb(theme.border))
-                                        .bg(rgb(theme.panel_bg))
-                                        .hover(|s| s.bg(rgb(theme.panel_active_bg)))
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(6.))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            if let Some(modal) =
-                                                this.connect_to_host_modal.as_mut()
-                                            {
-                                                modal.address = connect_addr.clone();
-                                            }
-                                            this.submit_connect_to_host(cx);
-                                        }))
-                                        .child(
-                                            div()
-                                                .flex_none()
-                                                .font_family(FONT_MONO)
-                                                .text_size(px(14.))
-                                                .text_color(rgb(theme.text_muted))
-                                                .child("\u{f1da}"),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .min_w_0()
-                                                .flex()
-                                                .flex_col()
-                                                .child(
-                                                    div()
-                                                        .text_xs()
-                                                        .font_weight(FontWeight::MEDIUM)
-                                                        .text_color(rgb(theme.text_primary))
-                                                        .overflow_hidden()
-                                                        .whitespace_nowrap()
-                                                        .text_ellipsis()
-                                                        .child(display),
-                                                )
-                                                .when(has_label, |d| {
-                                                    d.child(
-                                                        div()
-                                                            .text_xs()
-                                                            .text_color(rgb(theme.text_muted))
-                                                            .overflow_hidden()
-                                                            .whitespace_nowrap()
-                                                            .text_ellipsis()
-                                                            .child(subtitle),
-                                                    )
-                                                }),
-                                        )
-                                        .child(
-                                            div()
-                                                .id(("connect-modal-history-remove", idx))
-                                                .flex_none()
-                                                .w(px(20.))
-                                                .h(px(20.))
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .rounded_sm()
-                                                .cursor_pointer()
-                                                .text_xs()
-                                                .font_family(FONT_MONO)
-                                                .text_color(rgb(theme.text_muted))
-                                                .hover(|s| {
-                                                    s.bg(rgb(theme.panel_active_bg))
-                                                        .text_color(rgb(theme.text_primary))
-                                                })
-                                                .on_click(cx.listener(
-                                                    move |this, _, _, cx| {
-                                                        connection_history::remove_entry(
-                                                            &remove_addr,
-                                                        );
-                                                        this.daemon_auth_tokens
-                                                            .retain(|k, _| !k.contains(&*remove_addr));
-                                                        connection_history::save_tokens(
-                                                            &this.daemon_auth_tokens,
-                                                        );
-                                                        this.connection_history =
-                                                            connection_history::load_history();
-                                                        cx.stop_propagation();
-                                                        cx.notify();
-                                                    },
-                                                ))
-                                                .child("\u{f00d}"),
-                                        )
-                                })),
-                        )
-                    })
-                    // Discovered on LAN section
-                    .when(has_daemons, |modal_div| {
-                        let daemons = self.discovered_daemons.clone();
-                        modal_div.child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap_1()
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap_1()
-                                        .child(
-                                            div()
-                                                .font_family(FONT_MONO)
-                                                .text_size(px(15.))
-                                                .text_color(rgb(theme.text_muted))
-                                                .child("\u{f0ac}"),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .font_weight(FontWeight::MEDIUM)
-                                                .text_color(rgb(theme.text_muted))
-                                                .child("Discovered on LAN"),
-                                        ),
-                                )
-                                .children(daemons.into_iter().enumerate().map(|(idx, daemon)| {
-                                    let display_name = daemon.display_name().to_owned();
-                                    let addr = daemon
-                                        .addresses
-                                        .first()
-                                        .cloned()
-                                        .unwrap_or_else(|| daemon.host.clone());
-                                    let subtitle = format!("{}:{}", addr, daemon.port);
-                                    div()
-                                        .id(("connect-modal-daemon", idx))
-                                        .cursor_pointer()
-                                        .px_2()
-                                        .py_1()
-                                        .rounded_sm()
-                                        .border_1()
-                                        .border_color(rgb(theme.border))
-                                        .bg(rgb(theme.panel_bg))
-                                        .hover(|s| s.bg(rgb(theme.panel_active_bg)))
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(6.))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.connect_to_host_modal = None;
-                                            this.toggle_discovered_daemon(idx, cx);
-                                        }))
-                                        .child(
-                                            div()
-                                                .flex_none()
-                                                .font_family(FONT_MONO)
-                                                .text_size(px(14.))
-                                                .text_color(rgb(theme.accent))
-                                                .child("\u{f233}"),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .min_w_0()
-                                                .flex()
-                                                .flex_col()
-                                                .child(
-                                                    div()
-                                                        .text_xs()
-                                                        .font_weight(FontWeight::MEDIUM)
-                                                        .text_color(rgb(theme.text_primary))
-                                                        .overflow_hidden()
-                                                        .whitespace_nowrap()
-                                                        .text_ellipsis()
-                                                        .child(display_name),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .text_xs()
-                                                        .text_color(rgb(theme.text_muted))
-                                                        .overflow_hidden()
-                                                        .whitespace_nowrap()
-                                                        .text_ellipsis()
-                                                        .child(subtitle),
-                                                ),
-                                        )
-                                })),
-                        )
-                    })
-                    // Manual address label
-                    .child(div().text_xs().text_color(rgb(theme.text_muted)).child(
-                        if has_history || has_daemons {
-                            "Or enter an address manually:"
-                        } else {
-                            "Use http://HOST:PORT or ssh://[user@]HOST[:ssh_port]/"
-                        },
-                    ))
-                    // Error display
-                    .when_some(error, |this, err| {
-                        this.child(div().text_xs().text_color(rgb(0xf38ba8_u32)).child(err))
-                    })
-                    // Address input
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(theme.text_muted))
-                                    .child("Address"),
-                            )
-                            .child(
-                                div()
-                                    .id("connect-host-address-field")
-                                    .h(px(30.))
-                                    .px_2()
-                                    .flex()
-                                    .items_center()
-                                    .rounded_sm()
-                                    .border_1()
-                                    .border_color(rgb(theme.accent))
-                                    .bg(rgb(theme.panel_bg))
-                                    .text_sm()
-                                    .font_family(FONT_MONO)
-                                    .text_color(rgb(theme.text_primary))
-                                    .child(if address_empty {
-                                        active_input_display(
-                                            theme,
-                                            "",
-                                            "ssh://dev@192.168.1.42/",
-                                            theme.text_disabled,
-                                            modal.address_cursor,
-                                            42,
-                                        )
-                                    } else {
-                                        active_input_display(
-                                            theme,
-                                            &address,
-                                            "ssh://dev@192.168.1.42/",
-                                            theme.text_primary,
-                                            modal.address_cursor,
-                                            42,
-                                        )
-                                    }),
-                            ),
-                    )
-                    // Buttons
-                    .child(
-                        div()
-                            .w_full()
-                            .min_w_0()
-                            .flex()
-                            .justify_end()
-                            .gap_2()
-                            .child(
-                                action_button(
-                                    theme,
-                                    "cancel-connect",
-                                    "Cancel",
-                                    ActionButtonStyle::Secondary,
-                                    true,
-                                )
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.connect_to_host_modal = None;
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                action_button(
-                                    theme,
-                                    "submit-connect",
-                                    "Connect",
-                                    ActionButtonStyle::Primary,
-                                    !address_empty,
-                                )
-                                .when(!address_empty, |this| {
-                                    this.on_click(cx.listener(|this, _, _, cx| {
-                                        this.submit_connect_to_host(cx);
-                                    }))
-                                }),
-                            ),
-                    ),
-            )
-    }
-
-    fn render_settings_modal(&mut self, cx: &mut Context<Self>) -> Div {
-        let Some(modal) = self.settings_modal.clone() else {
-            return div();
-        };
-
-        let theme = self.theme();
-        let daemon_auth_token_empty = modal.daemon_auth_token.trim().is_empty();
-        let section_card = |this: Div| {
-            this.rounded_sm()
-                .border_1()
-                .border_color(rgb(theme.border))
-                .bg(rgb(theme.panel_bg))
-                .p_3()
-                .flex()
-                .flex_col()
-                .gap_2()
-        };
-        let section_heading = |title: &str| {
-            div()
-                .text_sm()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(rgb(theme.text_primary))
-                .child(title.to_owned())
-        };
-        let bind_mode_button = |mode: DaemonBindMode, title: &str, detail: &str| {
-            let selected = modal.daemon_bind_mode == mode;
-            let active = modal.active_control == SettingsControl::DaemonBindMode;
-            div()
-                .flex_1()
-                .min_w_0()
-                .cursor_pointer()
-                .rounded_sm()
-                .border_1()
-                .border_color(rgb(if selected || active {
-                    theme.accent
-                } else {
-                    theme.border
-                }))
-                .bg(rgb(if selected {
-                    theme.panel_active_bg
-                } else {
-                    theme.sidebar_bg
-                }))
-                .px_3()
-                .py_2()
-                .flex()
-                .flex_col()
-                .gap(px(3.))
-                .hover(|style| style.opacity(0.92))
-                .child(
-                    div()
-                        .text_xs()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(if selected {
-                            theme.text_primary
-                        } else {
-                            theme.text_muted
-                        }))
-                        .child(title.to_owned()),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(theme.text_muted))
-                        .child(detail.to_owned()),
-                )
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
-                        this.update_settings_modal_input(
-                            SettingsModalInputEvent::SelectDaemonBindMode(mode),
-                            cx,
-                        );
-                    }),
-                )
-        };
-        let daemon_helper_text = match modal.daemon_bind_mode {
-            DaemonBindMode::Localhost => "Only this machine can connect to the daemon.",
-            DaemonBindMode::AllInterfaces => {
-                "Other Arbor instances can connect with your host IP and the token below."
-            },
-        };
-        let notifications_enabled = modal.notifications;
-        let notifications_active = modal.active_control == SettingsControl::Notifications;
-        let notifications_toggle = div()
-            .id("settings-notifications-toggle")
-            .cursor_pointer()
-            .px_2()
-            .py_1()
-            .rounded_sm()
-            .border_1()
-            .border_color(rgb(if notifications_active {
-                theme.accent
-            } else {
-                theme.border
-            }))
-            .bg(rgb(if notifications_enabled {
-                theme.accent
-            } else {
-                theme.sidebar_bg
-            }))
-            .text_xs()
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_color(rgb(if notifications_enabled {
-                theme.app_bg
-            } else {
-                theme.text_muted
-            }))
-            .hover(|s| s.opacity(0.85))
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.update_settings_modal_input(SettingsModalInputEvent::ToggleNotifications, cx);
-            }))
-            .child(if notifications_enabled {
-                "Enabled"
-            } else {
-                "Disabled"
-            });
-
-        div()
-            .absolute()
-            .inset_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.close_settings_modal(cx);
-                    cx.stop_propagation();
-                }),
-            )
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(|this, _, _, cx| {
-                    this.close_settings_modal(cx);
-                    cx.stop_propagation();
-                }),
-            )
-            .child(modal_backdrop())
-            .child(
-                div()
-                    .w(px(500.))
-                    .flex_none()
-                    .overflow_hidden()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(rgb(theme.border))
-                    .bg(rgb(theme.sidebar_bg))
-                    .p_4()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                        cx.stop_propagation();
-                    })
-                    .on_mouse_down(MouseButton::Right, |_, _, cx| {
-                        cx.stop_propagation();
-                    })
-                    .child(
-                        div()
-                            .text_size(px(18.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(theme.text_primary))
-                            .child("Settings"),
-                    )
-                    .child(
-                        section_card(div())
-                            .child(section_heading("Daemon settings"))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(theme.text_muted))
-                                    .child("Choose who can reach this Arbor daemon."),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap_2()
-                                    .child(bind_mode_button(
-                                        DaemonBindMode::Localhost,
-                                        "Localhost only",
-                                        "Keep the daemon private to this machine.",
-                                    ))
-                                    .child(bind_mode_button(
-                                        DaemonBindMode::AllInterfaces,
-                                        "All interfaces",
-                                        "Allow other machines to connect with a token.",
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(theme.text_muted))
-                                    .child(daemon_helper_text),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_1()
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(rgb(theme.text_muted))
-                                            .child("Auth token"),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .justify_between()
-                                            .gap_2()
-                                            .child(
-                                                div()
-                                                    .flex_1()
-                                                    .min_w_0()
-                                                    .h(px(30.))
-                                                    .px_2()
-                                                    .flex()
-                                                    .items_center()
-                                                    .rounded_sm()
-                                                    .border_1()
-                                                    .border_color(rgb(theme.border))
-                                                    .bg(rgb(theme.sidebar_bg))
-                                                    .text_sm()
-                                                    .font_family(FONT_MONO)
-                                                    .text_color(rgb(theme.text_disabled))
-                                                    .overflow_hidden()
-                                                    .whitespace_nowrap()
-                                                    .text_ellipsis()
-                                                    .child(if modal.daemon_auth_token.is_empty() {
-                                                        "(not configured)".to_owned()
-                                                    } else {
-                                                        modal.daemon_auth_token.clone()
-                                                    }),
-                                            )
-                                            .child(
-                                                action_button(
-                                                    theme,
-                                                    "settings-copy-daemon-auth-token",
-                                                    "Copy",
-                                                    ActionButtonStyle::Secondary,
-                                                    !daemon_auth_token_empty,
-                                                )
-                                                .when(!daemon_auth_token_empty, |this| {
-                                                    this.on_click(cx.listener(|this, _, _, cx| {
-                                                        this.copy_settings_daemon_auth_token_to_clipboard(cx);
-                                                    }))
-                                                }),
-                                            ),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        section_card(div())
-                            .child(section_heading("Notifications"))
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .gap_3()
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .flex_col()
-                                            .gap(px(2.))
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                    .text_color(rgb(theme.text_muted))
-                                                    .child("Desktop notifications"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(rgb(theme.text_muted))
-                                                    .child(
-                                                        "Show notices for daemon status and background activity.",
-                                                    ),
-                                            ),
-                                    )
-                                    .child(notifications_toggle),
-                            ),
-                    )
-                    .when_some(modal.error.clone(), |this, error| {
-                        this.child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(theme.notice_text))
-                                .bg(rgb(theme.notice_bg))
-                                .rounded_sm()
-                                .px_2()
-                                .py_1()
-                                .child(error),
-                        )
-                    })
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_end()
-                            .gap_2()
-                            .child(
-                                action_button(
-                                    theme,
-                                    "settings-cancel",
-                                    "Cancel",
-                                    ActionButtonStyle::Secondary,
-                                    true,
-                                )
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.close_settings_modal(cx);
-                                })),
-                            )
-                            .child(
-                                action_button(
-                                    theme,
-                                    "settings-save",
-                                    "Save",
-                                    ActionButtonStyle::Primary,
-                                    true,
-                                )
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.submit_settings_modal(cx);
-                                })),
-                            ),
-                    ),
-            )
-    }
-
-    fn render_manage_repo_presets_modal(&mut self, cx: &mut Context<Self>) -> Div {
-        let Some(modal) = self.manage_repo_presets_modal.clone() else {
-            return div();
-        };
-
-        let theme = self.theme();
-        let is_editing = modal.editing_index.is_some();
-        let is_edit_tab = modal.active_tab == RepoPresetModalTab::Edit;
-        let title = if is_editing {
-            "Edit Custom Preset"
-        } else {
-            "Add Custom Preset"
-        };
-        let save_disabled = modal.name.trim().is_empty() || modal.command.trim().is_empty();
-        let local_preset_path = self.active_arbor_toml_dir().join("arbor.toml");
-        let local_preset_example = format!(
-            "[[presets]]\nname = \"{}\"\nicon = \"{}\"\ncommand = \"{}\"",
-            if modal.name.trim().is_empty() {
-                "dev"
-            } else {
-                modal.name.trim()
-            },
-            if modal.icon.trim().is_empty() {
-                "\u{f013}"
-            } else {
-                modal.icon.trim()
-            },
-            if modal.command.trim().is_empty() {
-                "just run"
-            } else {
-                modal.command.trim()
-            }
-        );
-        let tab_button = |tab: RepoPresetModalTab, label: &'static str| {
-            let is_active = modal.active_tab == tab;
-            div()
-                .cursor_pointer()
-                .px_3()
-                .py_1()
-                .flex()
-                .items_center()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(rgb(if is_active {
-                    theme.text_primary
-                } else {
-                    theme.text_muted
-                }))
-                .when(is_active, |this| {
-                    this.border_b_2().border_color(rgb(theme.accent))
-                })
-                .hover(|s| {
-                    s.bg(rgb(theme.panel_active_bg))
-                        .text_color(rgb(theme.text_primary))
-                })
-                .child(label)
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
-                        this.update_manage_repo_presets_modal_input(
-                            RepoPresetsModalInputEvent::SetActiveTab(tab),
-                            cx,
-                        );
-                    }),
-                )
-        };
-
-        div()
-            .absolute()
-            .inset_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.close_manage_repo_presets_modal(cx);
-                    cx.stop_propagation();
-                }),
-            )
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(|this, _, _, cx| {
-                    this.close_manage_repo_presets_modal(cx);
-                    cx.stop_propagation();
-                }),
-            )
-            .child(modal_backdrop())
-            .child(
-                div()
-                    .w(px(620.))
-                    .max_w(px(620.))
-                    .flex_none()
-                    .overflow_hidden()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(rgb(theme.border))
-                    .bg(rgb(theme.sidebar_bg))
-                    .p_3()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                        cx.stop_propagation();
-                    })
-                    .on_mouse_down(MouseButton::Right, |_, _, cx| {
-                        cx.stop_propagation();
-                    })
-                    .child(
-                        div().flex().items_center().child(
-                            div()
-                                .text_sm()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(theme.text_primary))
-                                .child(title),
-                        ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .gap_0()
-                            .border_b_1()
-                            .border_color(rgb(theme.border))
-                            .child(tab_button(RepoPresetModalTab::Edit, "Edit"))
-                            .child(tab_button(RepoPresetModalTab::LocalPreset, "Local Preset")),
-                    )
-                    .when(is_edit_tab, |this| {
-                        this.child(
-                            modal_input_field(
-                                theme,
-                                "repo-preset-icon-input",
-                                "Icon (emoji)",
-                                &modal.icon,
-                                modal.icon_cursor,
-                                "\u{f013}",
-                                modal.active_field == RepoPresetModalField::Icon,
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.update_manage_repo_presets_modal_input(
-                                    RepoPresetsModalInputEvent::SetActiveField(
-                                        RepoPresetModalField::Icon,
-                                    ),
-                                    cx,
-                                );
-                            })),
-                        )
-                        .child(
-                            modal_input_field(
-                                theme,
-                                "repo-preset-name-input",
-                                "Name",
-                                &modal.name,
-                                modal.name_cursor,
-                                "my preset",
-                                modal.active_field == RepoPresetModalField::Name,
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.update_manage_repo_presets_modal_input(
-                                    RepoPresetsModalInputEvent::SetActiveField(
-                                        RepoPresetModalField::Name,
-                                    ),
-                                    cx,
-                                );
-                            })),
-                        )
-                        .child(
-                            modal_input_field(
-                                theme,
-                                "repo-preset-command-input",
-                                "Command",
-                                &modal.command,
-                                modal.command_cursor,
-                                "just run",
-                                modal.active_field == RepoPresetModalField::Command,
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.update_manage_repo_presets_modal_input(
-                                    RepoPresetsModalInputEvent::SetActiveField(
-                                        RepoPresetModalField::Command,
-                                    ),
-                                    cx,
-                                );
-                            })),
-                        )
-                    })
-                    .when(!is_edit_tab, |this| {
-                        this.child(
-                            div()
-                                .rounded_sm()
-                                .border_1()
-                                .border_color(rgb(theme.border))
-                                .bg(rgb(theme.panel_bg))
-                                .p_3()
-                                .flex()
-                                .flex_col()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(rgb(theme.text_primary))
-                                        .child("Add repo-local presets directly in `arbor.toml`."),
-                                )
-                                .child(div().text_xs().text_color(rgb(theme.text_muted)).child(
-                                    format!(
-                                        "Arbor reads local presets from {}",
-                                        local_preset_path.display()
-                                    ),
-                                ))
-                                .child(
-                                    div()
-                                        .rounded_sm()
-                                        .border_1()
-                                        .border_color(rgb(theme.border))
-                                        .bg(rgb(theme.terminal_bg))
-                                        .p_2()
-                                        .font_family(FONT_MONO)
-                                        .text_xs()
-                                        .text_color(rgb(theme.text_primary))
-                                        .children(
-                                            local_preset_example
-                                                .lines()
-                                                .map(|line| div().child(line.to_owned())),
-                                        ),
-                                ),
-                        )
-                    })
-                    .child(div().when_some(modal.error.clone(), |this, error| {
-                        this.rounded_sm()
-                            .border_1()
-                            .border_color(rgb(0xa44949))
-                            .bg(rgb(0x4d2a2a))
-                            .px_2()
-                            .py_1()
-                            .text_xs()
-                            .text_color(rgb(0xffd7d7))
-                            .child(error)
-                    }))
-                    .child(
-                        div()
-                            .w_full()
-                            .min_w_0()
-                            .flex()
-                            .items_center()
-                            .justify_end()
-                            .gap_2()
-                            .when(is_edit_tab && is_editing, |this| {
-                                this.child(
-                                    action_button(
-                                        theme,
-                                        "repo-preset-new",
-                                        "New Preset",
-                                        ActionButtonStyle::Secondary,
-                                        true,
-                                    )
-                                    .on_click(cx.listener(
-                                        |this, _, _, cx| {
-                                            this.open_manage_repo_presets_modal(None, cx);
-                                        },
-                                    )),
-                                )
-                                .child(
-                                    action_button(
-                                        theme,
-                                        "repo-preset-delete",
-                                        "Delete",
-                                        ActionButtonStyle::Secondary,
-                                        true,
-                                    )
-                                    .on_click(cx.listener(
-                                        |this, _, _, cx| {
-                                            this.delete_repo_preset(cx);
-                                        },
-                                    )),
-                                )
-                            })
-                            .child(
-                                action_button(
-                                    theme,
-                                    "repo-preset-cancel",
-                                    "Cancel",
-                                    ActionButtonStyle::Secondary,
-                                    true,
-                                )
-                                .on_click(cx.listener(
-                                    |this, _, _, cx| {
-                                        this.close_manage_repo_presets_modal(cx);
-                                    },
-                                )),
-                            )
-                            .when(is_edit_tab, |this| {
-                                this.child(
-                                    action_button(
-                                        theme,
-                                        "repo-preset-save",
-                                        "Save",
-                                        ActionButtonStyle::Primary,
-                                        !save_disabled,
-                                    )
-                                    .when(
-                                        !save_disabled,
-                                        |this| {
-                                            this.on_click(cx.listener(|this, _, _, cx| {
-                                                this.submit_manage_repo_presets_modal(cx);
-                                            }))
-                                        },
-                                    ),
-                                )
-                            }),
-                    ),
-            )
-    }
-}
-
-enum LaunchMode {
-    Gui,
-    Daemon { bind_addr: Option<String> },
-    Help,
-}
-
-fn parse_launch_mode(args: impl IntoIterator<Item = String>) -> Result<LaunchMode, String> {
-    let mut daemon_mode = false;
-    let mut bind_addr: Option<String> = None;
-    let mut args = args.into_iter();
-
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--daemon" | "--daemon-only" | "daemon" => {
-                daemon_mode = true;
-            },
-            "--bind" | "--daemon-bind" => {
-                let Some(value) = args.next() else {
-                    return Err(format!("missing value for `{arg}`"));
-                };
-                if value.trim().is_empty() {
-                    return Err(format!("`{arg}` requires a non-empty address"));
+                worktree.agent_state = Some(*state);
+                if let Some(ts) = updated_at {
+                    worktree.last_activity_unix_ms =
+                        Some(worktree.last_activity_unix_ms.unwrap_or(0).max(*ts));
                 }
-                bind_addr = Some(value);
-            },
-            "-h" | "--help" => return Ok(LaunchMode::Help),
-            unknown => return Err(format!("unknown argument `{unknown}`")),
+                if previous_state == Some(AgentState::Working) && *state == AgentState::Waiting {
+                    capture_agent_turn_snapshot(worktree, *updated_at);
+                    notification_worktree = Some(worktree.clone());
+                }
+            }
+            if let Some(worktree) = notification_worktree.as_ref() {
+                app.maybe_notify_agent_finished(worktree, *updated_at);
+                app.maybe_run_auto_checkpoint(worktree);
+            }
+        } else {
+            tracing::warn!(
+                cwd = %cwd,
+                ?state,
+                "agent activity did not match any worktree"
+            );
         }
-    }
-
-    if daemon_mode {
-        Ok(LaunchMode::Daemon { bind_addr })
-    } else {
-        Ok(LaunchMode::Gui)
     }
 }
 
-fn daemon_cli_usage(program_name: &str) -> String {
+fn capture_agent_turn_snapshot(worktree: &mut WorktreeSummary, updated_at: Option<u64>) {
+    let diff_summary = changes::diff_line_summary(&worktree.path).ok();
+    let next_snapshot = AgentTurnSnapshot {
+        timestamp_unix_ms: updated_at.or(worktree.last_activity_unix_ms),
+        diff_summary,
+    };
+
+    if worktree
+        .recent_turns
+        .first()
+        .is_some_and(|previous| previous.diff_summary == next_snapshot.diff_summary)
+    {
+        worktree.stuck_turn_count += 1;
+    } else {
+        worktree.stuck_turn_count = 0;
+    }
+
+    worktree.recent_turns.insert(0, next_snapshot);
+    worktree.recent_turns.truncate(5);
+}
+
+fn inject_daemon_log_entry(log_buffer: &log_layer::LogBuffer, text: &str) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return;
+    };
+    let level = match value
+        .get("level")
+        .and_then(|v| v.as_str())
+        .unwrap_or("INFO")
+    {
+        "ERROR" => tracing::Level::ERROR,
+        "WARN" => tracing::Level::WARN,
+        "DEBUG" => tracing::Level::DEBUG,
+        "TRACE" => tracing::Level::TRACE,
+        _ => tracing::Level::INFO,
+    };
+    let target = value
+        .get("target")
+        .and_then(|v| v.as_str())
+        .unwrap_or("arbor_httpd");
+    let message = value
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned();
+    let fields_str = value.get("fields").and_then(|v| v.as_str()).unwrap_or("");
+    let ts_ms = value.get("ts").and_then(|v| v.as_u64()).unwrap_or(0);
+    let timestamp = SystemTime::UNIX_EPOCH + Duration::from_millis(ts_ms);
+
+    let mut fields = Vec::new();
+    if !fields_str.is_empty() {
+        for part in fields_str.split(' ') {
+            if let Some((k, v)) = part.split_once('=') {
+                fields.push((k.to_owned(), v.to_owned()));
+            }
+        }
+    }
+
+    log_buffer.push(log_layer::LogEntry {
+        timestamp,
+        level,
+        target: format!("[daemon] {target}"),
+        message,
+        fields,
+    });
+}
+
+fn should_emit_agent_finished_notification(
+    notifications: &mut HashMap<PathBuf, u64>,
+    worktree_path: &Path,
+    updated_at: Option<u64>,
+) -> bool {
+    let notification_timestamp = updated_at.unwrap_or_default();
+    if notifications
+        .get(worktree_path)
+        .copied()
+        .is_some_and(|previous| previous >= notification_timestamp)
+    {
+        return false;
+    }
+
+    notifications.insert(worktree_path.to_path_buf(), notification_timestamp);
+    true
+}
+
+fn install_claude_code_hooks(daemon_base_url: &str) -> Result<(), String> {
+    let home = env::var("HOME").map_err(|_| "HOME not set".to_owned())?;
+    let claude_dir = PathBuf::from(&home).join(".claude");
+    let settings_path = claude_dir.join("settings.json");
+
+    let mut settings: serde_json::Value = if settings_path.exists() {
+        let content = fs::read_to_string(&settings_path)
+            .map_err(|e| format!("failed to read settings.json: {e}"))?;
+        serde_json::from_str(&content).map_err(|e| format!("failed to parse settings.json: {e}"))?
+    } else {
+        if !claude_dir.exists() {
+            fs::create_dir_all(&claude_dir)
+                .map_err(|e| format!("failed to create .claude dir: {e}"))?;
+        }
+        serde_json::json!({})
+    };
+
+    let notify_url = format!("{daemon_base_url}/api/v1/agent/notify");
+
+    // Check if our hooks are already present
+    if let Some(hooks) = settings.get("hooks") {
+        let hooks_str = hooks.to_string();
+        if hooks_str.contains("/api/v1/agent/notify") {
+            tracing::debug!("Claude Code hooks already installed");
+            return Ok(());
+        }
+    }
+
+    let hook_entry = serde_json::json!([
+        {
+            "matcher": "",
+            "hooks": [
+                {
+                    "type": "http",
+                    "url": notify_url,
+                    "timeout": 2
+                }
+            ]
+        }
+    ]);
+
+    let hooks = settings
+        .as_object_mut()
+        .ok_or("settings.json is not an object")?
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}));
+
+    let hooks_obj = hooks.as_object_mut().ok_or("hooks is not an object")?;
+
+    if !hooks_obj.contains_key("UserPromptSubmit") {
+        hooks_obj.insert("UserPromptSubmit".to_owned(), hook_entry.clone());
+    }
+    if !hooks_obj.contains_key("Stop") {
+        hooks_obj.insert("Stop".to_owned(), hook_entry);
+    }
+
+    let serialized = serde_json::to_string_pretty(&settings)
+        .map_err(|e| format!("failed to serialize settings: {e}"))?;
+    fs::write(&settings_path, serialized)
+        .map_err(|e| format!("failed to write settings.json: {e}"))?;
+
+    tracing::info!(path = %settings_path.display(), "installed Claude Code hooks");
+    Ok(())
+}
+
+const PI_AGENT_EXTENSION_FILENAME: &str = "arbor-activity.ts";
+const PI_AGENT_EXTENSION_MARKER: &str = "Managed by Arbor: Pi activity bridge";
+
+fn install_pi_agent_extension(daemon_base_url: &str) -> Result<(), String> {
+    let home = env::var("HOME").map_err(|_| "HOME not set".to_owned())?;
+    let extensions_dir = PathBuf::from(&home)
+        .join(".pi")
+        .join("agent")
+        .join("extensions");
+    fs::create_dir_all(&extensions_dir)
+        .map_err(|e| format!("failed to create Pi extensions dir: {e}"))?;
+
+    let extension_path = extensions_dir.join(PI_AGENT_EXTENSION_FILENAME);
+    let next_content = render_pi_agent_extension(daemon_base_url);
+
+    if extension_path.exists() {
+        let existing = fs::read_to_string(&extension_path)
+            .map_err(|e| format!("failed to read Pi extension: {e}"))?;
+        if !existing.contains(PI_AGENT_EXTENSION_MARKER) {
+            return Err(format!(
+                "refusing to overwrite existing Pi extension `{}`",
+                extension_path.display()
+            ));
+        }
+        if existing == next_content {
+            tracing::debug!("Pi activity extension already installed");
+            return Ok(());
+        }
+    }
+
+    fs::write(&extension_path, next_content)
+        .map_err(|e| format!("failed to write Pi extension: {e}"))?;
+    tracing::info!(path = %extension_path.display(), "installed Pi activity extension");
+    Ok(())
+}
+
+fn render_pi_agent_extension(daemon_base_url: &str) -> String {
+    let notify_url = format!("{daemon_base_url}/api/v1/agent/notify");
     format!(
-        "Usage:\n  {program_name}\n  {program_name} --daemon [--bind ADDR]\n\nExamples:\n  {program_name} --daemon\n  {program_name} --daemon --bind 0.0.0.0:8787"
+        r#"// {PI_AGENT_EXTENSION_MARKER}
+import type {{ ExtensionAPI }} from "@mariozechner/pi-coding-agent";
+
+const NOTIFY_URL = {notify_url:?};
+
+async function notify(hookEventName: "UserPromptSubmit" | "Stop", sessionId: string, cwd: string) {{
+  try {{
+    await fetch(NOTIFY_URL, {{
+      method: "POST",
+      headers: {{ "content-type": "application/json" }},
+      body: JSON.stringify({{
+        hook_event_name: hookEventName,
+        session_id: sessionId,
+        cwd,
+      }}),
+    }});
+  }} catch {{
+    // Ignore daemon reachability errors.
+  }}
+}}
+
+export default function (pi: ExtensionAPI) {{
+  pi.on("before_agent_start", async (_event, ctx) => {{
+    await notify("UserPromptSubmit", ctx.sessionManager.getSessionId(), ctx.cwd);
+  }});
+
+  pi.on("agent_end", async (_event, ctx) => {{
+    await notify("Stop", ctx.sessionManager.getSessionId(), ctx.cwd);
+  }});
+}}
+"#
     )
 }
 
-fn top_bar_button(
-    theme: ThemePalette,
-    id: impl Into<ElementId>,
-    enabled: bool,
-    base_text_color: u32,
-    hover_text_color: u32,
-    content: impl IntoElement,
-) -> Stateful<Div> {
-    div()
-        .id(id)
-        .h(px(22.))
-        .px(px(6.))
-        .flex()
-        .items_center()
-        .gap(px(4.))
-        .rounded_sm()
-        .border_1()
-        .border_color(rgb(theme.border))
-        .bg(rgb(theme.chrome_bg))
-        .text_color(rgb(base_text_color))
-        .when(enabled, |this| {
-            this.cursor_pointer()
-                .hover(|this| {
-                    this.bg(rgb(theme.panel_bg))
-                        .text_color(rgb(hover_text_color))
-                        .border_color(rgb(theme.panel_active_bg))
-                })
-                .active(|this| {
-                    this.bg(rgb(theme.panel_active_bg))
-                        .text_color(rgb(hover_text_color))
-                })
-        })
-        .child(content)
-}
-
-fn top_bar_icon_asset_path(kind: TopBarIconKind, tone: TopBarIconTone) -> Option<PathBuf> {
-    let file_name = match (kind, tone) {
-        (TopBarIconKind::RemoteControl, TopBarIconTone::Connected) => {
-            "remote-control-connected.svg"
-        },
-        (TopBarIconKind::RemoteControl, TopBarIconTone::Disabled) => "remote-control-disabled.svg",
-        (TopBarIconKind::GitHub, TopBarIconTone::Muted) => "github-muted.svg",
-        (TopBarIconKind::GitHub, TopBarIconTone::Connected) => "github-connected.svg",
-        (TopBarIconKind::GitHub, TopBarIconTone::Busy) => "github-busy.svg",
-        (TopBarIconKind::WorktreeActions, TopBarIconTone::Muted) => "worktree-actions-enabled.svg",
-        (TopBarIconKind::WorktreeActions, TopBarIconTone::Disabled) => {
-            "worktree-actions-disabled.svg"
-        },
-        (TopBarIconKind::ReportIssue, TopBarIconTone::Muted) => "report-issue.svg",
-        _ => return None,
+fn remove_pi_agent_extension() {
+    let Ok(home) = env::var("HOME") else {
+        return;
     };
+    let extension_path = PathBuf::from(&home)
+        .join(".pi")
+        .join("agent")
+        .join("extensions")
+        .join(PI_AGENT_EXTENSION_FILENAME);
+    if !extension_path.exists() {
+        return;
+    }
 
-    find_top_bar_icons_dir().map(|dir| dir.join(file_name))
-}
+    let Ok(content) = fs::read_to_string(&extension_path) else {
+        return;
+    };
+    if !content.contains(PI_AGENT_EXTENSION_MARKER) {
+        return;
+    }
 
-fn top_bar_icon_size_px(kind: TopBarIconKind) -> f32 {
-    match kind {
-        TopBarIconKind::GitHub => 10.5,
-        TopBarIconKind::RemoteControl
-        | TopBarIconKind::WorktreeActions
-        | TopBarIconKind::ReportIssue => 12.0,
+    match fs::remove_file(&extension_path) {
+        Ok(()) => tracing::info!(path = %extension_path.display(), "removed Pi activity extension"),
+        Err(error) => {
+            tracing::warn!(path = %extension_path.display(), %error, "failed to remove Pi activity extension")
+        },
     }
 }
 
-fn top_bar_icon_element(
-    kind: TopBarIconKind,
-    tone: TopBarIconTone,
-    fallback_color: u32,
-    fallback_glyph: &'static str,
-) -> Div {
+fn remove_claude_code_hooks() {
+    let Ok(home) = env::var("HOME") else {
+        return;
+    };
+    let settings_path = PathBuf::from(&home).join(".claude").join("settings.json");
+    if !settings_path.exists() {
+        return;
+    }
+
+    let Ok(content) = fs::read_to_string(&settings_path) else {
+        return;
+    };
+    let Ok(mut settings) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return;
+    };
+
+    let Some(hooks) = settings.get_mut("hooks").and_then(|v| v.as_object_mut()) else {
+        return;
+    };
+
+    // Check if any hook references our notify endpoint
+    if !hooks
+        .values()
+        .any(|v| v.to_string().contains("/api/v1/agent/notify"))
+    {
+        return;
+    }
+
+    // Remove entries containing our notify URL from each hook array
+    let hook_keys: Vec<String> = hooks.keys().cloned().collect();
+    for key in hook_keys {
+        if let Some(arr) = hooks.get_mut(&key).and_then(|v| v.as_array_mut()) {
+            arr.retain(|entry| !entry.to_string().contains("/api/v1/agent/notify"));
+            if arr.is_empty() {
+                hooks.remove(&key);
+            }
+        }
+    }
+
+    if hooks.is_empty()
+        && let Some(obj) = settings.as_object_mut()
+    {
+        obj.remove("hooks");
+    }
+
+    match serde_json::to_string_pretty(&settings) {
+        Ok(serialized) => {
+            if let Err(e) = fs::write(&settings_path, serialized) {
+                tracing::warn!(error = %e, "failed to write settings.json during hook removal");
+            } else {
+                tracing::info!(path = %settings_path.display(), "removed Claude Code hooks");
+            }
+        },
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to serialize settings during hook removal");
+        },
+    }
+}
+
+fn worktree_rows_changed(previous: &[WorktreeSummary], next: &[WorktreeSummary]) -> bool {
+    if previous.len() != next.len() {
+        return true;
+    }
+
+    previous.iter().zip(next.iter()).any(|(left, right)| {
+        left.group_key != right.group_key
+            || left.checkout_kind != right.checkout_kind
+            || left.repo_root != right.repo_root
+            || left.path != right.path
+            || left.label != right.label
+            || left.branch != right.branch
+            || left.is_primary_checkout != right.is_primary_checkout
+            || left.branch_divergence != right.branch_divergence
+            || left.detected_ports != right.detected_ports
+    })
+}
+
+fn estimated_worktree_hover_popover_card_height(
+    worktree: &WorktreeSummary,
+    checks_expanded: bool,
+) -> Pixels {
+    let mut height = 72.;
+
+    if worktree
+        .diff_summary
+        .is_some_and(|summary| summary.additions > 0 || summary.deletions > 0)
+    {
+        height += 18.;
+    }
+
+    height += 18.;
+
+    if !worktree.recent_turns.is_empty() {
+        height += 24. + worktree.recent_turns.iter().take(3).count() as f32 * 18.;
+    }
+
+    if !worktree.detected_ports.is_empty() {
+        height += 22.;
+    }
+
+    if !worktree.recent_agent_sessions.is_empty() {
+        let visible_sessions = worktree.recent_agent_sessions.iter().take(4);
+        let provider_headers = visible_sessions
+            .clone()
+            .fold((None, 0usize), |(previous, count), session| {
+                if previous == Some(session.provider) {
+                    (previous, count)
+                } else {
+                    (Some(session.provider), count + 1)
+                }
+            })
+            .1;
+        height += 24.
+            + worktree.recent_agent_sessions.iter().take(4).count() as f32 * 18.
+            + provider_headers as f32 * 16.;
+    }
+
+    if let Some(pr) = worktree.pr_details.as_ref() {
+        height += 110.;
+        if checks_expanded
+            && !pr.checks.is_empty()
+            && matches!(
+                pr.state,
+                github_service::PrState::Open | github_service::PrState::Draft
+            )
+        {
+            height += pr.checks.len() as f32 * 18.;
+        }
+    }
+
+    px(height)
+}
+
+fn worktree_hover_popover_zone_bounds(
+    left_pane_width: f32,
+    popover: &WorktreeHoverPopover,
+    worktree: &WorktreeSummary,
+) -> Bounds<Pixels> {
+    let padding = px(WORKTREE_HOVER_POPOVER_ZONE_PADDING_PX);
+    Bounds::new(
+        point(
+            px(left_pane_width) + px(4.) - padding,
+            popover.mouse_y - px(8.) - padding,
+        ),
+        size(
+            px(WORKTREE_HOVER_POPOVER_CARD_WIDTH_PX) + padding * 2.,
+            estimated_worktree_hover_popover_card_height(worktree, popover.checks_expanded)
+                + padding * 2.,
+        ),
+    )
+}
+
+fn worktree_hover_trigger_zone_bounds(left_pane_width: f32, mouse_y: Pixels) -> Bounds<Pixels> {
+    let height = px(WORKTREE_HOVER_TRIGGER_ZONE_HEIGHT_PX);
+    Bounds::new(
+        point(px(0.), mouse_y - height / 2.),
+        size(px(left_pane_width), height),
+    )
+}
+
+fn worktree_hover_safe_zone_contains(
+    left_pane_width: f32,
+    popover: &WorktreeHoverPopover,
+    worktree: &WorktreeSummary,
+    position: gpui::Point<Pixels>,
+) -> bool {
+    worktree_hover_popover_zone_bounds(left_pane_width, popover, worktree).contains(&position)
+        || worktree_hover_trigger_zone_bounds(left_pane_width, popover.mouse_y).contains(&position)
+}
+
+fn format_relative_time(unix_ms: u64) -> String {
+    let now_ms = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    let age_secs = now_ms.saturating_sub(unix_ms) / 1000;
+
+    if age_secs < 60 {
+        return "just now".to_owned();
+    }
+    let minutes = age_secs / 60;
+    if minutes < 60 {
+        return format!("{minutes}m ago");
+    }
+    let hours = minutes / 60;
+    if hours < 24 {
+        return format!("{hours}h ago");
+    }
+    let days = hours / 24;
+    format!("{days}d ago")
+}
+
+fn terminal_tab_title(session: &TerminalSession) -> String {
+    if let Some(last_command) = session
+        .last_command
+        .as_ref()
+        .filter(|command| !command.trim().is_empty())
+    {
+        return truncate_with_ellipsis(last_command.trim(), TERMINAL_TAB_COMMAND_MAX_CHARS);
+    }
+
+    if !session.title.is_empty() && !session.title.starts_with("term-") {
+        return truncate_with_ellipsis(&session.title, TERMINAL_TAB_COMMAND_MAX_CHARS);
+    }
+
+    String::new()
+}
+
+fn diff_tab_title(session: &DiffSession) -> String {
+    truncate_with_ellipsis(&session.title, TERMINAL_TAB_COMMAND_MAX_CHARS)
+}
+
+fn build_worktree_diff_document(
+    worktree_path: &Path,
+    changed_files: &[ChangedFile],
+) -> Result<(Vec<DiffLine>, HashMap<PathBuf, usize>), String> {
+    let mut lines = Vec::new();
+    let mut file_row_indices = HashMap::new();
+
+    for changed_file in changed_files {
+        file_row_indices.insert(changed_file.path.clone(), lines.len());
+        lines.push(DiffLine {
+            left_line_number: None,
+            right_line_number: None,
+            left_text: format!(
+                "{} {}",
+                change_code(changed_file.kind),
+                changed_file.path.display()
+            ),
+            right_text: String::new(),
+            kind: DiffLineKind::FileHeader,
+        });
+
+        let file_lines = build_file_diff_lines(
+            worktree_path,
+            changed_file.path.as_path(),
+            changed_file.kind,
+        )?;
+        if file_lines.is_empty() {
+            lines.push(DiffLine {
+                left_line_number: None,
+                right_line_number: None,
+                left_text: "  no textual changes".to_owned(),
+                right_text: String::new(),
+                kind: DiffLineKind::Context,
+            });
+        } else {
+            lines.extend(file_lines);
+        }
+    }
+
+    Ok((lines, file_row_indices))
+}
+
+fn build_file_diff_lines(
+    worktree_path: &Path,
+    file_path: &Path,
+    change_kind: ChangeKind,
+) -> Result<Vec<DiffLine>, String> {
+    let head_bytes = match change_kind {
+        ChangeKind::Added | ChangeKind::IntentToAdd => Vec::new(),
+        _ => read_head_file_bytes(worktree_path, file_path)?,
+    };
+    let worktree_bytes = match change_kind {
+        ChangeKind::Removed => Vec::new(),
+        _ => read_worktree_file_bytes(worktree_path, file_path)?,
+    };
+    let head_text = String::from_utf8_lossy(&head_bytes).into_owned();
+    let worktree_text = String::from_utf8_lossy(&worktree_bytes).into_owned();
+    Ok(build_side_by_side_diff_lines(&head_text, &worktree_text))
+}
+
+fn read_head_file_bytes(worktree_path: &Path, file_path: &Path) -> Result<Vec<u8>, String> {
+    let relative = git_relative_path(file_path)?;
+    let object_spec = format!("HEAD:{relative}");
+
+    let repo = gix::open(worktree_path).map_err(|error| {
+        format!(
+            "failed to open repository at `{}`: {error}",
+            worktree_path.display()
+        )
+    })?;
+
+    let object_id = match repo.rev_parse_single(object_spec.as_str()) {
+        Ok(id) => id,
+        Err(_) => return Ok(Vec::new()), // file does not exist at HEAD
+    };
+
+    let object = object_id.object().map_err(|error| {
+        format!(
+            "failed to read `{relative}` at HEAD in `{}`: {error}",
+            worktree_path.display()
+        )
+    })?;
+
+    Ok(object.data.to_vec())
+}
+
+fn read_worktree_file_bytes(worktree_path: &Path, file_path: &Path) -> Result<Vec<u8>, String> {
+    let absolute = worktree_path.join(file_path);
+    match fs::read(&absolute) {
+        Ok(bytes) => Ok(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(format!(
+            "failed to read worktree file `{}`: {error}",
+            absolute.display()
+        )),
+    }
+}
+
+fn git_relative_path(file_path: &Path) -> Result<String, String> {
+    let path_text = file_path.to_string_lossy();
+    if path_text.trim().is_empty() {
+        return Err("cannot diff an empty path".to_owned());
+    }
+
+    Ok(path_text.replace('\\', "/"))
+}
+
+fn build_side_by_side_diff_lines(before_text: &str, after_text: &str) -> Vec<DiffLine> {
+    let before_rope = Rope::from_str(before_text);
+    let after_rope = Rope::from_str(after_text);
+    let input = BlobInternedInput::new(before_text.as_bytes(), after_text.as_bytes());
+    let mut diff = BlobDiff::compute(DiffAlgorithm::Histogram, &input);
+    diff.postprocess_lines(&input);
+    let hunks = diff.hunks().collect::<Vec<_>>();
+
+    if hunks.is_empty() {
+        return Vec::new();
+    }
+
+    let mut lines = Vec::new();
+    let mut before_cursor = 0_usize;
+    let mut after_cursor = 0_usize;
+    let hunk_count = hunks.len();
+
+    for (hunk_index, hunk) in hunks.iter().enumerate() {
+        let before_start = hunk.before.start as usize;
+        let before_end = hunk.before.end as usize;
+        let after_start = hunk.after.start as usize;
+        let after_end = hunk.after.end as usize;
+
+        let (leading_context, trailing_context) = if hunk_index == 0 {
+            (0, DIFF_HUNK_CONTEXT_LINES)
+        } else {
+            (DIFF_HUNK_CONTEXT_LINES, DIFF_HUNK_CONTEXT_LINES)
+        };
+        push_hunk_context_lines(
+            &mut lines,
+            &before_rope,
+            &after_rope,
+            before_cursor,
+            before_start,
+            after_cursor,
+            after_start,
+            leading_context,
+            trailing_context,
+        );
+
+        let removed_count = before_end.saturating_sub(before_start);
+        let added_count = after_end.saturating_sub(after_start);
+        let changed_count = removed_count.max(added_count);
+
+        for offset in 0..changed_count {
+            let left_index = (offset < removed_count).then_some(before_start + offset);
+            let right_index = (offset < added_count).then_some(after_start + offset);
+            let kind = match (left_index.is_some(), right_index.is_some()) {
+                (true, true) => DiffLineKind::Modified,
+                (true, false) => DiffLineKind::Removed,
+                (false, true) => DiffLineKind::Added,
+                (false, false) => DiffLineKind::Context,
+            };
+            push_diff_line(
+                &mut lines,
+                &before_rope,
+                &after_rope,
+                left_index,
+                right_index,
+                kind,
+            );
+        }
+
+        before_cursor = before_end;
+        after_cursor = after_end;
+
+        if hunk_index + 1 == hunk_count {
+            push_hunk_context_lines(
+                &mut lines,
+                &before_rope,
+                &after_rope,
+                before_cursor,
+                input.before.len(),
+                after_cursor,
+                input.after.len(),
+                DIFF_HUNK_CONTEXT_LINES,
+                0,
+            );
+        }
+    }
+
+    lines
+}
+
+fn push_hunk_context_lines(
+    output: &mut Vec<DiffLine>,
+    before_rope: &Rope,
+    after_rope: &Rope,
+    before_start: usize,
+    before_end: usize,
+    after_start: usize,
+    after_end: usize,
+    leading_context: usize,
+    trailing_context: usize,
+) {
+    let before_count = before_end.saturating_sub(before_start);
+    let after_count = after_end.saturating_sub(after_start);
+    if before_count == 0 && after_count == 0 {
+        return;
+    }
+
+    let leading_before_count = leading_context.min(before_count);
+    let leading_after_count = leading_context.min(after_count);
+    let leading_before_end = before_start.saturating_add(leading_before_count);
+    let leading_after_end = after_start.saturating_add(leading_after_count);
+
+    let trailing_before_available = before_end.saturating_sub(leading_before_end);
+    let trailing_after_available = after_end.saturating_sub(leading_after_end);
+    let trailing_before_count = trailing_context.min(trailing_before_available);
+    let trailing_after_count = trailing_context.min(trailing_after_available);
+    let trailing_before_start = before_end.saturating_sub(trailing_before_count);
+    let trailing_after_start = after_end.saturating_sub(trailing_after_count);
+
+    if leading_before_end > before_start || leading_after_end > after_start {
+        push_context_diff_lines(
+            output,
+            before_rope,
+            after_rope,
+            before_start,
+            leading_before_end,
+            after_start,
+            leading_after_end,
+        );
+    }
+
+    let hidden_before_count = trailing_before_start.saturating_sub(leading_before_end);
+    let hidden_after_count = trailing_after_start.saturating_sub(leading_after_end);
+    if hidden_before_count > 0 || hidden_after_count > 0 {
+        push_collapsed_gap_line(output, hidden_before_count, hidden_after_count);
+    }
+
+    if trailing_before_start < before_end || trailing_after_start < after_end {
+        push_context_diff_lines(
+            output,
+            before_rope,
+            after_rope,
+            trailing_before_start,
+            before_end,
+            trailing_after_start,
+            after_end,
+        );
+    }
+}
+
+fn push_collapsed_gap_line(
+    output: &mut Vec<DiffLine>,
+    hidden_before_count: usize,
+    hidden_after_count: usize,
+) {
+    output.push(DiffLine {
+        left_line_number: None,
+        right_line_number: None,
+        left_text: format!("… {hidden_before_count} unchanged lines hidden"),
+        right_text: format!("… {hidden_after_count} unchanged lines hidden"),
+        kind: DiffLineKind::Context,
+    });
+}
+
+fn push_context_diff_lines(
+    output: &mut Vec<DiffLine>,
+    before_rope: &Rope,
+    after_rope: &Rope,
+    before_start: usize,
+    before_end: usize,
+    after_start: usize,
+    after_end: usize,
+) {
+    let before_count = before_end.saturating_sub(before_start);
+    let after_count = after_end.saturating_sub(after_start);
+    let paired_count = before_count.min(after_count);
+
+    for offset in 0..paired_count {
+        push_diff_line(
+            output,
+            before_rope,
+            after_rope,
+            Some(before_start + offset),
+            Some(after_start + offset),
+            DiffLineKind::Context,
+        );
+    }
+
+    for offset in paired_count..before_count {
+        push_diff_line(
+            output,
+            before_rope,
+            after_rope,
+            Some(before_start + offset),
+            None,
+            DiffLineKind::Removed,
+        );
+    }
+
+    for offset in paired_count..after_count {
+        push_diff_line(
+            output,
+            before_rope,
+            after_rope,
+            None,
+            Some(after_start + offset),
+            DiffLineKind::Added,
+        );
+    }
+}
+
+fn push_diff_line(
+    output: &mut Vec<DiffLine>,
+    before_rope: &Rope,
+    after_rope: &Rope,
+    left_index: Option<usize>,
+    right_index: Option<usize>,
+    kind: DiffLineKind,
+) {
+    output.push(DiffLine {
+        left_line_number: left_index.map(|index| index + 1),
+        right_line_number: right_index.map(|index| index + 1),
+        left_text: left_index
+            .map(|index| rope_display_line(before_rope, index))
+            .unwrap_or_default(),
+        right_text: right_index
+            .map(|index| rope_display_line(after_rope, index))
+            .unwrap_or_default(),
+        kind,
+    });
+}
+
+fn rope_display_line(rope: &Rope, line_index: usize) -> String {
+    if line_index >= rope.len_lines() {
+        return String::new();
+    }
+
+    let mut text = rope.line(line_index).to_string();
+    while text.ends_with('\n') || text.ends_with('\r') {
+        let _ = text.pop();
+    }
+    text.replace('\t', "    ")
+}
+
+fn format_log_entry(entry: &log_layer::LogEntry) -> String {
+    let timestamp = entry
+        .timestamp
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    let total_secs = timestamp.as_secs();
+    let millis = timestamp.subsec_millis();
+    let hours = (total_secs / 3600) % 24;
+    let minutes = (total_secs / 60) % 60;
+    let seconds = total_secs % 60;
+    let level_str = match entry.level {
+        tracing::Level::ERROR => "ERROR",
+        tracing::Level::WARN => "WARN ",
+        tracing::Level::INFO => "INFO ",
+        tracing::Level::DEBUG => "DEBUG",
+        tracing::Level::TRACE => "TRACE",
+    };
+    let message = if entry.fields.is_empty() {
+        entry.message.clone()
+    } else {
+        let fields_str: Vec<String> = entry
+            .fields
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect();
+        format!("{} {}", entry.message, fields_str.join(" "))
+    };
+    format!(
+        "{hours:02}:{minutes:02}:{seconds:02}.{millis:03} {level_str} {} {message}",
+        entry.target
+    )
+}
+
+fn truncate_with_ellipsis(value: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+
+    let char_count = value.chars().count();
+    if char_count <= max_chars {
+        return value.to_owned();
+    }
+
+    // Take max_chars - 1 characters + "…" so total stays within budget
+    let truncated: String = value.chars().take(max_chars.saturating_sub(1)).collect();
+    format!("{truncated}\u{2026}")
+}
+
+fn notice_looks_like_error(notice: &str) -> bool {
+    let lower = notice.to_ascii_lowercase();
+    [
+        "error",
+        "failed",
+        "invalid",
+        "cannot",
+        "could not",
+        "missing",
+        "not found",
+        "denied",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn action_button(
+    theme: ThemePalette,
+    id: impl Into<ElementId>,
+    label: impl Into<String>,
+    style: ActionButtonStyle,
+    enabled: bool,
+) -> Stateful<Div> {
+    let background = if enabled && style == ActionButtonStyle::Primary {
+        theme.panel_active_bg
+    } else {
+        theme.panel_bg
+    };
+    let text_color = if enabled {
+        theme.text_primary
+    } else {
+        theme.text_disabled
+    };
+
     div()
-        .size(px(14.))
-        .flex_none()
+        .id(id)
+        .when(enabled, |this| {
+            this.cursor_pointer()
+                .hover(|this| this.bg(rgb(theme.panel_active_bg)))
+        })
+        .rounded_sm()
+        .border_1()
+        .border_color(rgb(theme.border))
+        .bg(rgb(background))
+        .px_2()
+        .py_1()
+        .text_xs()
+        .text_color(rgb(text_color))
+        .child(label.into())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActionButtonStyle {
+    Primary,
+    Secondary,
+}
+
+fn preset_icon_image(kind: AgentPresetKind) -> Arc<Image> {
+    static CLAUDE_ICON: OnceLock<Arc<Image>> = OnceLock::new();
+    static CODEX_ICON: OnceLock<Arc<Image>> = OnceLock::new();
+    static PI_ICON: OnceLock<Arc<Image>> = OnceLock::new();
+    static OPENCODE_ICON: OnceLock<Arc<Image>> = OnceLock::new();
+    static COPILOT_ICON: OnceLock<Arc<Image>> = OnceLock::new();
+
+    let lock = match kind {
+        AgentPresetKind::Codex => &CODEX_ICON,
+        AgentPresetKind::Claude => &CLAUDE_ICON,
+        AgentPresetKind::Pi => &PI_ICON,
+        AgentPresetKind::OpenCode => &OPENCODE_ICON,
+        AgentPresetKind::Copilot => &COPILOT_ICON,
+    };
+
+    lock.get_or_init(|| {
+        tracing::info!(
+            preset = kind.key(),
+            asset = preset_icon_asset_path(kind),
+            bytes = preset_icon_bytes(kind).len(),
+            "loading preset icon asset"
+        );
+        Arc::new(Image::from_bytes(
+            preset_icon_format(kind),
+            preset_icon_bytes(kind).to_vec(),
+        ))
+    })
+    .clone()
+}
+
+fn preset_icon_bytes(kind: AgentPresetKind) -> &'static [u8] {
+    match kind {
+        AgentPresetKind::Codex => PRESET_ICON_CODEX_SVG,
+        AgentPresetKind::Claude => PRESET_ICON_CLAUDE_PNG,
+        AgentPresetKind::Pi => PRESET_ICON_PI_SVG,
+        AgentPresetKind::OpenCode => PRESET_ICON_OPENCODE_SVG,
+        AgentPresetKind::Copilot => PRESET_ICON_COPILOT_SVG,
+    }
+}
+
+fn preset_icon_format(kind: AgentPresetKind) -> ImageFormat {
+    match kind {
+        AgentPresetKind::Codex
+        | AgentPresetKind::Pi
+        | AgentPresetKind::OpenCode
+        | AgentPresetKind::Copilot => ImageFormat::Svg,
+        AgentPresetKind::Claude => ImageFormat::Png,
+    }
+}
+
+fn preset_icon_asset_path(kind: AgentPresetKind) -> &'static str {
+    match kind {
+        AgentPresetKind::Codex => "assets/preset-icons/codex-white.svg",
+        AgentPresetKind::Claude => "assets/preset-icons/claude.png",
+        AgentPresetKind::Pi => "assets/preset-icons/pi-white.svg",
+        AgentPresetKind::OpenCode => "assets/preset-icons/opencode-white.svg",
+        AgentPresetKind::Copilot => "assets/preset-icons/copilot-white.svg",
+    }
+}
+
+fn log_preset_icon_fallback_once(kind: AgentPresetKind, fallback_glyph: &'static str) {
+    static CLAUDE_FALLBACK_LOGGED: OnceLock<()> = OnceLock::new();
+    static CODEX_FALLBACK_LOGGED: OnceLock<()> = OnceLock::new();
+    static PI_FALLBACK_LOGGED: OnceLock<()> = OnceLock::new();
+    static OPENCODE_FALLBACK_LOGGED: OnceLock<()> = OnceLock::new();
+    static COPILOT_FALLBACK_LOGGED: OnceLock<()> = OnceLock::new();
+
+    let once = match kind {
+        AgentPresetKind::Codex => &CODEX_FALLBACK_LOGGED,
+        AgentPresetKind::Claude => &CLAUDE_FALLBACK_LOGGED,
+        AgentPresetKind::Pi => &PI_FALLBACK_LOGGED,
+        AgentPresetKind::OpenCode => &OPENCODE_FALLBACK_LOGGED,
+        AgentPresetKind::Copilot => &COPILOT_FALLBACK_LOGGED,
+    };
+
+    once.get_or_init(|| {
+        tracing::warn!(
+            preset = kind.key(),
+            asset = preset_icon_asset_path(kind),
+            bytes = preset_icon_bytes(kind).len(),
+            fallback = fallback_glyph,
+            "preset icon asset could not be rendered, using fallback glyph"
+        );
+        eprintln!(
+            "WARN preset icon fallback preset={} asset={} bytes={} fallback={}",
+            kind.key(),
+            preset_icon_asset_path(kind),
+            preset_icon_bytes(kind).len(),
+            fallback_glyph
+        );
+    });
+}
+
+fn log_preset_icon_render_once(kind: AgentPresetKind) {
+    static CLAUDE_RENDER_LOGGED: OnceLock<()> = OnceLock::new();
+    static CODEX_RENDER_LOGGED: OnceLock<()> = OnceLock::new();
+    static PI_RENDER_LOGGED: OnceLock<()> = OnceLock::new();
+    static OPENCODE_RENDER_LOGGED: OnceLock<()> = OnceLock::new();
+    static COPILOT_RENDER_LOGGED: OnceLock<()> = OnceLock::new();
+
+    let once = match kind {
+        AgentPresetKind::Codex => &CODEX_RENDER_LOGGED,
+        AgentPresetKind::Claude => &CLAUDE_RENDER_LOGGED,
+        AgentPresetKind::Pi => &PI_RENDER_LOGGED,
+        AgentPresetKind::OpenCode => &OPENCODE_RENDER_LOGGED,
+        AgentPresetKind::Copilot => &COPILOT_RENDER_LOGGED,
+    };
+
+    once.get_or_init(|| {
+        tracing::info!(
+            preset = kind.key(),
+            asset = preset_icon_asset_path(kind),
+            "preset icon render path active"
+        );
+    });
+}
+
+fn preset_icon_render_size_px(kind: AgentPresetKind) -> f32 {
+    match kind {
+        AgentPresetKind::Codex => 20.,
+        AgentPresetKind::Claude
+        | AgentPresetKind::Pi
+        | AgentPresetKind::OpenCode
+        | AgentPresetKind::Copilot => 14.,
+    }
+}
+
+fn agent_preset_button_content(kind: AgentPresetKind, text_color: u32) -> Div {
+    log_preset_icon_render_once(kind);
+    let icon = preset_icon_image(kind);
+    let icon_size = preset_icon_render_size_px(kind);
+    // Use consistent slot size for all icons to ensure vertical alignment
+    let icon_slot_size = 20_f32;
+    let fallback_color = match kind {
+        AgentPresetKind::Claude => 0xD97757,
+        AgentPresetKind::Codex
+        | AgentPresetKind::Pi
+        | AgentPresetKind::OpenCode
+        | AgentPresetKind::Copilot => text_color,
+    };
+    let fallback_glyph = match kind {
+        AgentPresetKind::Claude => "C",
+        AgentPresetKind::Codex
+        | AgentPresetKind::Pi
+        | AgentPresetKind::OpenCode
+        | AgentPresetKind::Copilot => kind.fallback_icon(),
+    };
+    div()
         .flex()
         .items_center()
-        .justify_center()
-        .child(match top_bar_icon_asset_path(kind, tone) {
-            Some(path) => img(path)
-                .size(px(top_bar_icon_size_px(kind)))
-                .with_fallback(move || {
+        .gap(px(6.))
+        .child(
+            div()
+                .w(px(icon_slot_size))
+                .h(px(icon_slot_size))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(img(icon).size(px(icon_size)).with_fallback(move || {
+                    log_preset_icon_fallback_once(kind, fallback_glyph);
                     div()
                         .font_family(FONT_MONO)
                         .text_size(px(12.))
@@ -16429,230 +5556,1721 @@ fn top_bar_icon_element(
                         .text_color(rgb(fallback_color))
                         .child(fallback_glyph)
                         .into_any_element()
-                })
-                .into_any_element(),
-            None => div()
-                .font_family(FONT_MONO)
+                })),
+        )
+        .child(
+            div()
                 .text_size(px(12.))
-                .line_height(px(12.))
-                .text_color(rgb(fallback_color))
-                .child(fallback_glyph)
-                .into_any_element(),
-        })
-}
-
-fn terminal_quick_action_icon_element(fallback_color: u32, size_px: f32) -> Div {
-    div()
-        .size(px(size_px))
-        .flex_none()
-        .flex()
-        .items_center()
-        .justify_center()
-        .child(
-            match find_ui_icons_dir().map(|dir| dir.join("terminal-accent.svg")) {
-                Some(path) => img(path)
-                    .size(px(size_px))
-                    .with_fallback(move || {
-                        div()
-                            .font_family(FONT_MONO)
-                            .text_size(px(size_px))
-                            .line_height(px(size_px))
-                            .text_color(rgb(fallback_color))
-                            .child("\u{f120}")
-                            .into_any_element()
-                    })
-                    .into_any_element(),
-                None => div()
-                    .font_family(FONT_MONO)
-                    .text_size(px(size_px))
-                    .line_height(px(size_px))
-                    .text_color(rgb(fallback_color))
-                    .child("\u{f120}")
-                    .into_any_element(),
-            },
+                .line_height(px(14.))
+                .text_color(rgb(text_color))
+                .child(kind.label()),
         )
 }
 
-fn themed_ui_svg_icon(
-    path: &'static str,
-    color: u32,
-    size_px: f32,
-    fallback_glyph: &'static str,
-) -> Div {
-    div()
-        .size(px(size_px))
-        .flex_none()
-        .flex()
-        .items_center()
-        .justify_center()
-        .child(
-            svg()
-                .path(path)
-                .size(px(size_px))
-                .text_color(rgb(color))
-                .into_any_element(),
-        )
-        .when(find_assets_root_dir().is_none(), |this| {
-            this.child(
-                div()
-                    .font_family(FONT_MONO)
-                    .text_size(px(size_px))
-                    .line_height(px(size_px))
-                    .text_color(rgb(color))
-                    .child(fallback_glyph),
-            )
-        })
-}
-
-fn terminal_tab_icon_element(is_active: bool, color: u32, size_px: f32) -> Div {
-    themed_ui_svg_icon(
-        if is_active {
-            "icons/ui/terminal-active.svg"
-        } else {
-            "icons/ui/terminal-muted.svg"
-        },
-        color,
-        size_px,
-        "\u{f120}",
-    )
-}
-
-fn logs_tab_icon_element(is_active: bool, color: u32, size_px: f32) -> Div {
-    themed_ui_svg_icon(
-        if is_active {
-            "icons/ui/logs-active.svg"
-        } else {
-            "icons/ui/logs-muted.svg"
-        },
-        color,
-        size_px,
-        "\u{f4ed}",
-    )
-}
-
-fn run_daemon_mode(bind_addr: Option<String>) -> Result<(), String> {
-    let binary = find_arbor_httpd_binary().ok_or_else(|| {
-        "could not find `arbor-httpd` in PATH or next to the current executable".to_owned()
-    })?;
-
-    let mut command = Command::new(&binary);
-    if let Some(path) = AUGMENTED_PATH.get() {
-        command.env("PATH", path);
-    }
-    if let Some(bind_addr) = bind_addr {
-        command.env("ARBOR_HTTPD_BIND", bind_addr);
-    }
-
-    let status = command.status().map_err(|error| {
-        format!(
-            "failed to start `{}`: {error}",
-            binary
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("arbor-httpd")
-        )
-    })?;
-
-    if status.success() {
-        return Ok(());
-    }
-
-    Err(format!("arbor-httpd exited with status {status}"))
-}
-
-fn main() {
-    let program_name = env::args().next().unwrap_or_else(|| "arbor".to_owned());
-    let launch_mode = match parse_launch_mode(env::args().skip(1)) {
-        Ok(mode) => mode,
-        Err(error) => {
-            eprintln!("{error}\n\n{}", daemon_cli_usage(&program_name));
-            std::process::exit(2);
-        },
+fn git_action_button(
+    theme: ThemePalette,
+    id: impl Into<ElementId>,
+    icon: &'static str,
+    label: &'static str,
+    enabled: bool,
+    active: bool,
+) -> Stateful<Div> {
+    let background = if active {
+        theme.panel_active_bg
+    } else {
+        theme.panel_bg
+    };
+    let icon_color = if active {
+        theme.accent
+    } else if enabled {
+        theme.text_muted
+    } else {
+        theme.text_disabled
+    };
+    let text_color = if enabled || active {
+        theme.text_primary
+    } else {
+        theme.text_disabled
     };
 
-    if matches!(launch_mode, LaunchMode::Help) {
-        println!("{}", daemon_cli_usage(&program_name));
-        return;
-    }
+    div()
+        .id(id)
+        .h(px(24.))
+        .rounded_sm()
+        .border_1()
+        .border_color(rgb(theme.border))
+        .bg(rgb(background))
+        .px_2()
+        .flex()
+        .items_center()
+        .gap_1()
+        .when(enabled, |this| {
+            this.cursor_pointer()
+                .hover(|this| this.bg(rgb(theme.panel_active_bg)))
+        })
+        .child(
+            div()
+                .font_family(FONT_MONO)
+                .text_size(px(13.))
+                .text_color(rgb(icon_color))
+                .child(icon),
+        )
+        .child(div().text_xs().text_color(rgb(text_color)).child(label))
+}
 
-    augment_path_from_login_shell();
+fn modal_backdrop() -> Div {
+    div().absolute().inset_0().bg(rgb(0x000000)).opacity(0.28)
+}
 
-    if let LaunchMode::Daemon { bind_addr } = launch_mode {
-        if let Err(error) = run_daemon_mode(bind_addr) {
-            eprintln!("{error}");
-            std::process::exit(1);
-        }
-        return;
-    }
+fn modal_input_field(
+    theme: ThemePalette,
+    id: impl Into<ElementId>,
+    label: impl Into<String>,
+    value: &str,
+    cursor: usize,
+    placeholder: impl Into<String>,
+    active: bool,
+) -> Stateful<Div> {
+    let label = label.into();
+    let placeholder = placeholder.into();
 
-    let log_buffer = log_layer::LogBuffer::new();
-
-    {
-        use tracing_subscriber::{
-            EnvFilter, Layer, Registry, layer::SubscriberExt, util::SubscriberInitExt,
-        };
-
-        let env_filter =
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-        let in_memory_layer =
-            log_layer::InMemoryLayer::new(log_buffer.clone()).with_filter(env_filter);
-
-        Registry::default().with(in_memory_layer).init();
-    }
-
-    tracing::info!("Arbor starting");
-
-    let assets_base = find_assets_root_dir()
-        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets"));
-
-    Application::new()
-        .with_assets(ArborAssets { base: assets_base })
-        .run(move |cx: &mut App| {
-            register_bundled_fonts(cx);
-            set_dock_icon();
-            cx.set_http_client(simple_http_client::create_http_client());
-            install_app_menu_and_keys(cx);
-            let startup_ui_state = ui_state_store::load_startup_state();
-            let default_bounds = Bounds::centered(None, size(px(1460.), px(900.)), cx);
-            let bounds = startup_ui_state
-                .window
-                .and_then(bounds_from_window_geometry)
-                .unwrap_or(default_bounds);
-            let startup_ui_state_for_window = startup_ui_state.clone();
-            let log_buffer_for_window = log_buffer.clone();
-
-            if let Err(error) = cx.open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    window_min_size: Some(size(px(1180.), px(760.))),
-                    app_id: Some("so.pen.arbor".to_owned()),
-                    titlebar: Some(TitlebarOptions {
-                        title: Some("Arbor".into()),
-                        appears_transparent: true,
-                        traffic_light_position: Some(point(px(9.), px(9.))),
-                    }),
-                    window_decorations: Some(WindowDecorations::Client),
-                    ..Default::default()
-                },
-                move |_, cx| {
-                    let startup_ui_state = startup_ui_state_for_window.clone();
-                    let log_buffer = log_buffer_for_window.clone();
-                    cx.new(move |cx| {
-                        ArborWindow::load_with_daemon_store::<daemon::JsonDaemonSessionStore>(
-                            startup_ui_state,
-                            log_buffer,
-                            cx,
+    div()
+        .id(id)
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(theme.text_muted))
+                .child(label),
+        )
+        .child(
+            div()
+                .overflow_hidden()
+                .cursor_pointer()
+                .rounded_sm()
+                .border_1()
+                .border_color(rgb(if active {
+                    theme.accent
+                } else {
+                    theme.border
+                }))
+                .bg(rgb(theme.panel_bg))
+                .px_2()
+                .py_1()
+                .text_sm()
+                .font_family(FONT_MONO)
+                .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .child(if active {
+                    if value.is_empty() {
+                        active_input_display(theme, "", &placeholder, theme.text_disabled, 0, 48)
+                    } else {
+                        active_input_display(
+                            theme,
+                            value,
+                            &placeholder,
+                            theme.text_primary,
+                            cursor,
+                            56,
                         )
-                    })
-                },
-            ) {
-                eprintln!("failed to open Arbor window: {error:#}");
-                cx.quit();
+                    }
+                } else if value.is_empty() {
+                    div()
+                        .text_color(rgb(theme.text_disabled))
+                        .child(placeholder)
+                        .into_any_element()
+                } else {
+                    div()
+                        .text_color(rgb(theme.text_primary))
+                        .child(value.to_owned())
+                        .into_any_element()
+                }),
+        )
+}
+
+fn single_line_input_field(
+    theme: ThemePalette,
+    id: impl Into<ElementId>,
+    value: &str,
+    cursor: usize,
+    placeholder: impl Into<String>,
+    active: bool,
+) -> Stateful<Div> {
+    let placeholder = placeholder.into();
+
+    div()
+        .id(id)
+        .w_full()
+        .min_w_0()
+        .overflow_hidden()
+        .h(px(30.))
+        .cursor_text()
+        .rounded_sm()
+        .border_1()
+        .border_color(rgb(if active {
+            theme.accent
+        } else {
+            theme.border
+        }))
+        .bg(rgb(theme.panel_bg))
+        .px_2()
+        .text_sm()
+        .font_family(FONT_MONO)
+        .flex()
+        .items_center()
+        .child(if active {
+            if value.is_empty() {
+                active_input_display(theme, "", &placeholder, theme.text_disabled, 0, 48)
+            } else {
+                active_input_display(theme, value, &placeholder, theme.text_primary, cursor, 48)
+            }
+        } else {
+            div()
+                .min_w_0()
+                .flex_1()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .text_color(rgb(if value.is_empty() {
+                    theme.text_disabled
+                } else {
+                    theme.text_primary
+                }))
+                .child(if value.is_empty() {
+                    placeholder
+                } else {
+                    value.to_owned()
+                })
+                .into_any_element()
+        })
+}
+
+fn active_input_display(
+    theme: ThemePalette,
+    value: &str,
+    placeholder: &str,
+    text_color: u32,
+    cursor: usize,
+    max_chars: usize,
+) -> AnyElement {
+    if value.is_empty() {
+        return div()
+            .relative()
+            .min_w_0()
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .child(
+                div()
+                    .text_color(rgb(text_color))
+                    .child(placeholder.to_owned()),
+            )
+            .child(
+                input_caret(theme)
+                    .flex_none()
+                    .absolute()
+                    .left(px(0.))
+                    .top(px(2.)),
+            )
+            .into_any_element();
+    }
+
+    div()
+        .min_w_0()
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .flex()
+        .items_center()
+        .justify_start()
+        .gap(px(0.))
+        .child({
+            let (before_cursor, after_cursor) = visible_input_segments(value, cursor, max_chars);
+            div()
+                .flex()
+                .items_center()
+                .min_w_0()
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(rgb(text_color))
+                        .child(before_cursor),
+                )
+                .child(input_caret(theme).flex_none())
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(rgb(text_color))
+                        .child(after_cursor),
+                )
+        })
+        .into_any_element()
+}
+
+fn visible_input_segments(value: &str, cursor: usize, max_chars: usize) -> (String, String) {
+    let chars: Vec<char> = value.chars().collect();
+    let len = chars.len();
+    let cursor = cursor.min(len);
+    if len <= max_chars {
+        let before: String = chars[..cursor].iter().collect();
+        let after: String = chars[cursor..].iter().collect();
+        return (before, after);
+    }
+
+    let window = max_chars.max(1);
+    let preferred_left = window.saturating_sub(8);
+    let mut start = cursor.saturating_sub(preferred_left);
+    start = start.min(len.saturating_sub(window));
+    let end = (start + window).min(len);
+
+    let mut before: String = chars[start..cursor].iter().collect();
+    let mut after: String = chars[cursor..end].iter().collect();
+    if start > 0 {
+        before.insert(0, '\u{2026}');
+    }
+    if end < len {
+        after.push('\u{2026}');
+    }
+    (before, after)
+}
+
+fn input_caret(theme: ThemePalette) -> Div {
+    div().w(px(1.)).h(px(14.)).bg(rgb(theme.accent)).mt(px(1.))
+}
+
+fn status_text(theme: ThemePalette, text: impl Into<String>) -> Div {
+    div()
+        .text_xs()
+        .text_color(rgb(theme.text_muted))
+        .child(text.into())
+}
+
+fn is_gui_editor(editor: &str) -> bool {
+    let basename = Path::new(editor)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(editor);
+    matches!(
+        basename,
+        "code"
+            | "codium"
+            | "subl"
+            | "atom"
+            | "gedit"
+            | "kate"
+            | "mousepad"
+            | "xed"
+            | "pluma"
+            | "gvim"
+            | "mvim"
+            | "mate"
+            | "bbedit"
+            | "nova"
+            | "zed"
+            | "cursor"
+            | "fleet"
+            | "lite-xl"
+    )
+}
+
+fn shell_escape(s: &str) -> String {
+    if s.chars()
+        .all(|c| c.is_alphanumeric() || c == '/' || c == '.' || c == '-' || c == '_')
+    {
+        s.to_owned()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
+fn char_to_byte_offset(s: &str, char_idx: usize) -> usize {
+    s.char_indices()
+        .nth(char_idx)
+        .map(|(byte, _)| byte)
+        .unwrap_or(s.len())
+}
+
+fn char_count(s: &str) -> usize {
+    s.chars().count()
+}
+
+fn apply_text_edit_action(text: &mut String, cursor: &mut usize, action: &TextEditAction) {
+    *cursor = (*cursor).min(char_count(text));
+    match action {
+        TextEditAction::Insert(insert_text) => {
+            let byte_offset = char_to_byte_offset(text, *cursor);
+            text.insert_str(byte_offset, insert_text);
+            *cursor += insert_text.chars().count();
+        },
+        TextEditAction::Backspace => {
+            if *cursor == 0 {
                 return;
             }
+            let end = char_to_byte_offset(text, *cursor);
+            let start = char_to_byte_offset(text, *cursor - 1);
+            text.replace_range(start..end, "");
+            *cursor -= 1;
+        },
+        TextEditAction::Delete => {
+            let len = char_count(text);
+            if *cursor >= len {
+                return;
+            }
+            let start = char_to_byte_offset(text, *cursor);
+            let end = char_to_byte_offset(text, *cursor + 1);
+            text.replace_range(start..end, "");
+        },
+        TextEditAction::MoveLeft => {
+            *cursor = (*cursor).saturating_sub(1);
+        },
+        TextEditAction::MoveRight => {
+            *cursor = (*cursor + 1).min(char_count(text));
+        },
+        TextEditAction::MoveHome => {
+            *cursor = 0;
+        },
+        TextEditAction::MoveEnd => {
+            *cursor = char_count(text);
+        },
+    }
+}
 
-            cx.activate(true);
+fn typed_text_for_keystroke(event: &KeyDownEvent) -> Option<String> {
+    event
+        .keystroke
+        .key_char
+        .as_deref()
+        .or_else(|| {
+            let key = event.keystroke.key.as_str();
+            if key.chars().count() == 1 {
+                Some(key)
+            } else {
+                None
+            }
+        })
+        .map(ToOwned::to_owned)
+}
+
+fn text_edit_action_for_event(
+    event: &KeyDownEvent,
+    cx: &mut Context<ArborWindow>,
+) -> Option<TextEditAction> {
+    match event.keystroke.key.as_str() {
+        "backspace" => return Some(TextEditAction::Backspace),
+        "delete" => return Some(TextEditAction::Delete),
+        "left" => return Some(TextEditAction::MoveLeft),
+        "right" => return Some(TextEditAction::MoveRight),
+        "home" => return Some(TextEditAction::MoveHome),
+        "end" => return Some(TextEditAction::MoveEnd),
+        _ => {},
+    }
+
+    if event.keystroke.modifiers.platform {
+        if event.keystroke.key.as_str() == "v"
+            && let Some(clipboard) = cx.read_from_clipboard()
+        {
+            let text = clipboard.text().unwrap_or_default();
+            if !text.is_empty() {
+                return Some(TextEditAction::Insert(text));
+            }
+        }
+        return None;
+    }
+
+    if event.keystroke.modifiers.control || event.keystroke.modifiers.alt {
+        return None;
+    }
+
+    typed_text_for_keystroke(event).map(TextEditAction::Insert)
+}
+
+fn highlight_lines_with_syntect(
+    raw_lines: &[String],
+    ext: &str,
+    default_color: u32,
+) -> Vec<Vec<FileViewSpan>> {
+    let syntax_set = SyntaxSet::load_defaults_newlines();
+    let theme_set = ThemeSet::load_defaults();
+    let theme = &theme_set.themes["base16-ocean.dark"];
+    if let Some(syntax) = syntax_set.find_syntax_by_extension(ext) {
+        let mut highlighter = HighlightLines::new(syntax, theme);
+        raw_lines
+            .iter()
+            .map(|line| {
+                // Syntect grammars loaded with load_defaults_newlines() require
+                // newline-terminated lines for correct tokenisation.
+                let line_nl = format!("{line}\n");
+                match highlighter.highlight_line(&line_nl, &syntax_set) {
+                    Ok(ranges) => ranges
+                        .into_iter()
+                        .filter_map(|(style, text)| {
+                            let trimmed = text.trim_end_matches('\n');
+                            if trimmed.is_empty() {
+                                return None;
+                            }
+                            let c = style.foreground;
+                            Some(FileViewSpan {
+                                text: trimmed.to_owned(),
+                                color: (c.r as u32) << 16 | (c.g as u32) << 8 | c.b as u32,
+                            })
+                        })
+                        .collect(),
+                    Err(_) => vec![FileViewSpan {
+                        text: line.to_owned(),
+                        color: default_color,
+                    }],
+                }
+            })
+            .collect()
+    } else {
+        raw_lines
+            .iter()
+            .map(|line| {
+                vec![FileViewSpan {
+                    text: line.to_owned(),
+                    color: default_color,
+                }]
+            })
+            .collect()
+    }
+}
+
+fn file_icon_and_color(name: &str, is_dir: bool) -> (&'static str, u32) {
+    if is_dir {
+        return ("\u{f07b}", 0xe5c07b);
+    }
+
+    // Check full filename first
+    match name {
+        "Dockerfile" | ".dockerignore" => return ("\u{e7b0}", 0x61afef),
+        "Makefile" | "Justfile" => return ("\u{e615}", 0x98c379),
+        ".gitignore" | ".env" => return ("\u{e615}", 0x838994),
+        _ => {},
+    }
+
+    // Check extension
+    let ext = name.rsplit('.').next().unwrap_or("");
+    match ext {
+        "rs" => ("\u{e7a8}", 0xe06c75),
+        "toml" => ("\u{e615}", 0x838994),
+        "py" => ("\u{e73c}", 0x61afef),
+        "js" => ("\u{e74e}", 0xe5c07b),
+        "ts" => ("\u{e628}", 0x61afef),
+        "jsx" | "tsx" => ("\u{e7ba}", 0x56b6c2),
+        "json" => ("\u{e60b}", 0xe5c07b),
+        "html" => ("\u{e736}", 0xe06c75),
+        "css" | "scss" | "sass" => ("\u{e749}", 0x56b6c2),
+        "md" | "mdx" => ("\u{e73e}", 0x61afef),
+        "yaml" | "yml" => ("\u{e615}", 0xc678dd),
+        "sh" | "bash" | "zsh" => ("\u{e795}", 0x98c379),
+        "go" => ("\u{e627}", 0x56b6c2),
+        "c" | "h" => ("\u{e61e}", 0x61afef),
+        "cpp" | "hpp" | "cc" => ("\u{e61d}", 0xe06c75),
+        "java" => ("\u{e738}", 0xe06c75),
+        "rb" => ("\u{e739}", 0xe06c75),
+        "swift" => ("\u{e755}", 0xe06c75),
+        "lock" => ("\u{f023}", 0x838994),
+        "svg" | "png" | "jpg" | "jpeg" | "gif" | "webp" | "ico" => ("\u{f1c5}", 0xc678dd),
+        "txt" | "log" => ("\u{f15c}", 0x838994),
+        "xml" => ("\u{e619}", 0xe5c07b),
+        "sql" => ("\u{f1c0}", 0xe5c07b),
+        _ => ("\u{f15c}", 0x838994),
+    }
+}
+
+fn change_code(kind: ChangeKind) -> &'static str {
+    match kind {
+        ChangeKind::Added => "A",
+        ChangeKind::Modified => "M",
+        ChangeKind::Removed => "D",
+        ChangeKind::Renamed => "R",
+        ChangeKind::Copied => "C",
+        ChangeKind::TypeChange => "T",
+        ChangeKind::Conflict => "U",
+        ChangeKind::IntentToAdd => "I",
+    }
+}
+
+fn truncate_middle_path_for_width(path: &Path, right_pane_width: f32) -> String {
+    let path_text = path.display().to_string();
+    let available_width = (right_pane_width - 110.).max(120.);
+    let max_chars = ((available_width / 7.3).floor() as usize).clamp(18, 96);
+    truncate_middle_text(&path_text, max_chars)
+}
+
+fn truncate_middle_text(input: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    if chars.len() <= max_chars {
+        return input.to_owned();
+    }
+
+    if max_chars <= 1 {
+        return "…".to_owned();
+    }
+
+    let keep = max_chars - 1;
+    let tail_keep = (keep * 3) / 5;
+    let head_keep = keep.saturating_sub(tail_keep);
+    let tail_start = chars.len().saturating_sub(tail_keep);
+
+    let mut output = String::with_capacity(max_chars);
+    output.extend(chars.iter().take(head_keep));
+    output.push('…');
+    output.extend(chars.iter().skip(tail_start));
+    output
+}
+
+fn run_launch_command(command: &mut Command, operation: &str) -> Result<(), String> {
+    let output = run_command_output(command, operation)?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(command_failure_message(operation, &output))
+    }
+}
+
+fn run_command_output(
+    command: &mut Command,
+    operation: &str,
+) -> Result<std::process::Output, String> {
+    command
+        .output()
+        .map_err(|error| format!("failed to run {operation}: {error}"))
+}
+
+fn command_failure_message(operation: &str, output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if !stderr.is_empty() {
+        return format!("{operation} failed: {stderr}");
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if !stdout.is_empty() {
+        return format!("{operation} failed: {stdout}");
+    }
+
+    match output.status.code() {
+        Some(code) => format!("{operation} failed with exit code {code}"),
+        None => format!("{operation} failed"),
+    }
+}
+
+fn auto_commit_subject(changed_files: &[ChangedFile]) -> String {
+    if changed_files.len() == 1 {
+        let file_label = changed_files[0]
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| changed_files[0].path.display().to_string());
+        return format!("chore: update {file_label}");
+    }
+
+    let has_added = changed_files
+        .iter()
+        .any(|change| matches!(change.kind, ChangeKind::Added | ChangeKind::IntentToAdd));
+    let has_removed = changed_files
+        .iter()
+        .any(|change| matches!(change.kind, ChangeKind::Removed));
+    let has_renamed = changed_files
+        .iter()
+        .any(|change| matches!(change.kind, ChangeKind::Renamed));
+    let verb = if has_added && !has_removed && !has_renamed {
+        "add"
+    } else if has_removed && !has_added && !has_renamed {
+        "remove"
+    } else if has_renamed && !has_added && !has_removed {
+        "rename"
+    } else {
+        "update"
+    };
+
+    format!("chore: {verb} {} files", changed_files.len())
+}
+
+fn auto_commit_body(changed_files: &[ChangedFile]) -> String {
+    let mut lines = vec!["Auto-generated by Arbor.".to_owned(), String::new()];
+
+    for change in changed_files.iter().take(12) {
+        let mut line = format!("- {} {}", change_code(change.kind), change.path.display());
+        if change.additions > 0 || change.deletions > 0 {
+            line.push_str(&format!(" (+{} -{})", change.additions, change.deletions));
+        }
+        lines.push(line);
+    }
+
+    if changed_files.len() > 12 {
+        lines.push(format!("- ... and {} more", changed_files.len() - 12));
+    }
+
+    lines.join("\n")
+}
+
+fn default_commit_message(changed_files: &[ChangedFile]) -> String {
+    format!(
+        "{}\n\n{}",
+        auto_commit_subject(changed_files),
+        auto_commit_body(changed_files)
+    )
+}
+
+fn auto_checkpoint_commit_message(
+    changed_files: &[ChangedFile],
+    agent_task: Option<&str>,
+) -> String {
+    let mut body_lines = vec!["Auto-checkpoint created by Arbor after an agent turn.".to_owned()];
+    if let Some(task) = agent_task.map(str::trim).filter(|task| !task.is_empty()) {
+        body_lines.push(format!("Task: {task}"));
+    }
+    body_lines.push(String::new());
+    for change in changed_files.iter().take(12) {
+        let mut line = format!("- {} {}", change_code(change.kind), change.path.display());
+        if change.additions > 0 || change.deletions > 0 {
+            line.push_str(&format!(" (+{} -{})", change.additions, change.deletions));
+        }
+        body_lines.push(line);
+    }
+    if changed_files.len() > 12 {
+        body_lines.push(format!("- ... and {} more", changed_files.len() - 12));
+    }
+
+    format!("arbor: auto-checkpoint\n\n{}", body_lines.join("\n"))
+}
+
+#[derive(Clone)]
+struct PortScanTarget {
+    worktree_path: PathBuf,
+    root_pid: u32,
+}
+
+#[derive(Clone)]
+struct ProcessInfoSnapshot {
+    parent_pid: u32,
+    #[cfg_attr(unix, allow(dead_code))]
+    name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ScannedPortInfo {
+    port: u16,
+    pid: u32,
+    address: String,
+    process_name: String,
+}
+
+const IGNORED_PORTS: [u16; 7] = [22, 80, 443, 3306, 5432, 6379, 27017];
+
+fn detect_ports_for_worktrees(
+    worktree_paths: &[PathBuf],
+    scan_targets: &[PortScanTarget],
+    terminal_output_hints: &HashMap<PathBuf, String>,
+) -> HashMap<PathBuf, Vec<DetectedPort>> {
+    let mut ports_by_worktree: HashMap<PathBuf, Vec<DetectedPort>> = HashMap::new();
+    let worktrees_with_pid_targets: HashSet<PathBuf> = scan_targets
+        .iter()
+        .map(|target| target.worktree_path.clone())
+        .collect();
+    let mut dynamic_paths = Vec::new();
+
+    for worktree_path in worktree_paths {
+        match load_static_ports_for_worktree(worktree_path) {
+            Ok(Some(static_ports)) => {
+                ports_by_worktree.insert(worktree_path.clone(), static_ports);
+            },
+            Ok(None) => dynamic_paths.push(worktree_path.clone()),
+            Err(error) => {
+                tracing::warn!(path = %worktree_path.display(), %error, "invalid static port config");
+                ports_by_worktree.insert(worktree_path.clone(), Vec::new());
+            },
+        }
+    }
+
+    let process_snapshot = list_process_snapshot();
+    let pid_owner_map = build_pid_owner_map(scan_targets, &process_snapshot);
+    let scanned_ports = list_listening_ports_for_pids(
+        &pid_owner_map.keys().copied().collect::<Vec<_>>(),
+        &process_snapshot,
+    );
+    for port_info in scanned_ports {
+        if IGNORED_PORTS.contains(&port_info.port) {
+            continue;
+        }
+        let Some(worktree_path) = pid_owner_map.get(&port_info.pid) else {
+            continue;
+        };
+        ports_by_worktree
+            .entry(worktree_path.clone())
+            .or_default()
+            .push(DetectedPort {
+                port: port_info.port,
+                pid: Some(port_info.pid),
+                address: port_info.address,
+                process_name: port_info.process_name,
+                label: None,
+            });
+    }
+
+    for worktree_path in dynamic_paths {
+        let current_ports = ports_by_worktree.entry(worktree_path.clone()).or_default();
+        if current_ports.is_empty()
+            && !worktrees_with_pid_targets.contains(&worktree_path)
+            && let Some(output) = terminal_output_hints.get(&worktree_path)
+        {
+            current_ports.extend(
+                extract_ports_from_terminal_output(output)
+                    .into_iter()
+                    .filter(|port| !IGNORED_PORTS.contains(&port.port)),
+            );
+        }
+    }
+
+    for ports in ports_by_worktree.values_mut() {
+        ports.sort_by(|left, right| {
+            left.port
+                .cmp(&right.port)
+                .then(left.address.cmp(&right.address))
+                .then(left.label.cmp(&right.label))
         });
+        ports.dedup_by(|left, right| {
+            left.port == right.port && left.address == right.address && left.label == right.label
+        });
+    }
+
+    ports_by_worktree.retain(|_, ports| !ports.is_empty());
+    ports_by_worktree
+}
+
+fn load_static_ports_for_worktree(
+    worktree_path: &Path,
+) -> Result<Option<Vec<DetectedPort>>, String> {
+    let path = worktree_path.join(".arbor").join("ports.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let content = fs::read_to_string(&path)
+        .map_err(|error| format!("failed to read `{}`: {error}", path.display()))?;
+    let config = serde_json::from_str::<StaticPortsConfig>(&content)
+        .map_err(|error| format!("failed to parse `{}`: {error}", path.display()))?;
+
+    Ok(Some(
+        config
+            .ports
+            .into_iter()
+            .filter(|entry| entry.port > 0)
+            .map(|entry| DetectedPort {
+                port: entry.port,
+                pid: None,
+                address: "127.0.0.1".to_owned(),
+                process_name: "configured".to_owned(),
+                label: entry.label.and_then(|label| {
+                    let trimmed = label.trim().to_owned();
+                    (!trimmed.is_empty()).then_some(trimmed)
+                }),
+            })
+            .collect(),
+    ))
+}
+
+#[derive(serde::Deserialize)]
+struct StaticPortsConfig {
+    #[serde(default)]
+    ports: Vec<StaticPortEntry>,
+}
+
+#[derive(serde::Deserialize)]
+struct StaticPortEntry {
+    port: u16,
+    label: Option<String>,
+}
+
+fn build_pid_owner_map(
+    scan_targets: &[PortScanTarget],
+    process_snapshot: &HashMap<u32, ProcessInfoSnapshot>,
+) -> HashMap<u32, PathBuf> {
+    let mut children_by_parent: HashMap<u32, Vec<u32>> = HashMap::new();
+    for (&pid, process) in process_snapshot {
+        children_by_parent
+            .entry(process.parent_pid)
+            .or_default()
+            .push(pid);
+    }
+
+    let mut pid_owner_map = HashMap::new();
+    for target in scan_targets {
+        let mut stack = vec![target.root_pid];
+        while let Some(pid) = stack.pop() {
+            if pid_owner_map.contains_key(&pid) {
+                continue;
+            }
+            pid_owner_map.insert(pid, target.worktree_path.clone());
+            if let Some(children) = children_by_parent.get(&pid) {
+                stack.extend(children.iter().copied());
+            }
+        }
+    }
+
+    pid_owner_map
+}
+
+#[cfg(unix)]
+fn list_process_snapshot() -> HashMap<u32, ProcessInfoSnapshot> {
+    let mut command = create_command("ps");
+    command.args(["-axo", "pid=,ppid=,comm="]);
+    let output = match run_command_output(&mut command, "list processes") {
+        Ok(output) if output.status.success() => output,
+        _ => return HashMap::new(),
+    };
+
+    parse_unix_process_snapshot(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(windows)]
+fn list_process_snapshot() -> HashMap<u32, ProcessInfoSnapshot> {
+    let mut command = create_command("powershell");
+    command.args([
+        "-NoProfile",
+        "-Command",
+        "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name | ConvertTo-Json -Compress",
+    ]);
+    let output = match run_command_output(&mut command, "list processes") {
+        Ok(output) if output.status.success() => output,
+        _ => return HashMap::new(),
+    };
+
+    parse_windows_process_snapshot(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn list_process_snapshot() -> HashMap<u32, ProcessInfoSnapshot> {
+    HashMap::new()
+}
+
+#[cfg(unix)]
+fn list_listening_ports_for_pids(
+    pids: &[u32],
+    _process_snapshot: &HashMap<u32, ProcessInfoSnapshot>,
+) -> Vec<ScannedPortInfo> {
+    if pids.is_empty() {
+        return Vec::new();
+    }
+
+    let pid_arg = pids
+        .iter()
+        .map(|pid| pid.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let pid_set: HashSet<u32> = pids.iter().copied().collect();
+    let mut command = create_command("sh");
+    command.arg("-lc").arg(format!(
+        "lsof -p {pid_arg} -iTCP -sTCP:LISTEN -P -n 2>/dev/null || true"
+    ));
+    let output = match run_command_output(&mut command, "scan listening ports") {
+        Ok(output) => output,
+        Err(_) => return Vec::new(),
+    };
+
+    parse_unix_lsof_ports(&String::from_utf8_lossy(&output.stdout), &pid_set)
+}
+
+#[cfg(windows)]
+fn list_listening_ports_for_pids(
+    pids: &[u32],
+    process_snapshot: &HashMap<u32, ProcessInfoSnapshot>,
+) -> Vec<ScannedPortInfo> {
+    if pids.is_empty() {
+        return Vec::new();
+    }
+
+    let pid_set: HashSet<u32> = pids.iter().copied().collect();
+    let mut command = create_command("netstat");
+    command.args(["-ano", "-p", "tcp"]);
+    let output = match run_command_output(&mut command, "scan listening ports") {
+        Ok(output) if output.status.success() => output,
+        _ => return Vec::new(),
+    };
+
+    parse_windows_netstat_ports(
+        &String::from_utf8_lossy(&output.stdout),
+        &pid_set,
+        process_snapshot,
+    )
+}
+
+#[cfg(not(any(unix, windows)))]
+fn list_listening_ports_for_pids(
+    _pids: &[u32],
+    _process_snapshot: &HashMap<u32, ProcessInfoSnapshot>,
+) -> Vec<ScannedPortInfo> {
+    Vec::new()
+}
+
+#[cfg(unix)]
+fn parse_unix_process_snapshot(output: &str) -> HashMap<u32, ProcessInfoSnapshot> {
+    let mut processes = HashMap::new();
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut parts = trimmed.split_whitespace();
+        let Some(pid) = parts.next().and_then(|value| value.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(parent_pid) = parts.next().and_then(|value| value.parse::<u32>().ok()) else {
+            continue;
+        };
+        let name = parts.collect::<Vec<_>>().join(" ");
+        processes.insert(pid, ProcessInfoSnapshot { parent_pid, name });
+    }
+    processes
+}
+
+#[cfg(windows)]
+fn parse_windows_process_snapshot(output: &str) -> HashMap<u32, ProcessInfoSnapshot> {
+    let parsed = match serde_json::from_str::<serde_json::Value>(output.trim()) {
+        Ok(parsed) => parsed,
+        Err(_) => return HashMap::new(),
+    };
+    let entries = match parsed {
+        serde_json::Value::Array(values) => values,
+        value => vec![value],
+    };
+
+    let mut processes = HashMap::new();
+    for entry in entries {
+        let Some(pid) = entry.get("ProcessId").and_then(|value| value.as_u64()) else {
+            continue;
+        };
+        let Some(parent_pid) = entry
+            .get("ParentProcessId")
+            .and_then(|value| value.as_u64())
+        else {
+            continue;
+        };
+        let name = entry
+            .get("Name")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown")
+            .to_owned();
+        processes.insert(pid as u32, ProcessInfoSnapshot {
+            parent_pid: parent_pid as u32,
+            name,
+        });
+    }
+    processes
+}
+
+#[cfg(unix)]
+fn parse_unix_lsof_ports(output: &str, pid_set: &HashSet<u32>) -> Vec<ScannedPortInfo> {
+    let mut ports = Vec::new();
+    for line in output.lines().skip(1) {
+        let columns = line.split_whitespace().collect::<Vec<_>>();
+        if columns.len() < 10 {
+            continue;
+        }
+        let Some(pid) = columns.get(1).and_then(|value| value.parse::<u32>().ok()) else {
+            continue;
+        };
+        if !pid_set.contains(&pid) {
+            continue;
+        }
+        let Some(name_field) = columns.get(columns.len().saturating_sub(2)).copied() else {
+            continue;
+        };
+        let Some((address, port)) = parse_socket_address_port(name_field) else {
+            continue;
+        };
+        ports.push(ScannedPortInfo {
+            port,
+            pid,
+            address,
+            process_name: columns[0].to_owned(),
+        });
+    }
+    ports
+}
+
+#[cfg(windows)]
+fn parse_windows_netstat_ports(
+    output: &str,
+    pid_set: &HashSet<u32>,
+    process_snapshot: &HashMap<u32, ProcessInfoSnapshot>,
+) -> Vec<ScannedPortInfo> {
+    let mut ports = Vec::new();
+    for line in output.lines() {
+        if !line.contains("LISTENING") {
+            continue;
+        }
+        let columns = line.split_whitespace().collect::<Vec<_>>();
+        if columns.len() < 5 {
+            continue;
+        }
+        let Some(pid) = columns.last().and_then(|value| value.parse::<u32>().ok()) else {
+            continue;
+        };
+        if !pid_set.contains(&pid) {
+            continue;
+        }
+        let Some((address, port)) = parse_socket_address_port(columns[1]) else {
+            continue;
+        };
+        let process_name = process_snapshot
+            .get(&pid)
+            .map(|process| process.name.clone())
+            .unwrap_or_else(|| "unknown".to_owned());
+        ports.push(ScannedPortInfo {
+            port,
+            pid,
+            address,
+            process_name,
+        });
+    }
+    ports
+}
+
+fn parse_socket_address_port(value: &str) -> Option<(String, u16)> {
+    if let Some((address, port_text)) = value.rsplit_once(':')
+        && let Ok(port) = port_text.parse::<u16>()
+    {
+        let normalized = address
+            .trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_owned();
+        let normalized = if normalized == "*" {
+            "0.0.0.0".to_owned()
+        } else {
+            normalized
+        };
+        return Some((normalized, port));
+    }
+    None
+}
+
+fn extract_ports_from_terminal_output(output: &str) -> Vec<DetectedPort> {
+    const ADDRESS_MARKERS: [(&str, &str); 10] = [
+        ("http://127.0.0.1:", "127.0.0.1"),
+        ("https://127.0.0.1:", "127.0.0.1"),
+        ("http://localhost:", "127.0.0.1"),
+        ("https://localhost:", "127.0.0.1"),
+        ("http://0.0.0.0:", "0.0.0.0"),
+        ("https://0.0.0.0:", "0.0.0.0"),
+        ("127.0.0.1:", "127.0.0.1"),
+        ("localhost:", "127.0.0.1"),
+        ("0.0.0.0:", "0.0.0.0"),
+        ("[::]:", "::"),
+    ];
+    const PHRASE_MARKERS: [(&str, &str); 5] = [
+        ("listening on port ", "127.0.0.1"),
+        ("listening at port ", "127.0.0.1"),
+        ("running on port ", "127.0.0.1"),
+        ("ready on port ", "127.0.0.1"),
+        ("server started on port ", "127.0.0.1"),
+    ];
+
+    let mut ports = Vec::new();
+    for (marker, address) in ADDRESS_MARKERS {
+        collect_port_markers(&mut ports, output, marker, address);
+    }
+
+    let lowercase = output.to_ascii_lowercase();
+    for (marker, address) in PHRASE_MARKERS {
+        collect_port_markers(&mut ports, &lowercase, marker, address);
+    }
+
+    ports.sort_by(|left, right| {
+        left.port
+            .cmp(&right.port)
+            .then(left.address.cmp(&right.address))
+            .then(left.label.cmp(&right.label))
+    });
+    ports.dedup_by(|left, right| {
+        left.port == right.port && left.address == right.address && left.label == right.label
+    });
+    ports
+}
+
+fn collect_port_markers(
+    ports: &mut Vec<DetectedPort>,
+    haystack: &str,
+    marker: &str,
+    address: &str,
+) {
+    let mut remainder = haystack;
+    while let Some(index) = remainder.find(marker) {
+        let after_marker = &remainder[index + marker.len()..];
+        let digits: String = after_marker
+            .chars()
+            .take_while(|character| character.is_ascii_digit())
+            .collect();
+        if let Ok(port) = digits.parse::<u16>() {
+            ports.push(DetectedPort {
+                port,
+                pid: None,
+                address: address.to_owned(),
+                process_name: "hint".to_owned(),
+                label: None,
+            });
+        }
+        remainder = after_marker;
+    }
+}
+
+fn output_contains_port_hint(output: &str) -> bool {
+    if !extract_ports_from_terminal_output(output).is_empty() {
+        return true;
+    }
+
+    let lowercase = output.to_ascii_lowercase();
+    [
+        "listening on port",
+        "listening at port",
+        "server started on",
+        "server running on",
+        "ready on",
+    ]
+    .iter()
+    .any(|marker| lowercase.contains(marker))
+}
+
+#[derive(Clone, Copy)]
+struct WorktreeAttentionIndicator {
+    label: &'static str,
+    short_label: &'static str,
+    color: u32,
+}
+
+fn worktree_attention_indicator(worktree: &WorktreeSummary) -> WorktreeAttentionIndicator {
+    if worktree.stuck_turn_count >= 2 {
+        return WorktreeAttentionIndicator {
+            label: "Stuck",
+            short_label: "Stuck",
+            color: 0xeb6f92,
+        };
+    }
+    if worktree.agent_state == Some(AgentState::Working) {
+        return WorktreeAttentionIndicator {
+            label: "Working",
+            short_label: "Run",
+            color: 0xe5c07b,
+        };
+    }
+    if worktree.agent_state == Some(AgentState::Waiting)
+        && worktree
+            .recent_turns
+            .first()
+            .and_then(|snapshot| snapshot.diff_summary)
+            .is_some_and(|summary| summary.additions > 0 || summary.deletions > 0)
+    {
+        return WorktreeAttentionIndicator {
+            label: "Needs review",
+            short_label: "Review",
+            color: 0x61afef,
+        };
+    }
+    if worktree.agent_state == Some(AgentState::Waiting) {
+        return WorktreeAttentionIndicator {
+            label: "Waiting",
+            short_label: "Wait",
+            color: 0x61afef,
+        };
+    }
+    if !worktree.detected_ports.is_empty() {
+        return WorktreeAttentionIndicator {
+            label: "Serving",
+            short_label: "Ports",
+            color: 0x72d69c,
+        };
+    }
+    if worktree.last_activity_unix_ms.is_some_and(|timestamp| {
+        current_unix_timestamp_millis()
+            .unwrap_or(0)
+            .saturating_sub(timestamp)
+            <= 15 * 60 * 1000
+    }) {
+        return WorktreeAttentionIndicator {
+            label: "Recent",
+            short_label: "Recent",
+            color: 0xc0caf5,
+        };
+    }
+
+    WorktreeAttentionIndicator {
+        label: "Idle",
+        short_label: "Idle",
+        color: 0x7f8490,
+    }
+}
+
+fn worktree_activity_sparkline(worktree: &WorktreeSummary) -> String {
+    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    if worktree.recent_turns.is_empty() {
+        return String::new();
+    }
+
+    let values: Vec<usize> = worktree
+        .recent_turns
+        .iter()
+        .take(5)
+        .rev()
+        .map(|snapshot| {
+            snapshot
+                .diff_summary
+                .map(|summary| summary.additions + summary.deletions)
+                .unwrap_or(0)
+        })
+        .collect();
+    let max_value = values.iter().copied().max().unwrap_or(0);
+    if max_value == 0 {
+        return "▁▁▁".to_owned();
+    }
+
+    values
+        .into_iter()
+        .map(|value| {
+            let index = value.saturating_mul(BARS.len() - 1) / max_value.max(1);
+            BARS[index]
+        })
+        .collect()
+}
+
+fn worktree_port_url(port: &DetectedPort) -> String {
+    let host = match port.address.as_str() {
+        "" | "*" | "0.0.0.0" | "::" => "127.0.0.1",
+        other => other,
+    };
+    format!("http://{host}:{}", port.port)
+}
+
+fn worktree_port_badge_text(port: &DetectedPort) -> String {
+    format!(":{}", port.port)
+}
+
+fn worktree_port_detail_text(port: &DetectedPort) -> String {
+    if let Some(label) = port
+        .label
+        .as_deref()
+        .filter(|label| !label.trim().is_empty())
+    {
+        return format!("{label} :{}", port.port);
+    }
+    if port.process_name != "hint"
+        && port.process_name != "configured"
+        && !port.process_name.trim().is_empty()
+    {
+        return format!("{} :{}", port.process_name, port.port);
+    }
+    format!(":{}", port.port)
+}
+
+fn extract_repo_name_from_url(url: &str) -> String {
+    let url = url.trim();
+    // Strip trailing .git
+    let url = url.strip_suffix(".git").unwrap_or(url);
+    // Strip trailing /
+    let url = url.strip_suffix('/').unwrap_or(url);
+    // Get the last path component
+    if let Some(pos) = url.rfind('/') {
+        url[pos + 1..].to_owned()
+    } else if let Some(pos) = url.rfind(':') {
+        // SSH-style: git@github.com:user/repo
+        let after_colon = &url[pos + 1..];
+        if let Some(slash_pos) = after_colon.rfind('/') {
+            after_colon[slash_pos + 1..].to_owned()
+        } else {
+            after_colon.to_owned()
+        }
+    } else {
+        String::new()
+    }
+}
+
+fn repository_display_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+fn branch_divergence_summary(worktree_path: &Path) -> Option<BranchDivergenceSummary> {
+    let repo = git2::Repository::open(worktree_path).ok()?;
+    let head = repo.head().ok()?;
+    if !head.is_branch() {
+        return None;
+    }
+
+    let branch_name = head.shorthand()?;
+    let branch = repo
+        .find_branch(branch_name, git2::BranchType::Local)
+        .ok()?;
+    let upstream = branch.upstream().ok()?;
+    let head_oid = branch.get().target()?;
+    let upstream_oid = upstream.get().target()?;
+    let (ahead, behind) = repo.graph_ahead_behind(head_oid, upstream_oid).ok()?;
+
+    Some(BranchDivergenceSummary { ahead, behind })
+}
+
+fn should_seed_repo_root_from_cwd(store_file_exists: bool, loaded_roots_were_empty: bool) -> bool {
+    // Seed from CWD on first run (no store file), or when there are existing
+    // saved roots and CWD is simply not listed yet. If the store exists and is
+    // explicitly empty, preserve that empty state across restarts.
+    !store_file_exists || !loaded_roots_were_empty
+}
+
+fn short_branch(value: &str) -> String {
+    worktree::short_branch(value)
+}
+
+fn expand_home_path(path: &str) -> Result<PathBuf, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("repository path cannot be empty".to_owned());
+    }
+
+    if trimmed == "~" {
+        return user_home_dir();
+    }
+
+    if let Some(suffix) = trimmed.strip_prefix("~/") {
+        return user_home_dir().map(|home| home.join(suffix));
+    }
+
+    Ok(PathBuf::from(trimmed))
+}
+
+fn user_home_dir() -> Result<PathBuf, String> {
+    env::var("HOME")
+        .map(PathBuf::from)
+        .map_err(|_| "HOME environment variable is not set".to_owned())
+}
+
+fn sanitize_worktree_name(value: &str) -> String {
+    let mut sanitized = String::new();
+    let mut previous_dash = false;
+
+    for character in value.trim().chars() {
+        if character.is_ascii_alphanumeric() {
+            sanitized.push(character.to_ascii_lowercase());
+            previous_dash = false;
+            continue;
+        }
+
+        if character == '-' || character == '_' || character == '.' {
+            sanitized.push(character);
+            previous_dash = false;
+            continue;
+        }
+
+        if !previous_dash && !sanitized.is_empty() {
+            sanitized.push('-');
+            previous_dash = true;
+        }
+    }
+
+    while sanitized.ends_with('-') {
+        let _ = sanitized.pop();
+    }
+
+    sanitized
+}
+
+fn derive_branch_name(worktree_name: &str) -> String {
+    let sanitized = sanitize_worktree_name(worktree_name);
+    if sanitized.is_empty() {
+        "worktree".to_owned()
+    } else {
+        sanitized
+    }
+}
+
+fn derive_branch_name_with_repo_config(
+    repo_root: &Path,
+    worktree_name: &str,
+    github_login: Option<&str>,
+) -> String {
+    let base_name = derive_branch_name(worktree_name);
+    let Some(config) = arbor_core::repo_config::load_repo_config(repo_root) else {
+        return base_name;
+    };
+
+    let prefix = match config.branch.prefix_mode {
+        Some(arbor_core::repo_config::RepoBranchPrefixMode::None) | None => None,
+        Some(arbor_core::repo_config::RepoBranchPrefixMode::GitAuthor) => {
+            git_branch_prefix_from_author(repo_root)
+        },
+        Some(arbor_core::repo_config::RepoBranchPrefixMode::GithubUser) => github_login
+            .map(sanitize_worktree_name)
+            .filter(|value| !value.is_empty()),
+        Some(arbor_core::repo_config::RepoBranchPrefixMode::Custom) => config
+            .branch
+            .prefix
+            .as_deref()
+            .map(sanitize_worktree_name)
+            .filter(|value| !value.is_empty()),
+    };
+
+    match prefix {
+        Some(prefix) => format!("{prefix}/{base_name}"),
+        None => base_name,
+    }
+}
+
+fn git_branch_prefix_from_author(repo_root: &Path) -> Option<String> {
+    let mut command = create_command("git");
+    command
+        .arg("-C")
+        .arg(repo_root)
+        .args(["config", "--get", "user.name"]);
+    let output = run_command_output(&mut command, "read git author").ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let author = String::from_utf8_lossy(&output.stdout);
+    let sanitized = sanitize_worktree_name(author.trim());
+    (!sanitized.is_empty()).then_some(sanitized)
+}
+
+fn build_managed_worktree_path(repo_name: &str, worktree_name: &str) -> Result<PathBuf, String> {
+    let home_dir = user_home_dir()?;
+    Ok(home_dir
+        .join(".arbor")
+        .join("worktrees")
+        .join(repo_name)
+        .join(worktree_name))
+}
+
+fn load_task_templates_for_repo(repo_root: &Path) -> Vec<TaskTemplate> {
+    let tasks_dir = repo_task_templates_dir(repo_root);
+    let Ok(entries) = fs::read_dir(&tasks_dir) else {
+        return Vec::new();
+    };
+
+    let mut tasks = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("md") {
+            continue;
+        }
+        if let Some(task) = parse_task_template(&path, repo_root) {
+            tasks.push(task);
+        }
+    }
+    tasks.sort_by(|left, right| left.name.cmp(&right.name));
+    tasks
+}
+
+fn repo_task_templates_dir(repo_root: &Path) -> PathBuf {
+    let relative_dir = arbor_core::repo_config::load_repo_config(repo_root)
+        .and_then(|config| config.tasks.directory)
+        .unwrap_or_else(|| ".arbor/tasks".to_owned());
+    repo_root.join(relative_dir)
+}
+
+fn worktree_notes_storage_path(worktree_path: &Path) -> PathBuf {
+    worktree_path.join(".arbor").join("notes.md")
+}
+
+fn parse_task_template(path: &Path, repo_root: &Path) -> Option<TaskTemplate> {
+    let content = fs::read_to_string(path).ok()?;
+    parse_task_template_content(path, repo_root, &content)
+}
+
+fn parse_task_template_content(
+    path: &Path,
+    repo_root: &Path,
+    content: &str,
+) -> Option<TaskTemplate> {
+    let mut name = path.file_stem()?.to_string_lossy().into_owned();
+    let mut description = None;
+    let mut agent = None;
+    let mut body = content;
+
+    if content
+        .lines()
+        .next()
+        .is_some_and(|line| line.trim() == "---")
+    {
+        let mut frontmatter = Vec::new();
+        let mut body_start_offset = None;
+        let mut offset = 0usize;
+        for (index, line) in content.lines().enumerate() {
+            offset += line.len() + 1;
+            if index == 0 {
+                continue;
+            }
+            if line.trim() == "---" {
+                body_start_offset = Some(offset);
+                break;
+            }
+            frontmatter.push(line);
+        }
+
+        if let Some(start) = body_start_offset {
+            body = &content[start..];
+            for line in frontmatter {
+                let Some((key, value)) = line.split_once(':') else {
+                    continue;
+                };
+                let key = key.trim().to_ascii_lowercase();
+                let value = value.trim().trim_matches('"').trim_matches('\'');
+                match key.as_str() {
+                    "name" if !value.is_empty() => name = value.to_owned(),
+                    "title" if !value.is_empty() => name = value.to_owned(),
+                    "description" if !value.is_empty() => description = Some(value.to_owned()),
+                    "agent" => agent = AgentPresetKind::from_key(value),
+                    _ => {},
+                }
+            }
+        }
+    }
+
+    let mut prompt_lines = Vec::new();
+    let mut found_prompt_line = false;
+    let mut heading_name = None;
+
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if !found_prompt_line {
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            if heading_name.is_none()
+                && let Some(heading) = trimmed.strip_prefix("# ")
+            {
+                let heading = heading.trim();
+                if !heading.is_empty() {
+                    heading_name = Some(heading.to_owned());
+                }
+                continue;
+            }
+
+            if let Some((raw_key, raw_value)) = trimmed.split_once(':') {
+                let key = raw_key.trim().to_ascii_lowercase();
+                let value = raw_value.trim().trim_matches('"').trim_matches('\'');
+                match key.as_str() {
+                    "agent" => {
+                        if agent.is_none() {
+                            agent = AgentPresetKind::from_key(value);
+                        }
+                        continue;
+                    },
+                    "description" => {
+                        if description.is_none() && !value.is_empty() {
+                            description = Some(value.to_owned());
+                        }
+                        continue;
+                    },
+                    _ => {},
+                }
+            }
+        }
+
+        found_prompt_line = true;
+        prompt_lines.push(line);
+    }
+
+    if let Some(heading_name) = heading_name
+        && name == path.file_stem()?.to_string_lossy()
+    {
+        name = heading_name;
+    }
+
+    let prompt = prompt_lines.join("\n").trim().to_owned();
+    if prompt.is_empty() {
+        return None;
+    }
+    let description = description.unwrap_or_else(|| {
+        prompt
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .map(str::trim)
+            .unwrap_or("Task template")
+            .to_owned()
+    });
+
+    Some(TaskTemplate {
+        name,
+        description,
+        prompt,
+        agent,
+        path: path.to_path_buf(),
+        repo_root: repo_root.to_path_buf(),
+    })
+}
+
+fn shell_quote(value: &str) -> String {
+    #[cfg(target_os = "windows")]
+    {
+        let escaped = value.replace('"', "\"\"");
+        format!("\"{escaped}\"")
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn parse_terminal_backend_kind(
+    terminal_backend: Option<&str>,
+) -> Result<TerminalBackendKind, String> {
+    let Some(value) = terminal_backend
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(TerminalBackendKind::Embedded);
+    };
+
+    match value.to_ascii_lowercase().as_str() {
+        "embedded" => Ok(TerminalBackendKind::Embedded),
+        "alacritty" => Ok(TerminalBackendKind::Alacritty),
+        "ghostty" => Ok(TerminalBackendKind::Ghostty),
+        _ => Err(format!(
+            "invalid terminal_backend `{value}` in config, expected embedded/alacritty/ghostty"
+        )),
+    }
+}
+
+fn parse_theme_kind(theme: Option<&str>) -> Result<ThemeKind, String> {
+    let Some(value) = theme.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(ThemeKind::One);
+    };
+
+    match value.to_ascii_lowercase().as_str() {
+        "one-dark" | "onedark" => Ok(ThemeKind::One),
+        "ayu-dark" | "ayu" => Ok(ThemeKind::Ayu),
+        "gruvbox-dark" | "gruvbox" => Ok(ThemeKind::Gruvbox),
+        "dracula" => Ok(ThemeKind::Dracula),
+        "solarized-light" | "solarized" => Ok(ThemeKind::SolarizedLight),
+        "everforest-dark" | "everforest" => Ok(ThemeKind::Everforest),
+        "catppuccin" => Ok(ThemeKind::Catppuccin),
+        "catppuccin-latte" => Ok(ThemeKind::CatppuccinLatte),
+        "ethereal" => Ok(ThemeKind::Ethereal),
+        "flexoki-light" | "flexoki" => Ok(ThemeKind::FlexokiLight),
+        "hackerman" => Ok(ThemeKind::Hackerman),
+        "kanagawa" => Ok(ThemeKind::Kanagawa),
+        "matte-black" | "matteblack" => Ok(ThemeKind::MatteBlack),
+        "miasma" => Ok(ThemeKind::Miasma),
+        "nord" => Ok(ThemeKind::Nord),
+        "osaka-jade" | "osakajade" => Ok(ThemeKind::OsakaJade),
+        "ristretto" => Ok(ThemeKind::Ristretto),
+        "rose-pine" | "rosepine" => Ok(ThemeKind::RosePine),
+        "tokyo-night" | "tokyonight" => Ok(ThemeKind::TokyoNight),
+        "vantablack" => Ok(ThemeKind::Vantablack),
+        "white" => Ok(ThemeKind::White),
+        "retrobox-classic" | "retrobox" => Ok(ThemeKind::RetroboxClassic),
+        "tokyonight-day" | "tokionight-day" => Ok(ThemeKind::TokyoNightDay),
+        "tokyonight-classic" | "tokionight-classic" => Ok(ThemeKind::TokyoNightClassic),
+        "zellner" => Ok(ThemeKind::Zellner),
+        _ => Err(format!(
+            "invalid theme `{value}` in config, expected one-dark/ayu-dark/gruvbox-dark/dracula/solarized-light/everforest-dark/catppuccin/catppuccin-latte/ethereal/flexoki-light/hackerman/kanagawa/matte-black/miasma/nord/osaka-jade/ristretto/rose-pine/tokyo-night/vantablack/white/retrobox-classic/tokyonight-day/tokyonight-classic/zellner"
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -16682,7 +7300,13 @@ mod tests {
             daemon,
         },
         gpui::{Keystroke, point, px},
-        std::{sync::Arc, time::Instant},
+        std::{
+            collections::HashMap,
+            env, fs,
+            path::{Path, PathBuf},
+            sync::Arc,
+            time::{Instant, SystemTime},
+        },
     };
 
     fn session_with_styled_line(
@@ -16693,15 +7317,18 @@ mod tests {
     ) -> TerminalSession {
         TerminalSession {
             id: 1,
-            daemon_session_id: "daemon-test-1".into(),
-            worktree_path: std::path::PathBuf::from("/tmp/worktree"),
+            daemon_session_id: "daemon-test-1".to_owned(),
+            worktree_path: PathBuf::from("/tmp/worktree"),
             title: "term-1".to_owned(),
             last_command: None,
             pending_command: String::new(),
             command: "zsh".to_owned(),
+            agent_preset: None,
+            execution_mode: None,
             state: TerminalState::Running,
             exit_code: None,
             updated_at_unix_ms: None,
+            root_pid: None,
             cols: 120,
             rows: 35,
             generation: 0,
@@ -16742,10 +7369,15 @@ mod tests {
             pr_number: None,
             pr_url: None,
             pr_details: None,
+            branch_divergence: None,
             diff_summary: Some(DiffLineSummary {
                 additions: 3,
                 deletions: 1,
             }),
+            detected_ports: vec![],
+            recent_turns: vec![],
+            stuck_turn_count: 0,
+            recent_agent_sessions: vec![],
             agent_state: Some(AgentState::Working),
             agent_task: Some("Investigating hover".to_owned()),
             last_activity_unix_ms: None,
@@ -16770,6 +7402,18 @@ mod tests {
         }
     }
 
+    fn create_temp_test_dir(prefix: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_else(|error| panic!("system clock before unix epoch: {error}"))
+            .as_nanos();
+        let path = env::temp_dir().join(format!("arbor-gui-{prefix}-{unique}"));
+        fs::create_dir_all(&path).unwrap_or_else(|error| {
+            panic!("failed to create temp dir `{}`: {error}", path.display())
+        });
+        path
+    }
+
     #[test]
     fn sanitizes_worktree_name_for_branch_and_path() {
         let sanitized = crate::sanitize_worktree_name("  Remote SSH / Demo  ");
@@ -16780,6 +7424,65 @@ mod tests {
     fn derives_default_branch_name_when_empty() {
         let branch = crate::derive_branch_name(" !!! ");
         assert_eq!(branch, "worktree");
+    }
+
+    #[test]
+    fn derive_branch_name_uses_custom_repo_prefix_mode() {
+        let dir = create_temp_test_dir("branch-prefix");
+        fs::write(
+            dir.join("arbor.toml"),
+            "[branch]\nprefix_mode = \"custom\"\nprefix = \"team\"\n",
+        )
+        .unwrap_or_else(|error| panic!("failed to write repo config: {error}"));
+
+        assert_eq!(
+            crate::derive_branch_name_with_repo_config(&dir, "Auth Fix", None),
+            "team/auth-fix"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repo_task_templates_dir_honors_repo_config_override() {
+        let dir = create_temp_test_dir("task-dir");
+        fs::write(dir.join("arbor.toml"), "[tasks]\ndirectory = \"prompts\"\n")
+            .unwrap_or_else(|error| panic!("failed to write repo config: {error}"));
+
+        assert_eq!(crate::repo_task_templates_dir(&dir), dir.join("prompts"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_ports_from_terminal_output_detects_common_local_urls() {
+        let mut ports = crate::extract_ports_from_terminal_output(
+            "ready on http://localhost:3000 and http://127.0.0.1:5173",
+        );
+        ports.sort_by_key(|port| port.port);
+        ports.dedup_by_key(|port| port.port);
+
+        assert_eq!(
+            ports.into_iter().map(|port| port.port).collect::<Vec<_>>(),
+            vec![3000, 5173]
+        );
+    }
+
+    #[test]
+    fn output_contains_port_hint_detects_phrase_without_url() {
+        assert!(crate::output_contains_port_hint(
+            "Server started on port 4173 in 220ms"
+        ));
+    }
+
+    #[test]
+    fn attention_indicator_prefers_stuck_state() {
+        let mut worktree = sample_worktree_summary();
+        worktree.agent_state = Some(AgentState::Waiting);
+        worktree.stuck_turn_count = 2;
+
+        let attention = crate::worktree_attention_indicator(&worktree);
+        assert_eq!(attention.label, "Stuck");
     }
 
     #[test]
@@ -16919,7 +7622,6 @@ mod tests {
             title: "Improve hover stability".to_owned(),
             url: "https://example.com/pr/42".to_owned(),
             state: crate::github_service::PrState::Open,
-            base_ref_name: "main".to_owned(),
             additions: 12,
             deletions: 4,
             review_decision: crate::github_service::ReviewDecision::Pending,
@@ -16981,7 +7683,7 @@ mod tests {
         session.modes = TerminalModes::default();
 
         let changed = apply_daemon_snapshot(&mut session, &daemon::TerminalSnapshot {
-            session_id: "daemon-test-1".into(),
+            session_id: "daemon-test-1".to_owned().into(),
             output_tail: "READY".to_owned(),
             styled_lines: vec![daemon::DaemonTerminalStyledLine {
                 cells: vec![daemon::DaemonTerminalStyledCell {
@@ -17391,7 +8093,7 @@ mod tests {
     #[test]
     fn auto_commit_subject_uses_filename_for_single_change() {
         let changed_files = vec![ChangedFile {
-            path: std::path::PathBuf::from("src/main.rs"),
+            path: PathBuf::from("src/main.rs"),
             kind: ChangeKind::Modified,
             additions: 4,
             deletions: 1,
@@ -17405,7 +8107,7 @@ mod tests {
     fn auto_commit_body_includes_stats_and_overflow_line() {
         let changed_files = (0..13)
             .map(|index| ChangedFile {
-                path: std::path::PathBuf::from(format!("src/file-{index}.rs")),
+                path: PathBuf::from(format!("src/file-{index}.rs")),
                 kind: ChangeKind::Modified,
                 additions: index + 1,
                 deletions: index,
@@ -17593,5 +8295,78 @@ mod tests {
     #[test]
     fn seed_repo_root_from_cwd_when_store_has_saved_roots() {
         assert!(crate::should_seed_repo_root_from_cwd(true, false));
+    }
+
+    #[test]
+    fn agent_finished_notifications_are_deduped_by_timestamp() {
+        let path = Path::new("/tmp/repo/worktree");
+        let mut notifications = HashMap::new();
+
+        assert!(crate::should_emit_agent_finished_notification(
+            &mut notifications,
+            path,
+            Some(10),
+        ));
+        assert!(!crate::should_emit_agent_finished_notification(
+            &mut notifications,
+            path,
+            Some(10),
+        ));
+        assert!(!crate::should_emit_agent_finished_notification(
+            &mut notifications,
+            path,
+            Some(9),
+        ));
+        assert!(crate::should_emit_agent_finished_notification(
+            &mut notifications,
+            path,
+            Some(11),
+        ));
+    }
+
+    #[test]
+    fn parse_task_template_supports_frontmatter_description_and_agent() {
+        let repo_root = Path::new("/tmp/repo");
+        let path = repo_root.join(".arbor/tasks/review.md");
+        let content = r#"---
+name: Review PR
+description: Review the riskiest changes first
+agent: codex
+---
+Review the current branch and summarize the highest-risk changes.
+"#;
+
+        let task = crate::parse_task_template_content(&path, repo_root, content)
+            .unwrap_or_else(|| panic!("task template should parse"));
+        assert_eq!(task.name, "Review PR");
+        assert_eq!(task.description, "Review the riskiest changes first");
+        assert_eq!(task.agent, Some(crate::AgentPresetKind::Codex));
+        assert_eq!(
+            task.prompt,
+            "Review the current branch and summarize the highest-risk changes."
+        );
+    }
+
+    #[test]
+    fn parse_task_template_supports_heading_and_agent_metadata() {
+        let repo_root = Path::new("/tmp/repo");
+        let path = repo_root.join(".arbor/tasks/review.md");
+        let content = r#"# Review PR
+
+Agent: Codex
+Description: Review the current branch before merge
+
+Review the current branch and summarize the highest-risk changes.
+"#;
+
+        let task = crate::parse_task_template_content(&path, repo_root, content)
+            .unwrap_or_else(|| panic!("task template should parse"));
+        assert_eq!(task.name, "Review PR");
+        assert_eq!(task.description, "Review the current branch before merge");
+        assert_eq!(task.agent, Some(crate::AgentPresetKind::Codex));
+        assert_eq!(
+            task.prompt,
+            "Review the current branch and summarize the highest-risk changes."
+        );
     }
 }

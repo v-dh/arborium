@@ -53,6 +53,12 @@ bench-embedded-terminal-engines: ghostty-vt-bridge
 bench-embedded-terminal-codspeed: ghostty-vt-bridge
     RUSTFLAGS="-L native=$(pwd)/target/ghostty-vt-bridge/lib -C link-arg=-Wl,-rpath,$(pwd)/target/ghostty-vt-bridge/lib ${RUSTFLAGS:-}" cargo +{{nightly_toolchain}} bench -p arbor-benchmarks --features ghostty-vt-experimental --bench embedded_terminal
 
+docs-build:
+    mdbook build docs
+
+docs-serve:
+    mdbook serve docs --hostname 127.0.0.1 --port 3003
+
 zizmor:
     zizmor .github/workflows/
 

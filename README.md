@@ -103,6 +103,12 @@ just run-mcp
 
 Full documentation is available at [penso.github.io/arbor/docs](https://penso.github.io/arbor/docs/).
 
+To build the local docs book:
+
+```bash
+just docs-build
+```
+
 ## Crates
 
 | Crate | Description |

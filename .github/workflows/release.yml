@@ -236,7 +236,7 @@ jobs:
             exit 1
           fi
 
-          CLI_BIN="${APP_PATH}/Contents/MacOS/arbor"
+          CLI_BIN="${APP_PATH}/Contents/Helpers/arbor"
 
           /usr/bin/codesign --force --timestamp --options runtime \
               --entitlements packaging/macos/Arbor.entitlements \

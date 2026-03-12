@@ -16,6 +16,7 @@ APP_NAME="Arbor"
 APP_DIR="${OUTPUT_DIR}/${APP_NAME}.app"
 CONTENTS_DIR="${APP_DIR}/Contents"
 MACOS_DIR="${CONTENTS_DIR}/MacOS"
+HELPERS_DIR="${CONTENTS_DIR}/Helpers"
 RESOURCES_DIR="${CONTENTS_DIR}/Resources"
 ICONSET_DIR="${OUTPUT_DIR}/AppIcon.iconset"
 
@@ -24,7 +25,7 @@ is_lfs_pointer() {
   [[ -f "$path" ]] && head -n 1 "$path" | grep -Fqx 'version https://git-lfs.github.com/spec/v1'
 }
 
-mkdir -p "${MACOS_DIR}" "${RESOURCES_DIR}" "${ICONSET_DIR}"
+mkdir -p "${MACOS_DIR}" "${HELPERS_DIR}" "${RESOURCES_DIR}" "${ICONSET_DIR}"
 install -m 0755 "${BINARY_PATH}" "${MACOS_DIR}/${APP_NAME}"
 
 # Bundle arbor-httpd alongside the main binary so the GUI can auto-start it.
@@ -49,7 +50,9 @@ fi
 # Bundle arbor CLI for scripting and automation.
 CLI_PATH="$(dirname "${BINARY_PATH}")/arbor"
 if [[ -f "${CLI_PATH}" ]]; then
-  install -m 0755 "${CLI_PATH}" "${MACOS_DIR}/arbor"
+  # Keep the CLI out of Contents/MacOS so it does not collide with the main
+  # Arbor executable on case-insensitive macOS filesystems.
+  install -m 0755 "${CLI_PATH}" "${HELPERS_DIR}/arbor"
   echo "bundled arbor CLI from ${CLI_PATH}"
 else
   echo "note: arbor CLI not found at ${CLI_PATH}, skipping bundle"

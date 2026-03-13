@@ -7334,6 +7334,7 @@ mod tests {
         },
         gpui::{Keystroke, point, px},
         std::{
+            cell::Cell,
             collections::HashMap,
             env, fs,
             path::{Path, PathBuf},
@@ -7530,6 +7531,30 @@ mod tests {
         assert!(crate::worktree_rows_changed(&[previous], &[
             current, external
         ]));
+    }
+
+    #[test]
+    fn selected_worktree_terminal_existing_session_is_not_reported_as_created() {
+        let spawn_called = Cell::new(false);
+
+        let created = crate::selected_worktree_terminal_was_created(true, || {
+            spawn_called.set(true);
+            true
+        });
+
+        assert!(!created);
+        assert!(!spawn_called.get());
+    }
+
+    #[test]
+    fn selected_worktree_terminal_reports_spawn_result_when_missing() {
+        assert!(crate::selected_worktree_terminal_was_created(false, || {
+            true
+        }));
+        assert!(!crate::selected_worktree_terminal_was_created(
+            false,
+            || false
+        ));
     }
 
     #[test]

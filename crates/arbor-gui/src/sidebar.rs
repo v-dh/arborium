@@ -790,11 +790,10 @@ impl ArborWindow {
                                                                     github_service::CheckStatus::Failure => ("\u{f00d}", 0xeb6f92_u32),
                                                                     github_service::CheckStatus::Pending => ("\u{f192}", 0xe5c07b_u32),
                                                                 };
-                                                                let (review_icon, review_color) = match pr.review_decision {
-                                                                    github_service::ReviewDecision::Approved => ("\u{f00c}", 0x72d69c_u32),
-                                                                    github_service::ReviewDecision::ChangesRequested => ("\u{f071}", 0xeb6f92_u32),
-                                                                    github_service::ReviewDecision::Pending => ("\u{f128}", theme.text_disabled),
-                                                                };
+                                                                let (review_icon, _, review_color) =
+                                                                    review_status_presentation(
+                                                                        pr.review_decision,
+                                                                    );
 
                                                                 let mut badges = this.child(
                                                                     div()
@@ -2108,12 +2107,7 @@ impl ArborWindow {
         if let Some(ref pr) = worktree.pr_details {
             card = card.child(div().h(px(1.)).bg(rgb(theme.border)).my_1());
 
-            let (state_label, state_color) = match pr.state {
-                github_service::PrState::Open => ("Open", 0x72d69c_u32),
-                github_service::PrState::Draft => ("Draft", theme.text_disabled),
-                github_service::PrState::Merged => ("Merged", 0xbb9af7_u32),
-                github_service::PrState::Closed => ("Closed", 0xeb6f92_u32),
-            };
+            let (state_label, state_color) = pr_state_presentation(&theme, pr.state);
 
             let pr_url = pr.url.clone();
             let mut pr_header = div()
@@ -2177,17 +2171,8 @@ impl ArborWindow {
                 let mut status_row = div().flex().items_center().gap_1();
 
                 if !pr.checks.is_empty() {
-                    let passed = pr
-                        .checks
-                        .iter()
-                        .filter(|(_, s)| *s == github_service::CheckStatus::Success)
-                        .count();
-                    let total = pr.checks.len();
-                    let (check_icon, check_color) = match pr.checks_status {
-                        github_service::CheckStatus::Success => ("\u{f00c}", 0x72d69c_u32),
-                        github_service::CheckStatus::Failure => ("\u{f00d}", 0xeb6f92_u32),
-                        github_service::CheckStatus::Pending => ("\u{f192}", 0xe5c07b_u32),
-                    };
+                    let (passed, total) = pr_check_counts(pr);
+                    let (check_icon, check_color) = check_status_presentation(pr.checks_status);
                     let chevron = if checks_expanded {
                         "\u{f078}"
                     } else {
@@ -2228,20 +2213,25 @@ impl ArborWindow {
                     );
                 }
 
-                let (review_label, review_color) = match pr.review_decision {
-                    github_service::ReviewDecision::Approved => ("Approved", 0x72d69c_u32),
-                    github_service::ReviewDecision::ChangesRequested => {
-                        ("Changes requested", 0xeb6f92_u32)
-                    },
-                    github_service::ReviewDecision::Pending => {
-                        ("Review pending", theme.text_disabled)
-                    },
-                };
+                let (review_icon, review_label, review_color) =
+                    review_status_presentation(pr.review_decision);
                 status_row = status_row.child(
                     div()
-                        .text_xs()
-                        .text_color(rgb(review_color))
-                        .child(review_label),
+                        .flex()
+                        .items_center()
+                        .gap(px(3.))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(review_color))
+                                .child(review_icon),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(review_color))
+                                .child(review_label),
+                        ),
                 );
 
                 card = card.child(status_row);
@@ -2249,18 +2239,8 @@ impl ArborWindow {
                 // Expanded checks list
                 if checks_expanded {
                     let mut checks_list = div().flex().flex_col().gap(px(2.)).pl_2();
-                    let mut sorted_checks: Vec<_> = pr.checks.iter().collect();
-                    sorted_checks.sort_by_key(|(_, status)| match status {
-                        github_service::CheckStatus::Failure => 0,
-                        github_service::CheckStatus::Pending => 1,
-                        github_service::CheckStatus::Success => 2,
-                    });
-                    for (name, status) in sorted_checks {
-                        let (icon, color) = match status {
-                            github_service::CheckStatus::Success => ("\u{f00c}", 0x72d69c_u32),
-                            github_service::CheckStatus::Failure => ("\u{f00d}", 0xeb6f92_u32),
-                            github_service::CheckStatus::Pending => ("\u{f192}", 0xe5c07b_u32),
-                        };
+                    for (name, status) in sorted_pr_checks_for_display(pr) {
+                        let (icon, color) = check_status_presentation(*status);
                         checks_list = checks_list.child(
                             div()
                                 .flex()

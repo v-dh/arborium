@@ -265,6 +265,9 @@ impl ArborWindow {
                     .flex_col()
                     .font_family(FONT_MONO)
                     .p_1()
+                    .when_some(self.render_changes_worktree_summary(cx), |this, summary| {
+                        this.child(summary)
+                    })
                     .children(filtered_changes.iter().map(|change| {
                         let is_selected = selected_path
                             .as_ref()

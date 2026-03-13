@@ -28,7 +28,26 @@ pub enum CheckStatus {
     Pending,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeableState {
+    Conflicting,
+    Mergeable,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeStateStatus {
+    Behind,
+    Blocked,
+    Clean,
+    Dirty,
+    Draft,
+    HasHooks,
+    Unknown,
+    Unstable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrDetails {
     pub number: u64,
     pub title: String,
@@ -37,6 +56,9 @@ pub struct PrDetails {
     pub additions: usize,
     pub deletions: usize,
     pub review_decision: ReviewDecision,
+    pub mergeable: MergeableState,
+    pub merge_state_status: MergeStateStatus,
+    pub passed_checks: usize,
     pub checks_status: CheckStatus,
     pub checks: Vec<(String, CheckStatus)>,
 }
@@ -52,6 +74,8 @@ struct GhPrResponse {
     additions: usize,
     deletions: usize,
     review_decision: Option<String>,
+    mergeable: Option<String>,
+    merge_state_status: Option<String>,
     #[serde(default)]
     status_check_rollup: Vec<GhCheckContext>,
 }
@@ -138,12 +162,31 @@ fn parse_pr_details(response: GhPrResponse) -> PrDetails {
         Some("CHANGES_REQUESTED") => ReviewDecision::ChangesRequested,
         _ => ReviewDecision::Pending,
     };
+    let mergeable = match response.mergeable.as_deref() {
+        Some("CONFLICTING") => MergeableState::Conflicting,
+        Some("MERGEABLE") => MergeableState::Mergeable,
+        _ => MergeableState::Unknown,
+    };
+    let merge_state_status = match response.merge_state_status.as_deref() {
+        Some("BEHIND") => MergeStateStatus::Behind,
+        Some("BLOCKED") => MergeStateStatus::Blocked,
+        Some("CLEAN") => MergeStateStatus::Clean,
+        Some("DIRTY") => MergeStateStatus::Dirty,
+        Some("DRAFT") => MergeStateStatus::Draft,
+        Some("HAS_HOOKS") => MergeStateStatus::HasHooks,
+        Some("UNSTABLE") => MergeStateStatus::Unstable,
+        _ => MergeStateStatus::Unknown,
+    };
 
-    let checks: Vec<(String, CheckStatus)> = response
+    let mut checks: Vec<(String, CheckStatus)> = response
         .status_check_rollup
         .iter()
         .map(|c| (c.display_name(), c.to_check_status()))
         .collect();
+    let passed_checks = checks
+        .iter()
+        .filter(|(_, status)| *status == CheckStatus::Success)
+        .count();
 
     let checks_status = if checks.is_empty() {
         CheckStatus::Pending
@@ -154,6 +197,7 @@ fn parse_pr_details(response: GhPrResponse) -> PrDetails {
     } else {
         CheckStatus::Pending
     };
+    sort_checks_for_display(&mut checks);
 
     PrDetails {
         number: response.number,
@@ -163,8 +207,27 @@ fn parse_pr_details(response: GhPrResponse) -> PrDetails {
         additions: response.additions,
         deletions: response.deletions,
         review_decision,
+        mergeable,
+        merge_state_status,
+        passed_checks,
         checks_status,
         checks,
+    }
+}
+
+fn sort_checks_for_display(checks: &mut [(String, CheckStatus)]) {
+    checks.sort_by(|left, right| {
+        check_status_sort_key(left.1)
+            .cmp(&check_status_sort_key(right.1))
+            .then(left.0.cmp(&right.0))
+    });
+}
+
+fn check_status_sort_key(status: CheckStatus) -> usize {
+    match status {
+        CheckStatus::Failure => 0,
+        CheckStatus::Pending => 1,
+        CheckStatus::Success => 2,
     }
 }
 
@@ -178,7 +241,7 @@ pub fn pull_request_details(repo_slug: &str, branch: &str) -> Option<PrDetails> 
             "--repo",
             repo_slug,
             "--json",
-            "number,title,url,state,isDraft,additions,deletions,reviewDecision,statusCheckRollup",
+            "number,title,url,state,isDraft,additions,deletions,reviewDecision,mergeable,mergeStateStatus,statusCheckRollup",
             branch,
         ])
         .stdin(Stdio::null())
@@ -421,7 +484,8 @@ pub(crate) fn parse_pull_request_number(reference: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CheckStatus, GhCheckContext, GhPrResponse, parse_pr_details, parse_pull_request_number,
+        CheckStatus, GhCheckContext, GhPrResponse, MergeStateStatus, MergeableState,
+        parse_pr_details, parse_pull_request_number,
     };
 
     #[test]
@@ -435,6 +499,8 @@ mod tests {
             additions: 10,
             deletions: 2,
             review_decision: None,
+            mergeable: Some("MERGEABLE".to_owned()),
+            merge_state_status: Some("CLEAN".to_owned()),
             status_check_rollup: vec![
                 GhCheckContext {
                     name: Some("Clippy".to_owned()),
@@ -454,6 +520,9 @@ mod tests {
         });
 
         assert_eq!(details.checks_status, CheckStatus::Pending);
+        assert_eq!(details.passed_checks, 0);
+        assert_eq!(details.mergeable, MergeableState::Mergeable);
+        assert_eq!(details.merge_state_status, MergeStateStatus::Clean);
         assert_eq!(details.checks, vec![
             ("Clippy".to_owned(), CheckStatus::Pending),
             ("Test".to_owned(), CheckStatus::Pending),

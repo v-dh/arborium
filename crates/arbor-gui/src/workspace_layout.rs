@@ -502,8 +502,21 @@ impl ArborWindow {
                     ))
                     .child(status_text(theme, "•"))
                     .child(status_text(theme, format!("terminals {terminal_count}")))
+                    .when_some(self.github_rate_limit_remaining(), |this, remaining| {
+                        this.child(status_text(theme, "•")).child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(theme.accent))
+                                .child(format!(
+                                    "GitHub rate limited: {}",
+                                    format_countdown(remaining)
+                                )),
+                        )
+                    })
                     .child(
-                        if let Some(label) = workspace_loading_status_label(
+                        if self.github_rate_limit_remaining().is_some() {
+                            loading_status_text(theme, "waiting")
+                        } else if let Some(label) = workspace_loading_status_label(
                             if self.worktree_stats_loading {
                                 self.worktrees
                                     .iter()

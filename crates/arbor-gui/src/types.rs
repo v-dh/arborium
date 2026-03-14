@@ -424,7 +424,7 @@ struct DaemonTerminalRuntime {
     daemon: terminal_daemon_http::SharedTerminalDaemonClient,
     ws_state: Arc<DaemonTerminalWsState>,
     last_synced_ws_generation: std::sync::atomic::AtomicU64,
-    snapshot_request_in_flight: Arc<std::sync::atomic::AtomicBool>,
+    snapshot_request_in_flight: Arc<AtomicBool>,
     kind: TerminalRuntimeKind,
     resize_error_label: &'static str,
     exit_labels: Option<RuntimeExitLabels>,
@@ -458,8 +458,8 @@ impl Default for DaemonTerminalCachedSnapshot {
 
 struct DaemonTerminalWsState {
     event_generation: std::sync::atomic::AtomicU64,
-    closed: std::sync::atomic::AtomicBool,
-    connection_refused: std::sync::atomic::AtomicBool,
+    closed: AtomicBool,
+    connection_refused: AtomicBool,
     /// Channel to send keystroke bytes to the WS thread for low-latency binary transmission.
     ws_writer: Mutex<Option<std::sync::mpsc::Sender<Vec<u8>>>>,
     /// Channel to wake the terminal poller when new data arrives.
@@ -485,8 +485,8 @@ impl DaemonTerminalWsState {
         let cols = cols.max(2);
         Self {
             event_generation: std::sync::atomic::AtomicU64::new(0),
-            closed: std::sync::atomic::AtomicBool::new(false),
-            connection_refused: std::sync::atomic::AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+            connection_refused: AtomicBool::new(false),
             ws_writer: Mutex::new(None),
             poll_notify,
             size: Mutex::new((rows, cols)),
@@ -1831,6 +1831,7 @@ struct ArborWindow {
     worktree_prs_loading: bool,
     loading_animation_active: bool,
     loading_animation_frame: usize,
+    github_rate_limited_until: Option<SystemTime>,
     expanded_pr_checks_worktree: Option<PathBuf>,
     active_worktree_index: Option<usize>,
     pending_local_worktree_selection: Option<PathBuf>,

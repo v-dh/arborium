@@ -120,6 +120,12 @@ pub struct ProcessManager {
     broadcast: broadcast::Sender<ProcessEvent>,
 }
 
+#[derive(Copy, Clone)]
+enum StartMode {
+    Manual,
+    AutoRestart,
+}
+
 impl ProcessManager {
     pub fn new() -> Self {
         let (broadcast, _) = broadcast::channel(64);
@@ -195,7 +201,7 @@ impl ProcessManager {
             .cloned()
             .ok_or_else(|| format!("process `{identifier}` is not defined"))?;
 
-        self.start_definition(definition, daemon)
+        self.start_definition(definition, daemon, StartMode::Manual)
     }
 
     pub fn stop_process<D>(
@@ -238,7 +244,7 @@ impl ProcessManager {
             .cloned()
             .ok_or_else(|| format!("process `{identifier}` is not defined"))?;
 
-        self.start_definition(definition, daemon)
+        self.start_definition(definition, daemon, StartMode::Manual)
     }
 
     pub fn restart_tracked_process<D>(
@@ -259,7 +265,7 @@ impl ProcessManager {
         }
         let definition = process.definition.clone();
 
-        self.start_definition(definition, daemon)
+        self.start_definition(definition, daemon, StartMode::AutoRestart)
     }
 
     pub fn start_all<D>(
@@ -478,6 +484,7 @@ impl ProcessManager {
         &mut self,
         definition: ProcessDefinition,
         daemon: &mut D,
+        start_mode: StartMode,
     ) -> Result<ProcessInfo, String>
     where
         D: TerminalDaemon,
@@ -495,7 +502,10 @@ impl ProcessManager {
                 .ok_or_else(|| format!("process `{}` not found", definition.id));
         }
 
-        self.clear_stale_session(&definition.id, daemon)?;
+        if let Err(error) = self.clear_stale_session(&definition.id, daemon) {
+            self.record_start_failure(&definition, false);
+            return Err(error);
+        }
 
         let session_id = session_id_for_process(&definition);
         let result = daemon.create_or_attach(CreateOrAttachRequest {
@@ -519,7 +529,9 @@ impl ProcessManager {
                     .entry(definition.id.clone())
                     .or_insert_with(|| ManagedProcess::from_definition(definition.clone()));
                 process.update_definition(&definition);
-                process.reset_backoff();
+                if matches!(start_mode, StartMode::Manual) {
+                    process.reset_backoff();
+                }
                 process.status = ProcessStatus::Running;
                 process.session_id = Some(response.session.session_id.to_string());
                 process.exit_code = None;
@@ -532,19 +544,25 @@ impl ProcessManager {
                 Ok(info)
             },
             Err(error) => {
-                let process = self
-                    .processes
-                    .entry(definition.id.clone())
-                    .or_insert_with(|| ManagedProcess::from_definition(definition.clone()));
-                process.update_definition(&definition);
-                process.status = ProcessStatus::Crashed;
-                process.session_id = None;
-                let _ = self.broadcast.send(ProcessEvent::Update {
-                    process: process.info(),
-                });
+                self.record_start_failure(&definition, true);
                 Err(error.to_string())
             },
         }
+    }
+
+    fn record_start_failure(&mut self, definition: &ProcessDefinition, clear_session_id: bool) {
+        let process = self
+            .processes
+            .entry(definition.id.clone())
+            .or_insert_with(|| ManagedProcess::from_definition(definition.clone()));
+        process.update_definition(definition);
+        process.status = ProcessStatus::Crashed;
+        if clear_session_id {
+            process.session_id = None;
+        }
+        let _ = self.broadcast.send(ProcessEvent::Update {
+            process: process.info(),
+        });
     }
 
     fn clear_stale_session<D>(&mut self, process_id: &str, daemon: &mut D) -> Result<(), String>
@@ -813,6 +831,8 @@ mod tests {
         create_requests: Vec<CreateOrAttachRequest>,
         killed_session_ids: Vec<String>,
         sessions: HashMap<String, DaemonSessionRecord>,
+        fail_list_sessions: bool,
+        fail_kill: bool,
     }
 
     impl TestTerminalDaemon {
@@ -825,6 +845,12 @@ mod tests {
             self.sessions
                 .get(session_id)
                 .and_then(|session| session.state)
+        }
+
+        fn set_session_state(&mut self, session_id: &str, state: TerminalSessionState) {
+            if let Some(session) = self.sessions.get_mut(session_id) {
+                session.state = Some(state);
+            }
         }
     }
 
@@ -885,6 +911,9 @@ mod tests {
         }
 
         fn kill(&mut self, request: KillRequest) -> Result<(), Self::Error> {
+            if self.fail_kill {
+                return Err(io::Error::other("kill failed"));
+            }
             self.killed_session_ids
                 .push(request.session_id.as_str().to_owned());
             self.sessions.remove(request.session_id.as_str());
@@ -899,6 +928,9 @@ mod tests {
         }
 
         fn list_sessions(&self) -> Result<Vec<DaemonSessionRecord>, Self::Error> {
+            if self.fail_list_sessions {
+                return Err(io::Error::other("list failed"));
+            }
             Ok(self.sessions.values().cloned().collect())
         }
     }
@@ -1033,6 +1065,74 @@ mod tests {
     }
 
     #[test]
+    fn auto_restart_preserves_backoff_across_successful_restarts() {
+        let repo_root = PathBuf::from("/tmp/repo");
+        let workspace_path = PathBuf::from("/tmp/repo");
+        let definition = build_process_definition(
+            ProcessSource::Procfile,
+            &repo_root,
+            &workspace_path,
+            "web".to_owned(),
+            "cargo run".to_owned(),
+            workspace_path.clone(),
+            false,
+            true,
+        );
+        let session_id = session_id_for_process(&definition);
+
+        let mut manager = ProcessManager::new();
+        manager
+            .processes
+            .insert(definition.id.clone(), ManagedProcess {
+                definition: definition.clone(),
+                status: ProcessStatus::Running,
+                session_id: Some(session_id.clone()),
+                exit_code: None,
+                restart_count: 0,
+                last_start: None,
+                current_backoff_secs: 1,
+            });
+
+        let mut daemon = TestTerminalDaemon::default();
+        daemon.insert_session(DaemonSessionRecord {
+            session_id: SessionId::new(session_id.clone()),
+            workspace_id: WorkspaceId::new(workspace_path.display().to_string()),
+            cwd: workspace_path.clone(),
+            shell: "/bin/zsh".to_owned(),
+            root_pid: None,
+            cols: 120,
+            rows: 35,
+            title: Some(managed_process_session_title(
+                ProcessSource::Procfile,
+                &definition.name,
+            )),
+            last_command: Some(definition.command.clone()),
+            output_tail: None,
+            exit_code: Some(1),
+            state: Some(TerminalSessionState::Completed),
+            updated_at_unix_ms: None,
+        });
+
+        let restart_schedule = manager.check_and_update(&mut daemon);
+        assert_eq!(restart_schedule, vec![(
+            definition.id.clone(),
+            Duration::from_secs(1)
+        )]);
+
+        match manager.restart_tracked_process(&definition.id, &mut daemon) {
+            Ok(_) => {},
+            Err(error) => panic!("restart should succeed: {error}"),
+        }
+
+        daemon.set_session_state(&session_id, TerminalSessionState::Completed);
+        let next_restart_schedule = manager.check_and_update(&mut daemon);
+        assert_eq!(next_restart_schedule, vec![(
+            definition.id.clone(),
+            Duration::from_secs(2)
+        )]);
+    }
+
+    #[test]
     fn start_process_uses_source_specific_session_titles() {
         let repo_root = PathBuf::from("/tmp/repo");
         let workspace_path = PathBuf::from("/tmp/repo");
@@ -1130,5 +1230,53 @@ mod tests {
         };
         assert_eq!(result.status, ProcessStatus::Crashed);
         assert!(daemon.create_requests.is_empty());
+    }
+
+    #[test]
+    fn restart_cleanup_failure_demotes_process_from_restarting() {
+        let repo_root = PathBuf::from("/tmp/repo");
+        let workspace_path = PathBuf::from("/tmp/repo");
+        let definition = build_process_definition(
+            ProcessSource::Procfile,
+            &repo_root,
+            &workspace_path,
+            "web".to_owned(),
+            "cargo run".to_owned(),
+            workspace_path.clone(),
+            false,
+            true,
+        );
+        let session_id = session_id_for_process(&definition);
+
+        let mut manager = ProcessManager::new();
+        manager
+            .processes
+            .insert(definition.id.clone(), ManagedProcess {
+                definition: definition.clone(),
+                status: ProcessStatus::Restarting,
+                session_id: Some(session_id.clone()),
+                exit_code: Some(1),
+                restart_count: 1,
+                last_start: None,
+                current_backoff_secs: 2,
+            });
+
+        let mut daemon = TestTerminalDaemon {
+            fail_list_sessions: true,
+            ..TestTerminalDaemon::default()
+        };
+
+        let error = match manager.restart_tracked_process(&definition.id, &mut daemon) {
+            Ok(process) => panic!("restart should fail, got {}", process.name),
+            Err(error) => error,
+        };
+        assert!(error.contains("list failed"));
+
+        let process = match manager.processes.get(&definition.id) {
+            Some(process) => process,
+            None => panic!("tracked process should remain present"),
+        };
+        assert_eq!(process.status, ProcessStatus::Crashed);
+        assert_eq!(process.session_id.as_deref(), Some(session_id.as_str()));
     }
 }

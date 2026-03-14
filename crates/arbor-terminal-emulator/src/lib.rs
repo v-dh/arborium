@@ -5,6 +5,19 @@ mod ghostty_vt_experimental;
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TerminalEngineError {
+    #[error(
+        "embedded_terminal_engine `ghostty-vt-experimental` requires Arbor to be built with the `ghostty-vt-experimental` cargo feature"
+    )]
+    UnsupportedEngine { engine: String },
+    #[error(
+        "invalid embedded_terminal_engine `{engine}`, expected alacritty{}",
+        available_terminal_engine_suffix()
+    )]
+    InvalidEngine { engine: String },
+}
+
 pub const TERMINAL_ROWS: u16 = 24;
 pub const TERMINAL_COLS: u16 = 80;
 pub const TERMINAL_SCROLLBACK: usize = 8_000;
@@ -130,7 +143,9 @@ pub fn set_default_terminal_engine(engine: TerminalEngineKind) {
     );
 }
 
-pub fn parse_terminal_engine_kind(value: Option<&str>) -> Result<TerminalEngineKind, String> {
+pub fn parse_terminal_engine_kind(
+    value: Option<&str>,
+) -> Result<TerminalEngineKind, TerminalEngineError> {
     let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(TerminalEngineKind::default());
     };
@@ -144,16 +159,14 @@ pub fn parse_terminal_engine_kind(value: Option<&str>) -> Result<TerminalEngineK
             }
             #[cfg(not(feature = "ghostty-vt-experimental"))]
             {
-                Err(
-                    "embedded_terminal_engine `ghostty-vt-experimental` requires Arbor to be built with the `ghostty-vt-experimental` cargo feature"
-                        .to_owned(),
-                )
+                Err(TerminalEngineError::UnsupportedEngine {
+                    engine: value.to_owned(),
+                })
             }
         },
-        _ => Err(format!(
-            "invalid embedded_terminal_engine `{value}`, expected alacritty{}",
-            available_terminal_engine_suffix(),
-        )),
+        _ => Err(TerminalEngineError::InvalidEngine {
+            engine: value.to_owned(),
+        }),
     }
 }
 
@@ -283,6 +296,7 @@ impl Default for TerminalEmulator {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -311,6 +325,27 @@ mod tests {
         assert_eq!(
             parse_terminal_engine_kind(Some("ghostty-vt-experimental")),
             Ok(TerminalEngineKind::GhosttyVtExperimental),
+        );
+    }
+
+    #[test]
+    fn parse_terminal_engine_rejects_invalid_engine() {
+        assert_eq!(
+            parse_terminal_engine_kind(Some("invalid-engine")),
+            Err(TerminalEngineError::InvalidEngine {
+                engine: "invalid-engine".to_owned(),
+            }),
+        );
+    }
+
+    #[cfg(not(feature = "ghostty-vt-experimental"))]
+    #[test]
+    fn parse_terminal_engine_rejects_ghostty_without_feature() {
+        assert_eq!(
+            parse_terminal_engine_kind(Some("ghostty")),
+            Err(TerminalEngineError::UnsupportedEngine {
+                engine: "ghostty".to_owned(),
+            }),
         );
     }
 }

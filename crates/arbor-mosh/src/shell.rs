@@ -101,7 +101,7 @@ impl MoshShell {
         })
     }
 
-    pub fn write_input(&self, bytes: &[u8]) -> Result<(), String> {
+    pub fn write_input(&self, bytes: &[u8]) -> Result<(), MoshError> {
         if bytes.is_empty() {
             return Ok(());
         }
@@ -109,13 +109,13 @@ impl MoshShell {
         let mut writer = self
             .writer
             .lock()
-            .map_err(|_| "failed to acquire mosh PTY writer lock".to_owned())?;
+            .map_err(|_| MoshError::Io("failed to acquire mosh PTY writer lock".to_owned()))?;
         writer
             .write_all(bytes)
-            .map_err(|error| format!("failed to write to mosh PTY: {error}"))?;
+            .map_err(|error| MoshError::Io(format!("failed to write to mosh PTY: {error}")))?;
         writer
             .flush()
-            .map_err(|error| format!("failed to flush mosh PTY writer: {error}"))
+            .map_err(|error| MoshError::Io(format!("failed to flush mosh PTY writer: {error}")))
     }
 
     pub fn snapshot(&self) -> TerminalSnapshot {

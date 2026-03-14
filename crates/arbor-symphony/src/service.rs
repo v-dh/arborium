@@ -31,6 +31,8 @@ pub enum ServiceError {
     Workflow(#[from] WorkflowError),
     #[error("{0}")]
     Tracker(#[from] TrackerError),
+    #[error("failed to send service command: {0}")]
+    SendCommand(String),
 }
 
 #[derive(Clone)]
@@ -49,16 +51,16 @@ impl ServiceHandle {
         self.issue_snapshots.read().await.get(identifier).cloned()
     }
 
-    pub fn refresh(&self) -> Result<(), String> {
+    pub fn refresh(&self) -> Result<(), ServiceError> {
         self.commands
             .send(ServiceCommand::Refresh)
-            .map_err(|error| error.to_string())
+            .map_err(|error| ServiceError::SendCommand(error.to_string()))
     }
 
-    pub fn stop(&self) -> Result<(), String> {
+    pub fn stop(&self) -> Result<(), ServiceError> {
         self.commands
             .send(ServiceCommand::Stop)
-            .map_err(|error| error.to_string())
+            .map_err(|error| ServiceError::SendCommand(error.to_string()))
     }
 }
 

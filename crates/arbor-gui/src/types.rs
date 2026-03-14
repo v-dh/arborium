@@ -733,7 +733,7 @@ impl EmulatorRuntimeBackend for arbor_mosh::MoshShell {
     fn poll(&self) {}
 
     fn write_input(&self, input: &[u8]) -> Result<(), String> {
-        arbor_mosh::MoshShell::write_input(self, input)
+        arbor_mosh::MoshShell::write_input(self, input).map_err(|e| e.to_string())
     }
 
     fn snapshot(&self) -> arbor_terminal_emulator::TerminalSnapshot {

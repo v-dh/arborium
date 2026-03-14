@@ -101,7 +101,9 @@ pub(crate) async fn symphony_refresh(
     let Some(service) = state.symphony.clone() else {
         return Err(internal_error("symphony service is disabled"));
     };
-    service.refresh().map_err(internal_error)?;
+    service
+        .refresh()
+        .map_err(|e| internal_error(e.to_string()))?;
     Ok(Json(serde_json::json!({
         "queued": true,
         "requested_at": current_unix_timestamp_millis(),

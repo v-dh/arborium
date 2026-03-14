@@ -57,7 +57,7 @@ pub(crate) fn resolve_embedded_terminal_engine(
             engine
         },
         Err(error) => {
-            notices.push(error);
+            notices.push(error.to_string());
             let engine = arbor_terminal_emulator::TerminalEngineKind::default();
             arbor_terminal_emulator::set_default_terminal_engine(engine);
             engine

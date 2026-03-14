@@ -10,6 +10,7 @@ ghostty-vt-experimental = []
 
 [dependencies]
 alacritty_terminal = { workspace = true }
+thiserror          = { workspace = true }
 
 [lints.rust]
 unsafe_code = "allow"

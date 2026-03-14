@@ -1,6 +1,7 @@
 use {
     arbor_core::{
         SessionId, WorkspaceId,
+        agent::AgentState,
         daemon::{
             CreateOrAttachRequest, CreateOrAttachResponse, DaemonSessionRecord, DaemonSessionStore,
             DaemonSessionStoreError, DaemonTerminalCursor, DaemonTerminalModes,
@@ -19,7 +20,7 @@ use {
         thread,
     },
     thiserror::Error,
-    tokio::sync::broadcast,
+    tokio::sync::{broadcast, mpsc},
 };
 
 const OUTPUT_TAIL_MAX_CHARS: usize = 24_000;
@@ -35,6 +36,18 @@ pub enum SessionEvent {
         state: TerminalSessionState,
     },
     Error(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalActivityEvent {
+    Update {
+        session_id: SessionId,
+        cwd: PathBuf,
+        state: AgentState,
+    },
+    Clear {
+        session_id: SessionId,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -75,10 +88,15 @@ struct LiveSession {
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     killer: Arc<Mutex<Option<Box<dyn ChildKiller + Send + Sync>>>>,
     sender: broadcast::Sender<SessionEvent>,
+    activity_state: Arc<Mutex<Option<AgentState>>>,
+    activity_tx: Option<mpsc::UnboundedSender<TerminalActivityEvent>>,
 }
 
 impl LiveSession {
-    fn from_request(request: CreateOrAttachRequest) -> Result<Arc<Self>, LocalTerminalDaemonError> {
+    fn from_request(
+        request: CreateOrAttachRequest,
+        activity_tx: Option<mpsc::UnboundedSender<TerminalActivityEvent>>,
+    ) -> Result<Arc<Self>, LocalTerminalDaemonError> {
         let shell = if request.shell.trim().is_empty() {
             default_shell()
         } else {
@@ -160,6 +178,8 @@ impl LiveSession {
             master: Arc::new(Mutex::new(master)),
             killer: Arc::new(Mutex::new(Some(killer))),
             sender,
+            activity_state: Arc::new(Mutex::new(None)),
+            activity_tx,
         });
 
         spawn_reader_thread(reader, session.clone());
@@ -198,6 +218,7 @@ impl LiveSession {
         }
 
         self.track_command_input(bytes);
+        self.clear_waiting_for_input();
         self.touch();
         Ok(())
     }
@@ -361,6 +382,52 @@ impl LiveSession {
         let emulator = lock_or_recover(&self.emulator);
         emulator.render_ansi_snapshot(max_lines)
     }
+
+    fn note_waiting_for_input(&self) {
+        let mut state = lock_or_recover(&self.activity_state);
+        if *state == Some(AgentState::Waiting) {
+            return;
+        }
+        *state = Some(AgentState::Waiting);
+        drop(state);
+
+        if let Some(sender) = self.activity_tx.as_ref() {
+            let _ = sender.send(TerminalActivityEvent::Update {
+                session_id: self.session_id.clone(),
+                cwd: self.cwd.clone(),
+                state: AgentState::Waiting,
+            });
+        }
+    }
+
+    fn clear_waiting_for_input(&self) {
+        let mut state = lock_or_recover(&self.activity_state);
+        if *state != Some(AgentState::Waiting) {
+            return;
+        }
+        state.take();
+        drop(state);
+
+        if let Some(sender) = self.activity_tx.as_ref() {
+            let _ = sender.send(TerminalActivityEvent::Clear {
+                session_id: self.session_id.clone(),
+            });
+        }
+    }
+
+    fn clear_activity(&self) {
+        let mut state = lock_or_recover(&self.activity_state);
+        if state.take().is_none() {
+            return;
+        }
+        drop(state);
+
+        if let Some(sender) = self.activity_tx.as_ref() {
+            let _ = sender.send(TerminalActivityEvent::Clear {
+                session_id: self.session_id.clone(),
+            });
+        }
+    }
 }
 
 fn spawn_reader_thread(mut reader: Box<dyn Read + Send>, session: Arc<LiveSession>) {
@@ -371,7 +438,10 @@ fn spawn_reader_thread(mut reader: Box<dyn Read + Send>, session: Arc<LiveSessio
                 Ok(0) => break,
                 Ok(bytes_read) => {
                     let chunk = buffer[..bytes_read].to_vec();
-                    lock_or_recover(&session.emulator).process(&chunk);
+                    let report = lock_or_recover(&session.emulator).process_and_report(&chunk);
+                    if report.bell_rang() {
+                        session.note_waiting_for_input();
+                    }
                     let text = String::from_utf8_lossy(&chunk).into_owned();
                     if text.is_empty() {
                         continue;
@@ -400,10 +470,12 @@ fn spawn_wait_thread(mut child: Box<dyn Child + Send + Sync>, session: Arc<LiveS
             } else {
                 TerminalSessionState::Failed
             };
+            session.clear_activity();
             session.set_exit_state(exit_code, state);
             let _ = session.sender.send(SessionEvent::Exit { exit_code, state });
         },
         Err(error) => {
+            session.clear_activity();
             session.set_exit_state(None, TerminalSessionState::Failed);
             let _ = session.sender.send(SessionEvent::Error(format!(
                 "failed waiting for session exit: {error}"
@@ -416,10 +488,14 @@ pub struct LocalTerminalDaemon {
     sessions: HashMap<SessionId, Arc<LiveSession>>,
     session_store: Box<dyn DaemonSessionStore>,
     next_session_id: u64,
+    activity_tx: Option<mpsc::UnboundedSender<TerminalActivityEvent>>,
 }
 
 impl LocalTerminalDaemon {
-    pub fn new<S>(session_store: S) -> Self
+    pub fn new<S>(
+        session_store: S,
+        activity_tx: Option<mpsc::UnboundedSender<TerminalActivityEvent>>,
+    ) -> Self
     where
         S: DaemonSessionStore + 'static,
     {
@@ -427,6 +503,7 @@ impl LocalTerminalDaemon {
             sessions: HashMap::new(),
             session_store: Box::new(session_store),
             next_session_id: 1,
+            activity_tx,
         }
     }
 
@@ -556,7 +633,7 @@ impl TerminalDaemon for LocalTerminalDaemon {
             request.rows = DEFAULT_ROWS;
         }
 
-        let session = LiveSession::from_request(request)?;
+        let session = LiveSession::from_request(request, self.activity_tx.clone())?;
         let record = session.record();
         self.sessions.insert(record.session_id.clone(), session);
         self.persist_current_sessions()?;

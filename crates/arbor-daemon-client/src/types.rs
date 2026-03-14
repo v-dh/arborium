@@ -85,6 +85,7 @@ pub struct ChangedFileDto {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct AgentSessionDto {
+    pub session_id: String,
     pub cwd: String,
     pub state: String,
     pub updated_at_unix_ms: u64,

@@ -417,11 +417,14 @@ const AGENT_RECONNECT_MAX_MS = 30000;
 function parseAgentSession(item: unknown): AgentSession | null {
   if (typeof item !== "object" || item === null || Array.isArray(item)) return null;
   const rec = item as Record<string, unknown>;
+  const sessionId = typeof rec["session_id"] === "string" ? rec["session_id"] : null;
   const cwd = typeof rec["cwd"] === "string" ? rec["cwd"] : null;
   const s = typeof rec["state"] === "string" ? rec["state"] : null;
   const ts = typeof rec["updated_at_unix_ms"] === "number" ? rec["updated_at_unix_ms"] : null;
-  if (cwd === null || (s !== "working" && s !== "waiting") || ts === null) return null;
-  return { cwd, state: s, updated_at_unix_ms: ts };
+  if (sessionId === null || cwd === null || (s !== "working" && s !== "waiting") || ts === null) {
+    return null;
+  }
+  return { session_id: sessionId, cwd, state: s, updated_at_unix_ms: ts };
 }
 
 function parseAgentWsEvent(data: string): AgentActivityWsEvent | null {
@@ -450,8 +453,9 @@ function applyAgentEvent(event: AgentActivityWsEvent): void {
   if (event.type === "snapshot") {
     updateState({ agentSessions: event.sessions });
   } else {
-    // Upsert by cwd
-    const existing = state.agentSessions.filter((s) => s.cwd !== event.session.cwd);
+    const existing = state.agentSessions.filter(
+      (s) => s.session_id !== event.session.session_id,
+    );
     updateState({ agentSessions: [...existing, event.session] });
   }
 }
@@ -496,9 +500,14 @@ export function agentStateForWorktree(worktreePath: string): "working" | "waitin
   let bestLen = 0;
 
   for (const session of state.agentSessions) {
-    if (session.cwd.startsWith(worktreePath) && worktreePath.length > bestLen) {
+    if (!session.cwd.startsWith(worktreePath)) continue;
+    if (worktreePath.length > bestLen) {
       bestState = session.state;
       bestLen = worktreePath.length;
+      continue;
+    }
+    if (worktreePath.length === bestLen && session.state === "waiting") {
+      bestState = "waiting";
     }
   }
   return bestState;

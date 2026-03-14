@@ -5,10 +5,11 @@ use {
         managed_worktree::preview_managed_worktree as build_managed_worktree_preview,
         process_manager::ProcessEvent,
         repository_store, task_scheduler,
-        terminal_daemon::{LocalTerminalDaemonError, SessionEvent},
+        terminal_daemon::{LocalTerminalDaemonError, SessionEvent, TerminalActivityEvent},
         types::*,
     },
     arbor_core::{
+        SessionId,
         agent::AgentState,
         changes,
         daemon::{
@@ -1052,33 +1053,68 @@ pub(crate) async fn agent_notify(
         },
     };
 
+    upsert_agent_session(
+        &state,
+        request.session_id.clone(),
+        request.cwd.clone(),
+        agent_state,
+    )
+    .await;
+
+    StatusCode::OK
+}
+
+pub(crate) async fn apply_terminal_activity_event(state: &AppState, event: TerminalActivityEvent) {
+    match event {
+        TerminalActivityEvent::Update {
+            session_id,
+            cwd,
+            state: agent_state,
+        } => {
+            upsert_agent_session(
+                state,
+                terminal_agent_session_key(&session_id),
+                cwd.display().to_string(),
+                agent_state,
+            )
+            .await;
+        },
+        TerminalActivityEvent::Clear { session_id } => {
+            remove_agent_session(state, &terminal_agent_session_key(&session_id)).await;
+        },
+    }
+}
+
+async fn upsert_agent_session(
+    state: &AppState,
+    session_id: String,
+    cwd: String,
+    agent_state: AgentState,
+) {
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let session_id = request.session_id.clone();
-    let cwd_path = PathBuf::from(&request.cwd);
+    let cwd_path = PathBuf::from(&cwd);
 
     let (dto, previous_state) = {
         let mut sessions = state.agent_sessions.lock().await;
 
-        // Expire stale sessions
         let cutoff = now_ms.saturating_sub(AGENT_SESSION_EXPIRY_SECS * 1000);
         sessions.retain(|_, session| session.updated_at_unix_ms > cutoff);
 
-        let previous_state = sessions
-            .get(&request.session_id)
-            .map(|session| session.state);
+        let previous_state = sessions.get(&session_id).map(|session| session.state);
 
-        sessions.insert(request.session_id, AgentSession {
-            cwd: request.cwd.clone(),
+        sessions.insert(session_id.clone(), AgentSession {
+            cwd: cwd.clone(),
             state: agent_state,
             updated_at_unix_ms: now_ms,
         });
 
         (
             AgentSessionDto {
-                cwd: request.cwd,
+                session_id: session_id.clone(),
+                cwd: cwd.clone(),
                 state: agent_state_label(agent_state).to_owned(),
                 updated_at_unix_ms: now_ms,
             },
@@ -1087,6 +1123,7 @@ pub(crate) async fn agent_notify(
     };
 
     tracing::info!(
+        session_id = dto.session_id.as_str(),
         cwd = dto.cwd.as_str(),
         state = dto.state.as_str(),
         "agent session updated, broadcasting"
@@ -1115,8 +1152,25 @@ pub(crate) async fn agent_notify(
     let _ = state
         .agent_broadcast
         .send(AgentWsEvent::Update { session: dto });
+}
 
-    StatusCode::OK
+async fn remove_agent_session(state: &AppState, session_id: &str) {
+    let snapshot = {
+        let mut sessions = state.agent_sessions.lock().await;
+        if sessions.remove(session_id).is_none() {
+            return;
+        }
+        agent_session_snapshot(&mut sessions)
+    };
+
+    tracing::info!(session_id, "agent session cleared, broadcasting snapshot");
+    let _ = state
+        .agent_broadcast
+        .send(AgentWsEvent::Snapshot { sessions: snapshot });
+}
+
+fn terminal_agent_session_key(session_id: &SessionId) -> String {
+    format!("terminal:{session_id}")
 }
 
 pub(crate) async fn list_agent_activity(
@@ -1438,8 +1492,9 @@ fn agent_session_snapshot(sessions: &mut HashMap<String, AgentSession>) -> Vec<A
     sessions.retain(|_, session| session.updated_at_unix_ms > cutoff);
 
     let mut snapshot: Vec<AgentSessionDto> = sessions
-        .values()
-        .map(|session| AgentSessionDto {
+        .iter()
+        .map(|(session_id, session)| AgentSessionDto {
+            session_id: session_id.clone(),
             cwd: session.cwd.clone(),
             state: match session.state {
                 AgentState::Working => "working".to_owned(),
@@ -1448,7 +1503,11 @@ fn agent_session_snapshot(sessions: &mut HashMap<String, AgentSession>) -> Vec<A
             updated_at_unix_ms: session.updated_at_unix_ms,
         })
         .collect();
-    snapshot.sort_by(|left, right| left.cwd.cmp(&right.cwd));
+    snapshot.sort_by(|left, right| {
+        left.cwd
+            .cmp(&right.cwd)
+            .then_with(|| left.session_id.cmp(&right.session_id))
+    });
     snapshot
 }
 

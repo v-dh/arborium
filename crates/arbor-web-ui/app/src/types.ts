@@ -112,6 +112,7 @@ export type ProcessInfo = {
 };
 
 export type AgentSession = {
+  session_id: string;
   cwd: string;
   state: "working" | "waiting";
   updated_at_unix_ms: number;

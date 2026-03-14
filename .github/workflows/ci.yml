@@ -288,7 +288,7 @@ jobs:
             exit 1
           fi
           # Fail if the binary requires macOS newer than 11.0
-          if [[ "$(printf '%s\n' "$minos" "11.0" | sort -V | tail -1)" != "11.0" ]]; then
+          if ! python3 -c "import sys; sys.exit(0 if tuple(int(x) for x in '$minos'.split('.')) <= (11,0) else 1)"; then
             echo "::error::$bin requires macOS $minos, expected <= 11.0"
             exit 1
           fi

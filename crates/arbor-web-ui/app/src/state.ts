@@ -3,19 +3,18 @@ import type {
   Worktree,
   TerminalSession,
   ChangedFile,
-  ProcessInfo,
   AgentSession,
   AgentActivityWsEvent,
   Issue,
   IssueSource,
   RightPanelTab,
+  RightPaneTab,
 } from "./types";
 import {
   fetchRepositories,
   fetchWorktrees,
   fetchTerminals,
   fetchChangedFiles,
-  fetchProcesses,
   fetchIssues,
 } from "./api";
 
@@ -24,7 +23,6 @@ export type AppState = {
   worktrees: Worktree[];
   sessions: TerminalSession[];
   changedFiles: ChangedFile[];
-  processes: ProcessInfo[];
   agentSessions: AgentSession[];
   issues: Issue[];
   issueSource: IssueSource | null;
@@ -39,6 +37,7 @@ export type AppState = {
   selectedRepoRoot: string | null;
   selectedWorktreePath: string | null;
   activeSessionId: string | null;
+  rightPaneTab: RightPaneTab;
 
   loading: boolean;
   error: string | null;
@@ -50,7 +49,6 @@ export function createInitialState(): AppState {
     worktrees: [],
     sessions: [],
     changedFiles: [],
-    processes: [],
     agentSessions: [],
     issues: [],
     issueSource: null,
@@ -64,6 +62,7 @@ export function createInitialState(): AppState {
     selectedRepoRoot: null,
     selectedWorktreePath: null,
     activeSessionId: null,
+    rightPaneTab: "changes",
     loading: true,
     error: null,
   };
@@ -91,7 +90,6 @@ export function updateState(partial: Partial<AppState>): void {
   notify();
 }
 
-let refreshInFlight = false;
 let refreshPromise: Promise<void> | null = null;
 
 export async function refresh(): Promise<void> {
@@ -100,15 +98,13 @@ export async function refresh(): Promise<void> {
   }
 
   refreshPromise = (async () => {
-    refreshInFlight = true;
     updateState({ loading: true, error: null });
 
     try {
-      const [repositories, worktrees, sessions, processes] = await Promise.all([
+      const [repositories, worktrees, sessions] = await Promise.all([
         fetchRepositories(),
         fetchWorktrees(),
         fetchTerminals(),
-        fetchProcesses().catch(() => [] as ProcessInfo[]),
       ]);
 
       // Validate selections still exist, auto-select on first load
@@ -191,7 +187,6 @@ export async function refresh(): Promise<void> {
         repositories,
         worktrees,
         sessions,
-        processes,
         selectedRepoRoot,
         selectedWorktreePath,
         activeSessionId,
@@ -226,7 +221,6 @@ export async function refresh(): Promise<void> {
         error: error instanceof Error ? error.message : "unknown request failure",
       });
     } finally {
-      refreshInFlight = false;
       refreshPromise = null;
     }
   })();
@@ -405,6 +399,9 @@ export function refreshIssues(
     });
 }
 
+export function setRightPaneTab(tab: RightPaneTab): void {
+  updateState({ rightPaneTab: tab });
+}
 export function filteredSessions(): TerminalSession[] {
   if (state.selectedWorktreePath === null) {
     return state.sessions;

@@ -6,6 +6,7 @@ mod managed_worktree;
 #[cfg(feature = "mdns")]
 mod mdns;
 mod process_manager;
+mod process_metrics;
 mod repository_store;
 mod routes;
 pub(crate) mod task_scheduler;
@@ -156,27 +157,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (terminal_activity_tx, mut terminal_activity_rx) =
         tokio::sync::mpsc::unbounded_channel::<terminal_daemon::TerminalActivityEvent>();
 
-    // Initialize process manager — scan repository roots for arbor.toml files
     let repository_store = repository_store::default_repository_store();
-    let process_manager = {
-        let roots = repository_store.load_roots().unwrap_or_default();
-        let resolved = repository_store::resolve_repository_roots(roots);
-        let repo_root = resolved
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| PathBuf::from("."));
-        let mut pm = ProcessManager::new(repo_root.clone());
-        let configs = process_manager::load_process_configs(&repo_root);
-        if !configs.is_empty() {
-            println!(
-                "loaded {} process config(s) from {}/arbor.toml",
-                configs.len(),
-                repo_root.display()
-            );
-        }
-        pm.load_configs(configs);
-        pm
-    };
+    let process_manager = ProcessManager::new();
 
     #[cfg(feature = "symphony")]
     let symphony = start_symphony_if_configured().await;
@@ -238,10 +220,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut ticks_since_reap: u32 = 0;
             loop {
                 interval.tick().await;
-                let (restart_schedule, crashed_processes, process_repo_root) = {
+                let (restart_schedule, crashed_processes) = {
                     let mut pm = state.process_manager.lock().await;
                     let mut daemon = state.daemon.lock().await;
-                    let previous = pm.list_processes();
+                    let previous = pm.list_processes(&[]);
 
                     // Periodically reap exited terminal sessions to free memory
                     // (~23 MB per dead session from scrollback buffers).
@@ -253,32 +235,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     let restart_schedule = pm.check_and_update(&mut *daemon);
-                    let current = pm.list_processes();
+                    let current = pm.list_processes(&[]);
                     let crashed_processes = current
                         .into_iter()
                         .filter(|process| {
                             process.status == ProcessStatus::Crashed
                                 && previous
                                     .iter()
-                                    .find(|candidate| candidate.name == process.name)
+                                    .find(|candidate| candidate.id == process.id)
                                     .map(|candidate| candidate.status)
                                     != Some(ProcessStatus::Crashed)
                         })
                         .collect::<Vec<_>>();
 
-                    (
-                        restart_schedule,
-                        crashed_processes,
-                        pm.repo_root().to_path_buf(),
-                    )
+                    (restart_schedule, crashed_processes)
                 };
                 for process in crashed_processes {
                     spawn_notification_webhooks(
-                        process_repo_root.clone(),
+                        PathBuf::from(&process.repo_root),
                         "agent_error",
                         serde_json::json!({
                             "event": "agent_error",
-                            "repo_root": process_repo_root.clone(),
+                            "repo_root": process.repo_root,
+                            "workspace_id": process.workspace_id,
                             "process_name": process.name,
                             "command": process.command,
                             "exit_code": process.exit_code,
@@ -295,7 +274,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         tokio::time::sleep(delay).await;
                         let mut pm = state.process_manager.lock().await;
                         let mut daemon = state.daemon.lock().await;
-                        let _ = pm.restart_process(&name, &mut *daemon);
+                        let _ = pm.restart_tracked_process(&name, &mut *daemon);
                     });
                 }
             }
@@ -771,7 +750,7 @@ mod tests {
                 daemon_store,
                 Some(terminal_activity_tx),
             ))),
-            process_manager: Arc::new(Mutex::new(ProcessManager::new(repo_root.clone()))),
+            process_manager: Arc::new(Mutex::new(ProcessManager::new())),
             task_scheduler: Arc::new(Mutex::new(TaskScheduler::new(repo_root))),
             #[cfg(feature = "symphony")]
             symphony: None,

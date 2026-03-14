@@ -1,5 +1,5 @@
 use {
-    arbor_core::{SessionId, WorkspaceId, daemon::DaemonSessionRecord},
+    arbor_core::{SessionId, WorkspaceId, daemon::DaemonSessionRecord, process::ProcessInfo},
     schemars::JsonSchema,
     serde::{Deserialize, Deserializer, Serialize},
 };
@@ -73,6 +73,7 @@ pub struct WorktreeDto {
     pub diff_deletions: Option<usize>,
     pub pr_number: Option<u64>,
     pub pr_url: Option<String>,
+    pub processes: Vec<ProcessInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]

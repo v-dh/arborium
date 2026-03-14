@@ -64,6 +64,34 @@ test.describe("Arbor Web UI", () => {
             diff_deletions: 2,
             pr_number: null,
             pr_url: null,
+            processes: [
+              {
+                id: "procfile:/home/user/projects/arbor:web",
+                name: "web",
+                command: "cargo watch -x run",
+                repo_root: "/home/user/projects/arbor",
+                workspace_id: "/home/user/projects/arbor",
+                source: "procfile",
+                status: "running",
+                exit_code: null,
+                restart_count: 1,
+                memory_bytes: 268435456,
+                session_id: "daemon-1",
+              },
+              {
+                id: "procfile:/home/user/projects/arbor:worker",
+                name: "worker",
+                command: "just queue",
+                repo_root: "/home/user/projects/arbor",
+                workspace_id: "/home/user/projects/arbor",
+                source: "procfile",
+                status: "stopped",
+                exit_code: null,
+                restart_count: 0,
+                memory_bytes: null,
+                session_id: null,
+              },
+            ],
           },
           {
             repo_root: "/home/user/projects/arbor",
@@ -75,6 +103,21 @@ test.describe("Arbor Web UI", () => {
             diff_deletions: 3,
             pr_number: 365,
             pr_url: "https://github.com/penso/arbor/pull/365",
+            processes: [
+              {
+                id: "procfile:/home/user/projects/arbor-worktrees/feature-auth:web",
+                name: "web",
+                command: "just feature-server",
+                repo_root: "/home/user/projects/arbor",
+                workspace_id: "/home/user/projects/arbor-worktrees/feature-auth",
+                source: "procfile",
+                status: "crashed",
+                exit_code: 1,
+                restart_count: 0,
+                memory_bytes: null,
+                session_id: null,
+              },
+            ],
           },
           ...(managedWorktreeCreateCount > 0 &&
             managedWorktreeName !== null &&
@@ -101,10 +144,22 @@ test.describe("Arbor Web UI", () => {
             diff_deletions: null,
             pr_number: null,
             pr_url: null,
+            processes: [],
           },
         ]),
       }),
     );
+
+    await page.route("**/api/v1/processes**", (route) => {
+      if (route.request().method() === "GET") {
+        return route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify([]),
+        });
+      }
+      return route.fulfill({ status: 200, contentType: "application/json", body: "{}" });
+    });
 
     await page.route("**/api/v1/terminals", (route) => {
       if (route.request().method() === "GET") {
@@ -275,6 +330,9 @@ test.describe("Arbor Web UI", () => {
     await expect(sidebar.locator(".repo-wt-count").getByText("2")).toBeVisible();
     await expect(sidebar.locator(".repo-wt-count").getByText("1")).toBeVisible();
 
+    // Procfile commands are no longer surfaced directly from the worktree list
+    await expect(sidebar.locator(".wt-procfile-badge")).toHaveCount(0);
+
     await page.screenshot({
       path: "e2e/screenshots/sidebar-details.png",
       fullPage: true,
@@ -302,6 +360,22 @@ test.describe("Arbor Web UI", () => {
     const sidebar = page.getByTestId("sidebar");
     await sidebar.locator(".wt-card").nth(1).click();
     await expect(terminalPanel.locator(".terminal-tab-label").getByText("cargo build")).toBeVisible();
+  });
+
+  test("right pane shows processes in a dedicated tab", async ({ page }) => {
+    const changesPanel = page.getByTestId("changes-panel");
+
+    await expect(changesPanel.getByRole("button", { name: "Processes 2" })).toBeVisible();
+    await changesPanel.getByRole("button", { name: "Processes 2" }).click();
+
+    await expect(changesPanel.getByRole("button", { name: "Processes 2" })).toHaveClass(/active/);
+    await expect(changesPanel.locator(".changes-title").getByText("Processes")).toBeVisible();
+    await expect(changesPanel.locator(".procfile-name").getByText("web")).toBeVisible();
+    await expect(changesPanel.locator(".procfile-command").getByText("cargo watch -x run")).toBeVisible();
+    await expect(changesPanel.locator(".process-memory").getByText("RSS 256 MiB")).toBeVisible();
+    await expect(changesPanel.locator(".procfile-status").getByText("Running")).toBeVisible();
+    await expect(changesPanel.getByRole("button", { name: "Restart" })).toBeVisible();
+    await expect(changesPanel.getByRole("button", { name: "Stop" })).toBeVisible();
   });
 
   test("terminal panel shows empty state for worktree without terminals", async ({ page }) => {

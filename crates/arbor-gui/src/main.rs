@@ -27,7 +27,11 @@ use {
             self, CreateOrAttachRequest, DaemonSessionRecord, DetachRequest, KillRequest,
             ResizeRequest, SignalRequest, TerminalSessionState, TerminalSignal, WriteRequest,
         },
-        worktree,
+        process::{
+            ProcessSource, managed_process_session_title,
+            managed_process_source_and_name_from_title,
+        },
+        procfile, repo_config, worktree,
         worktree_scripts::{WorktreeScriptContext, WorktreeScriptPhase, run_worktree_scripts},
     },
     checkout::CheckoutKind,
@@ -1798,6 +1802,7 @@ impl ArborWindow {
                 .clone()
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| format!("term-{}", self.next_terminal_id));
+            let managed_process_id = managed_process_id_from_title(&worktree_path, &title);
             let command = record.shell.clone();
             let output = record.output_tail.clone().unwrap_or_default();
             let cols = record.cols.max(2);
@@ -1814,6 +1819,10 @@ impl ArborWindow {
                 }
                 if session.title != title {
                     session.title = title.clone();
+                    changed = true;
+                }
+                if session.managed_process_id != managed_process_id {
+                    session.managed_process_id = managed_process_id.clone();
                     changed = true;
                 }
                 if session.command != command {
@@ -1865,6 +1874,7 @@ impl ArborWindow {
                     id: session_id,
                     daemon_session_id: record.session_id.to_string(),
                     worktree_path: worktree_path.clone(),
+                    managed_process_id,
                     title,
                     last_command: record.last_command.clone(),
                     pending_command: String::new(),
@@ -3998,6 +4008,7 @@ impl ArborWindow {
             id: session_id,
             daemon_session_id: session_id.to_string(),
             worktree_path: cwd.clone(),
+            managed_process_id: None,
             title: title.clone(),
             last_command: None,
             pending_command: String::new(),
@@ -4318,6 +4329,7 @@ impl ArborWindow {
             id: session_id,
             daemon_session_id: session_id.to_string(),
             worktree_path,
+            managed_process_id: None,
             title,
             last_command: None,
             pending_command: String::new(),
@@ -4755,6 +4767,7 @@ impl WorktreeSummary {
         let is_primary_checkout = entry.path.as_path() == repo_root;
 
         let last_activity_unix_ms = worktree::last_git_activity_ms(&entry.path);
+        let managed_processes = managed_processes_for_worktree(repo_root, &entry.path);
 
         Self {
             group_key: group_key.to_owned(),
@@ -4772,6 +4785,7 @@ impl WorktreeSummary {
             branch_divergence: branch_divergence_summary(&entry.path),
             diff_summary: None,
             detected_ports: Vec::new(),
+            managed_processes,
             recent_turns: Vec::new(),
             stuck_turn_count: 0,
             recent_agent_sessions: Vec::new(),
@@ -5971,7 +5985,103 @@ fn worktree_rows_changed(previous: &[WorktreeSummary], next: &[WorktreeSummary])
             || left.is_primary_checkout != right.is_primary_checkout
             || left.branch_divergence != right.branch_divergence
             || left.detected_ports != right.detected_ports
+            || left.managed_processes != right.managed_processes
     })
+}
+
+fn managed_processes_for_worktree(
+    repo_root: &Path,
+    worktree_path: &Path,
+) -> Vec<ManagedWorktreeProcess> {
+    let mut processes = Vec::new();
+
+    if paths_equivalent(repo_root, worktree_path) {
+        processes.extend(arbor_toml_processes_for_worktree(repo_root, worktree_path));
+    }
+    processes.extend(procfile_processes_for_worktree(worktree_path));
+
+    processes
+}
+
+fn arbor_toml_processes_for_worktree(
+    repo_root: &Path,
+    worktree_path: &Path,
+) -> Vec<ManagedWorktreeProcess> {
+    let Some(config) = repo_config::load_repo_config(repo_root) else {
+        return Vec::new();
+    };
+
+    config
+        .processes
+        .into_iter()
+        .filter(|process| !process.name.trim().is_empty() && !process.command.trim().is_empty())
+        .map(|process| ManagedWorktreeProcess {
+            id: managed_process_id(ProcessSource::ArborToml, worktree_path, &process.name),
+            name: process.name,
+            command: process.command,
+            working_dir: process
+                .working_dir
+                .as_deref()
+                .map(|dir| repo_root.join(dir))
+                .unwrap_or_else(|| repo_root.to_path_buf()),
+            source: ProcessSource::ArborToml,
+        })
+        .collect()
+}
+
+fn procfile_processes_for_worktree(worktree_path: &Path) -> Vec<ManagedWorktreeProcess> {
+    match procfile::read_procfile(worktree_path) {
+        Ok(Some(entries)) => entries
+            .into_iter()
+            .map(|entry| ManagedWorktreeProcess {
+                id: managed_process_id(ProcessSource::Procfile, worktree_path, &entry.name),
+                name: entry.name,
+                command: entry.command,
+                working_dir: worktree_path.to_path_buf(),
+                source: ProcessSource::Procfile,
+            })
+            .collect(),
+        Ok(None) => Vec::new(),
+        Err(error) => {
+            tracing::warn!(path = %worktree_path.display(), %error, "failed to read Procfile");
+            Vec::new()
+        },
+    }
+}
+
+fn managed_process_id(source: ProcessSource, worktree_path: &Path, process_name: &str) -> String {
+    format!(
+        "{}:{}:{process_name}",
+        managed_process_source_label(source),
+        worktree_path.display()
+    )
+}
+
+fn managed_process_source_label(source: ProcessSource) -> &'static str {
+    match source {
+        ProcessSource::ArborToml => "arbor-toml",
+        ProcessSource::Procfile => "procfile",
+    }
+}
+
+fn managed_process_source_display_name(source: ProcessSource) -> &'static str {
+    match source {
+        ProcessSource::ArborToml => "arbor.toml",
+        ProcessSource::Procfile => "Procfile",
+    }
+}
+
+fn managed_process_title(source: ProcessSource, process_name: &str) -> String {
+    managed_process_session_title(source, process_name)
+}
+
+fn managed_process_id_from_title(worktree_path: &Path, title: &str) -> Option<String> {
+    managed_process_source_and_name_from_title(title)
+        .map(|(source, name)| managed_process_id(source, worktree_path, name))
+}
+
+fn managed_process_session_is_active(session: &TerminalSession) -> bool {
+    session.is_initializing || session.state == TerminalState::Running
 }
 
 fn next_active_worktree_index(
@@ -6574,6 +6684,7 @@ fn persisted_right_pane_tab(tab: RightPaneTab) -> ui_state_store::PersistedRight
     match tab {
         RightPaneTab::Changes => ui_state_store::PersistedRightPaneTab::Changes,
         RightPaneTab::FileTree => ui_state_store::PersistedRightPaneTab::FileTree,
+        RightPaneTab::Procfile => ui_state_store::PersistedRightPaneTab::Procfile,
         RightPaneTab::Notes => ui_state_store::PersistedRightPaneTab::Notes,
     }
 }
@@ -6584,6 +6695,7 @@ fn right_pane_tab_from_persisted(
     match tab.unwrap_or(ui_state_store::PersistedRightPaneTab::Changes) {
         ui_state_store::PersistedRightPaneTab::Changes => RightPaneTab::Changes,
         ui_state_store::PersistedRightPaneTab::FileTree => RightPaneTab::FileTree,
+        ui_state_store::PersistedRightPaneTab::Procfile => RightPaneTab::Procfile,
         ui_state_store::PersistedRightPaneTab::Notes => RightPaneTab::Notes,
     }
 }
@@ -8414,19 +8526,19 @@ fn derive_branch_name_with_repo_config(
     github_login: Option<&str>,
 ) -> String {
     let base_name = derive_branch_name(worktree_name);
-    let Some(config) = arbor_core::repo_config::load_repo_config(repo_root) else {
+    let Some(config) = repo_config::load_repo_config(repo_root) else {
         return base_name;
     };
 
     let prefix = match config.branch.prefix_mode {
-        Some(arbor_core::repo_config::RepoBranchPrefixMode::None) | None => None,
-        Some(arbor_core::repo_config::RepoBranchPrefixMode::GitAuthor) => {
+        Some(repo_config::RepoBranchPrefixMode::None) | None => None,
+        Some(repo_config::RepoBranchPrefixMode::GitAuthor) => {
             git_branch_prefix_from_author(repo_root)
         },
-        Some(arbor_core::repo_config::RepoBranchPrefixMode::GithubUser) => github_login
+        Some(repo_config::RepoBranchPrefixMode::GithubUser) => github_login
             .map(sanitize_worktree_name)
             .filter(|value| !value.is_empty()),
-        Some(arbor_core::repo_config::RepoBranchPrefixMode::Custom) => config
+        Some(repo_config::RepoBranchPrefixMode::Custom) => config
             .branch
             .prefix
             .as_deref()
@@ -8486,7 +8598,7 @@ fn load_task_templates_for_repo(repo_root: &Path) -> Vec<TaskTemplate> {
 }
 
 fn repo_task_templates_dir(repo_root: &Path) -> PathBuf {
-    let relative_dir = arbor_core::repo_config::load_repo_config(repo_root)
+    let relative_dir = repo_config::load_repo_config(repo_root)
         .and_then(|config| config.tasks.directory)
         .unwrap_or_else(|| ".arbor/tasks".to_owned());
     repo_root.join(relative_dir)
@@ -8734,6 +8846,7 @@ mod tests {
             agent::AgentState,
             changes::{ChangeKind, ChangedFile, DiffLineSummary},
             daemon,
+            process::ProcessSource,
             repo_config::RepoConfig,
         },
         gpui::{Keystroke, point, px},
@@ -8757,6 +8870,7 @@ mod tests {
             id: 1,
             daemon_session_id: "daemon-test-1".to_owned(),
             worktree_path: PathBuf::from("/tmp/worktree"),
+            managed_process_id: None,
             title: "term-1".to_owned(),
             last_command: None,
             pending_command: String::new(),
@@ -8817,6 +8931,7 @@ mod tests {
                 deletions: 1,
             }),
             detected_ports: vec![],
+            managed_processes: vec![],
             recent_turns: vec![],
             stuck_turn_count: 0,
             recent_agent_sessions: vec![],
@@ -10631,5 +10746,86 @@ Review the current branch and summarize the highest-risk changes.
             task.prompt,
             "Review the current branch and summarize the highest-risk changes."
         );
+    }
+
+    #[test]
+    fn managed_process_title_round_trips_to_process_id() {
+        let worktree_path = Path::new("/tmp/repo");
+        assert_eq!(
+            crate::managed_process_id_from_title(
+                worktree_path,
+                &crate::managed_process_title(ProcessSource::Procfile, "web"),
+            ),
+            Some(crate::managed_process_id(
+                ProcessSource::Procfile,
+                worktree_path,
+                "web",
+            ))
+        );
+        assert_eq!(
+            crate::managed_process_id_from_title(
+                worktree_path,
+                &crate::managed_process_title(ProcessSource::ArborToml, "worker"),
+            ),
+            Some(crate::managed_process_id(
+                ProcessSource::ArborToml,
+                worktree_path,
+                "worker",
+            ))
+        );
+    }
+
+    #[test]
+    fn managed_processes_for_primary_worktree_include_arbor_toml_processes() {
+        let unique_suffix = match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
+            Ok(duration) => duration.as_nanos(),
+            Err(error) => panic!("current time should be after the unix epoch: {error}"),
+        };
+        let repo_root = env::temp_dir().join(format!("arbor-managed-processes-{unique_suffix}"));
+        let linked_worktree = repo_root.join("worktrees").join("feature");
+
+        if let Err(error) = fs::create_dir_all(&linked_worktree) {
+            panic!("linked worktree dir should be created: {error}");
+        }
+        if let Err(error) = fs::write(
+            repo_root.join("arbor.toml"),
+            "[[processes]]\nname = \"worker\"\ncommand = \"cargo run -- worker\"\nworking_dir = \"backend\"\n",
+        ) {
+            panic!("arbor.toml should be written: {error}");
+        }
+
+        let primary_processes = crate::managed_processes_for_worktree(&repo_root, &repo_root);
+        assert!(primary_processes.iter().any(|process| {
+            process.source == ProcessSource::ArborToml
+                && process.name == "worker"
+                && process.working_dir == repo_root.join("backend")
+        }));
+
+        let linked_processes = crate::managed_processes_for_worktree(&repo_root, &linked_worktree);
+        assert!(
+            !linked_processes
+                .iter()
+                .any(|process| process.source == ProcessSource::ArborToml)
+        );
+
+        if let Err(error) = fs::remove_dir_all(&repo_root) {
+            panic!("temp repo root should be removed: {error}");
+        }
+    }
+
+    #[test]
+    fn completed_managed_process_sessions_are_not_active() {
+        let mut session = session_with_styled_line("", 0xffffff, 0x000000, None);
+        session.managed_process_id = Some("procfile:/tmp/worktree:web".to_owned());
+        session.is_initializing = false;
+        session.state = TerminalState::Completed;
+        assert!(!crate::managed_process_session_is_active(&session));
+
+        session.state = TerminalState::Running;
+        assert!(crate::managed_process_session_is_active(&session));
+
+        session.is_initializing = true;
+        session.state = TerminalState::Completed;
+        assert!(crate::managed_process_session_is_active(&session));
     }
 }

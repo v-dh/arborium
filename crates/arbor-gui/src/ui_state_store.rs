@@ -60,6 +60,7 @@ pub enum PersistedSidebarSelection {
 pub enum PersistedRightPaneTab {
     Changes,
     FileTree,
+    Procfile,
     Notes,
 }
 

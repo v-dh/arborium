@@ -63,6 +63,7 @@ export type ProcessInfo = {
 };
 
 export type AgentSession = {
+  session_id: string;
   cwd: string;
   state: "working" | "waiting";
   updated_at_unix_ms: number;
@@ -70,7 +71,8 @@ export type AgentSession = {
 
 export type AgentActivityWsEvent =
   | { type: "snapshot"; sessions: AgentSession[] }
-  | { type: "update"; session: AgentSession };
+  | { type: "update"; session: AgentSession }
+  | { type: "clear"; session_id: string };
 
 export type WsClientEvent =
   | { type: "resize"; cols: number; rows: number }

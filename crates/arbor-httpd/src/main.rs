@@ -147,6 +147,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let daemon_store = JsonDaemonSessionStore::default();
     let (agent_broadcast, _) = tokio::sync::broadcast::channel::<AgentWsEvent>(64);
+    let (terminal_activity_tx, mut terminal_activity_rx) =
+        tokio::sync::mpsc::unbounded_channel::<terminal_daemon::TerminalActivityEvent>();
 
     // Initialize process manager — scan repository roots for arbor.toml files
     let repository_store = repository_store::default_repository_store();
@@ -194,7 +196,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let state = AppState {
         repository_store: repository_store.clone(),
-        daemon: Arc::new(Mutex::new(LocalTerminalDaemon::new(daemon_store))),
+        daemon: Arc::new(Mutex::new(LocalTerminalDaemon::new(
+            daemon_store,
+            Some(terminal_activity_tx),
+        ))),
         process_manager: Arc::new(Mutex::new(process_manager)),
         #[cfg(feature = "symphony")]
         symphony,
@@ -208,6 +213,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         shutdown_signal: Arc::new(tokio::sync::Notify::new()),
         auth_state: auth_state.clone(),
     };
+
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            while let Some(event) = terminal_activity_rx.recv().await {
+                apply_terminal_activity_event(&state, event).await;
+            }
+        });
+    }
 
     // Spawn background task to monitor process lifecycle
     {
@@ -359,10 +373,14 @@ mod tests {
     use {
         super::*,
         crate::{
-            repository_store::JsonRepositoryStore, routes::process_ws_client_message,
-            terminal_daemon::SessionEvent,
+            repository_store::JsonRepositoryStore,
+            routes::{apply_terminal_activity_event, process_ws_client_message},
+            terminal_daemon::{SessionEvent, TerminalActivityEvent},
         },
-        arbor_core::daemon::{CreateOrAttachRequest, KillRequest, TerminalDaemon},
+        arbor_core::{
+            agent::AgentState,
+            daemon::{CreateOrAttachRequest, KillRequest, TerminalDaemon},
+        },
         axum::{
             Json,
             body::Bytes,
@@ -450,6 +468,45 @@ mod tests {
         assert_eq!(echoed, payload);
 
         kill_session(&state, &session_id).await;
+    }
+
+    #[tokio::test]
+    async fn terminal_activity_events_are_keyed_by_session_id() {
+        let temp = match tempfile::tempdir() {
+            Ok(temp) => temp,
+            Err(error) => panic!("failed to create temp dir: {error}"),
+        };
+        let state = test_app_state(temp.path().to_path_buf());
+
+        apply_terminal_activity_event(&state, TerminalActivityEvent::Update {
+            session_id: "daemon-1".into(),
+            cwd: PathBuf::from("/tmp/repo/worktree"),
+            state: AgentState::Waiting,
+        })
+        .await;
+        apply_terminal_activity_event(&state, TerminalActivityEvent::Update {
+            session_id: "daemon-2".into(),
+            cwd: PathBuf::from("/tmp/repo/worktree"),
+            state: AgentState::Waiting,
+        })
+        .await;
+
+        {
+            let sessions = state.agent_sessions.lock().await;
+            assert_eq!(sessions.len(), 2);
+            assert!(sessions.contains_key("terminal:daemon-1"));
+            assert!(sessions.contains_key("terminal:daemon-2"));
+        }
+
+        apply_terminal_activity_event(&state, TerminalActivityEvent::Clear {
+            session_id: "daemon-1".into(),
+        })
+        .await;
+
+        let sessions = state.agent_sessions.lock().await;
+        assert_eq!(sessions.len(), 1);
+        assert!(!sessions.contains_key("terminal:daemon-1"));
+        assert!(sessions.contains_key("terminal:daemon-2"));
     }
 
     #[test]
@@ -698,11 +755,15 @@ mod tests {
             repo_root.join("repositories.json"),
         ));
         let (agent_broadcast, _) = tokio::sync::broadcast::channel(16);
+        let (terminal_activity_tx, _terminal_activity_rx) = tokio::sync::mpsc::unbounded_channel();
         let (log_broadcast, _) = tokio::sync::broadcast::channel(16);
 
         AppState {
             repository_store,
-            daemon: Arc::new(Mutex::new(LocalTerminalDaemon::new(daemon_store))),
+            daemon: Arc::new(Mutex::new(LocalTerminalDaemon::new(
+                daemon_store,
+                Some(terminal_activity_tx),
+            ))),
             process_manager: Arc::new(Mutex::new(ProcessManager::new(repo_root.clone()))),
             task_scheduler: Arc::new(Mutex::new(TaskScheduler::new(repo_root))),
             #[cfg(feature = "symphony")]

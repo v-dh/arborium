@@ -43,9 +43,6 @@ fn install_app_menu_and_keys(cx: &mut App) {
         KeyBinding::new("cmd-shift-n", OpenCreateWorktree, None),
         KeyBinding::new("cmd-shift-r", RefreshWorktrees, None),
         KeyBinding::new("cmd-alt-r", RefreshChanges, None),
-        KeyBinding::new("cmd-1", UseEmbeddedBackend, None),
-        KeyBinding::new("cmd-2", UseAlacrittyBackend, None),
-        KeyBinding::new("cmd-3", UseGhosttyBackend, None),
         KeyBinding::new("cmd-\\", ToggleLeftPane, None),
         KeyBinding::new("cmd-[", NavigateWorktreeBack, None),
         KeyBinding::new("cmd-]", NavigateWorktreeForward, None),
@@ -108,8 +105,6 @@ fn build_app_menus(discovered_daemons: &[mdns_browser::DiscoveredDaemon]) -> Vec
                 MenuItem::separator(),
                 MenuItem::action("Edit Presets...", OpenManagePresets),
                 MenuItem::action("Custom Presets...", OpenManageRepoPresets),
-                MenuItem::separator(),
-                MenuItem::action("Use Embedded Backend", UseEmbeddedBackend),
             ],
         },
         Menu {

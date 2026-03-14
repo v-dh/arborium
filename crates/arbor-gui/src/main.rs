@@ -4997,8 +4997,7 @@ fn reconcile_worktree_agent_activity(
         }
 
         if allow_waiting_transitions
-            && next_state == Some(AgentState::Waiting)
-            && previous_state != Some(AgentState::Waiting)
+            && agent_waiting_transition_detected(previous_state, next_state)
             && let Some(epoch) = transition_epoch
         {
             waiting_transitions.push(AgentWaitingTransitionRequest {
@@ -5015,6 +5014,13 @@ fn reconcile_worktree_agent_activity(
     for request in waiting_transitions {
         app.spawn_agent_waiting_transition(request, cx);
     }
+}
+
+fn agent_waiting_transition_detected(
+    previous_state: Option<AgentState>,
+    next_state: Option<AgentState>,
+) -> bool {
+    previous_state == Some(AgentState::Working) && next_state == Some(AgentState::Waiting)
 }
 
 #[derive(Clone)]
@@ -8230,6 +8236,22 @@ mod tests {
 
         let attention = crate::worktree_attention_indicator(&worktree);
         assert_eq!(attention.label, "Stuck");
+    }
+
+    #[test]
+    fn agent_waiting_transition_requires_prior_working_state() {
+        assert!(crate::agent_waiting_transition_detected(
+            Some(AgentState::Working),
+            Some(AgentState::Waiting),
+        ));
+        assert!(!crate::agent_waiting_transition_detected(
+            None,
+            Some(AgentState::Waiting),
+        ));
+        assert!(!crate::agent_waiting_transition_detected(
+            Some(AgentState::Waiting),
+            Some(AgentState::Waiting),
+        ));
     }
 
     #[test]

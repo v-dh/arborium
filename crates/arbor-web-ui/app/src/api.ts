@@ -8,6 +8,13 @@ import type {
   ProcessInfo,
   ProcessStatus,
   ProcessSource,
+  Issue,
+  IssueReview,
+  IssueReviewKind,
+  IssueListResponse,
+  IssueSource,
+  ManagedWorktreePreview,
+  WorktreeMutationResponse,
   WsServerEvent,
   WsClientEvent,
 } from "./types";
@@ -177,6 +184,172 @@ export async function fetchChangedFiles(worktreePath: string): Promise<ChangedFi
     }
   }
   return files;
+}
+
+function parseIssueSource(item: unknown): IssueSource | null {
+  if (!isRecord(item)) return null;
+  const provider = readString(item["provider"]);
+  const label = readString(item["label"]);
+  const repository = readString(item["repository"]);
+  if (provider === null || label === null || repository === null) {
+    return null;
+  }
+  return {
+    provider,
+    label,
+    repository,
+    url: readString(item["url"]),
+  };
+}
+
+function parseIssueReviewKind(value: unknown): IssueReviewKind | null {
+  if (value === "pull_request" || value === "merge_request") {
+    return value;
+  }
+  return null;
+}
+
+function parseIssueReview(item: unknown): IssueReview | null {
+  if (!isRecord(item)) return null;
+  const kind = parseIssueReviewKind(item["kind"]);
+  const label = readString(item["label"]);
+  if (kind === null || label === null) {
+    return null;
+  }
+  return {
+    kind,
+    label,
+    url: readString(item["url"]),
+  };
+}
+
+function parseIssue(item: unknown): Issue | null {
+  if (!isRecord(item)) return null;
+  const id = readString(item["id"]);
+  const displayId = readString(item["display_id"]);
+  const title = readString(item["title"]);
+  const state = readString(item["state"]);
+  const suggestedWorktreeName = readString(item["suggested_worktree_name"]);
+  if (
+    id === null ||
+    displayId === null ||
+    title === null ||
+    state === null ||
+    suggestedWorktreeName === null
+  ) {
+    return null;
+  }
+  return {
+    id,
+    display_id: displayId,
+    title,
+    state,
+    url: readString(item["url"]),
+    suggested_worktree_name: suggestedWorktreeName,
+    updated_at: readString(item["updated_at"]),
+    linked_branch: readString(item["linked_branch"]),
+    linked_review: parseIssueReview(item["linked_review"]),
+  };
+}
+
+export async function fetchIssues(repoRoot: string): Promise<IssueListResponse> {
+  const raw = await fetchJson(`/api/v1/issues?repo_root=${encodeURIComponent(repoRoot)}`);
+  if (!isRecord(raw)) throw new Error("issues payload is not an object");
+
+  const issues: Issue[] = [];
+  const rawIssues = raw["issues"];
+  if (Array.isArray(rawIssues)) {
+    for (const item of rawIssues) {
+      const issue = parseIssue(item);
+      if (issue !== null) issues.push(issue);
+    }
+  }
+
+  return {
+    source: parseIssueSource(raw["source"]),
+    issues,
+    notice: readString(raw["notice"]),
+  };
+}
+
+type ManagedWorktreePreviewRequest = {
+  repo_root: string;
+  worktree_name: string;
+};
+
+type CreateManagedWorktreeRequest = {
+  repo_root: string;
+  worktree_name: string;
+};
+
+async function postJson(url: string, body: unknown): Promise<unknown> {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  if (response.status === 401) {
+    window.location.href = "/login";
+    throw new Error("authentication required");
+  }
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(text || `request failed (${response.status}) for ${url}`);
+  }
+  return response.json();
+}
+
+export async function previewManagedWorktree(
+  repoRoot: string,
+  worktreeName: string,
+): Promise<ManagedWorktreePreview> {
+  const payload: ManagedWorktreePreviewRequest = {
+    repo_root: repoRoot,
+    worktree_name: worktreeName,
+  };
+  const raw = await postJson("/api/v1/worktrees/managed/preview", payload);
+  if (!isRecord(raw)) throw new Error("managed worktree preview payload is not an object");
+  const sanitizedWorktreeName = readString(raw["sanitized_worktree_name"]);
+  const branch = readString(raw["branch"]);
+  const path = readString(raw["path"]);
+  if (sanitizedWorktreeName === null || branch === null || path === null) {
+    throw new Error("managed worktree preview is missing required fields");
+  }
+  return {
+    sanitized_worktree_name: sanitizedWorktreeName,
+    branch,
+    path,
+  };
+}
+
+export async function createManagedWorktree(
+  repoRoot: string,
+  worktreeName: string,
+): Promise<WorktreeMutationResponse> {
+  const payload: CreateManagedWorktreeRequest = {
+    repo_root: repoRoot,
+    worktree_name: worktreeName,
+  };
+  const raw = await postJson("/api/v1/worktrees/managed", payload);
+  if (!isRecord(raw)) throw new Error("managed worktree response is not an object");
+
+  const repoRootValue = readString(raw["repo_root"]);
+  const path = readString(raw["path"]);
+  const message = readString(raw["message"]);
+  if (repoRootValue === null || path === null || message === null) {
+    throw new Error("managed worktree response is missing required fields");
+  }
+
+  return {
+    repo_root: repoRootValue,
+    path,
+    branch: readString(raw["branch"]),
+    deleted_branch: readString(raw["deleted_branch"]),
+    message,
+  };
 }
 
 export type CreateTerminalResult = {

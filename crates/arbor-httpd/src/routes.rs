@@ -1,6 +1,8 @@
 use {
     crate::{
         github_service::GitHubPrService,
+        issue_linking::{self, LinkedIssueWorktree},
+        managed_worktree::preview_managed_worktree as build_managed_worktree_preview,
         process_manager::ProcessEvent,
         repository_store, task_scheduler,
         terminal_daemon::{LocalTerminalDaemonError, SessionEvent, TerminalActivityEvent},
@@ -22,10 +24,12 @@ use {
         worktree_scripts::{WorktreeScriptContext, WorktreeScriptPhase, run_worktree_scripts},
     },
     arbor_daemon_client::{
-        AgentSessionDto, ChangedFileDto, CommitWorktreeRequest, CreateTerminalRequest,
-        CreateTerminalResponse, CreateWorktreeRequest, DeleteWorktreeRequest, GitActionResponse,
-        HealthResponse, PushWorktreeRequest, RepositoryDto, TerminalResizeRequest,
-        TerminalSignalRequest, WorktreeDto, WorktreeMutationResponse,
+        AgentSessionDto, ChangedFileDto, CommitWorktreeRequest, CreateManagedWorktreeRequest,
+        CreateTerminalRequest, CreateTerminalResponse, CreateWorktreeRequest,
+        DeleteWorktreeRequest, GitActionResponse, HealthResponse, IssueListResponse,
+        ManagedWorktreePreviewRequest, ManagedWorktreePreviewResponse, PushWorktreeRequest,
+        RepositoryDto, TerminalResizeRequest, TerminalSignalRequest, WorktreeDto,
+        WorktreeMutationResponse,
     },
     axum::{
         Json,
@@ -182,6 +186,112 @@ pub(crate) async fn list_repositories(
     Ok(Json(repositories))
 }
 
+pub(crate) async fn list_repository_issues(
+    State(state): State<AppState>,
+    Query(query): Query<IssuesQuery>,
+) -> ApiResult<IssueListResponse> {
+    let repo_root = PathBuf::from(query.repo_root);
+    let issue_service = state.issue_service.clone();
+    let repo_root_for_issue_fetch = repo_root.clone();
+    let mut issues = tokio::task::spawn_blocking(move || {
+        issue_service.list_repository_issues(&repo_root_for_issue_fetch)
+    })
+    .await
+    .map_err(|error| internal_error(format!("failed to join issue fetch task: {error}")))?
+    .map_err(internal_error)?;
+    if let Err(error) = enrich_issue_list_with_local_links(&state, &repo_root, &mut issues).await {
+        tracing::warn!(
+            repo_root = %repo_root.display(),
+            %error,
+            "failed to enrich repository issues with local worktree links"
+        );
+    }
+    Ok(Json(issues))
+}
+
+async fn enrich_issue_list_with_local_links(
+    state: &AppState,
+    repo_root: &Path,
+    issues_response: &mut IssueListResponse,
+) -> Result<(), String> {
+    let linked_worktrees = collect_linked_issue_worktrees(state, repo_root).await?;
+    issue_linking::enrich_issues_with_worktree_links(
+        repo_root,
+        &mut issues_response.issues,
+        &linked_worktrees,
+    );
+    Ok(())
+}
+
+async fn collect_linked_issue_worktrees(
+    state: &AppState,
+    repo_root: &Path,
+) -> Result<Vec<LinkedIssueWorktree>, String> {
+    let entries = worktree::list(repo_root).map_err(|error| {
+        format!(
+            "failed to list worktrees for `{}`: {error}",
+            repo_root.display()
+        )
+    })?;
+
+    let repo_slug = {
+        let mut repo_cache = state.repo_cache.lock().await;
+        let (repo_slug, _) = github_repo_slug_cached(&mut repo_cache, repo_root);
+        repo_slug
+    };
+
+    let worktrees = issue_worktree_data_from_entries(entries);
+
+    let pr_futures: Vec<_> = worktrees
+        .iter()
+        .map(|worktree| {
+            let cache = state.pr_cache.clone();
+            let github_service = state.github_service.clone();
+            let repo_slug = repo_slug.clone();
+            let branch = worktree.branch.clone();
+            async move {
+                lookup_pr_cached(cache, github_service, repo_slug.as_deref(), &branch, false).await
+            }
+        })
+        .collect();
+
+    let pr_results = futures_util::future::join_all(pr_futures).await;
+
+    Ok(worktrees
+        .into_iter()
+        .zip(pr_results)
+        .map(|(worktree, (pr_number, pr_url))| LinkedIssueWorktree {
+            path: worktree.path,
+            branch: worktree.branch,
+            pr_number,
+            pr_url,
+            last_activity_unix_ms: worktree.last_activity_unix_ms,
+        })
+        .collect())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IssueWorktreeData {
+    path: PathBuf,
+    branch: String,
+    last_activity_unix_ms: Option<u64>,
+}
+
+fn issue_worktree_data_from_entries(entries: Vec<worktree::Worktree>) -> Vec<IssueWorktreeData> {
+    entries
+        .into_iter()
+        .map(|entry| IssueWorktreeData {
+            last_activity_unix_ms: worktree::last_git_activity_ms(&entry.path),
+            branch: entry
+                .branch
+                .as_deref()
+                .map(short_branch)
+                .unwrap_or_else(|| "-".to_owned()),
+            path: entry.path,
+        })
+        .collect()
+}
+
 pub(crate) async fn list_worktrees(
     State(state): State<AppState>,
     Query(query): Query<WorktreeQuery>,
@@ -324,6 +434,56 @@ pub(crate) async fn create_worktree(
         .filter(|value| !value.is_empty())
         .map(str::to_owned);
 
+    create_worktree_at(
+        repo_root,
+        worktree_path,
+        branch,
+        request.detach,
+        request.force,
+    )
+}
+
+pub(crate) async fn preview_managed_worktree(
+    Json(request): Json<ManagedWorktreePreviewRequest>,
+) -> ApiResult<ManagedWorktreePreviewResponse> {
+    let repo_root = PathBuf::from(&request.repo_root);
+    let repo_root = worktree::repo_root(&repo_root)
+        .map_err(|error| internal_error(format!("failed to resolve repository root: {error}")))?;
+    let preview = build_managed_worktree_preview(&repo_root, &request.worktree_name)
+        .map_err(internal_error)?;
+
+    Ok(Json(ManagedWorktreePreviewResponse {
+        sanitized_worktree_name: preview.sanitized_worktree_name,
+        branch: preview.branch_name,
+        path: preview.worktree_path.display().to_string(),
+    }))
+}
+
+pub(crate) async fn create_managed_worktree(
+    Json(request): Json<CreateManagedWorktreeRequest>,
+) -> ApiResult<WorktreeMutationResponse> {
+    let repo_root = PathBuf::from(&request.repo_root);
+    let repo_root = worktree::repo_root(&repo_root)
+        .map_err(|error| internal_error(format!("failed to resolve repository root: {error}")))?;
+    let preview = build_managed_worktree_preview(&repo_root, &request.worktree_name)
+        .map_err(internal_error)?;
+
+    create_worktree_at(
+        repo_root,
+        preview.worktree_path,
+        Some(preview.branch_name),
+        Some(false),
+        Some(false),
+    )
+}
+
+fn create_worktree_at(
+    repo_root: PathBuf,
+    worktree_path: PathBuf,
+    branch: Option<String>,
+    detach: Option<bool>,
+    force: Option<bool>,
+) -> ApiResult<WorktreeMutationResponse> {
     if paths_equivalent(&repo_root, &worktree_path) {
         return Err(internal_error(
             "refusing to create a worktree over the primary checkout",
@@ -349,8 +509,8 @@ pub(crate) async fn create_worktree(
 
     worktree::add(&repo_root, &worktree_path, worktree::AddWorktreeOptions {
         branch: branch.as_deref(),
-        detach: request.detach.unwrap_or(false),
-        force: request.force.unwrap_or(false),
+        detach: detach.unwrap_or(false),
+        force: force.unwrap_or(false),
     })
     .map_err(|error| internal_error(format!("failed to create worktree: {error}")))?;
 
@@ -2188,7 +2348,7 @@ async fn lookup_pr_cached(
         None => return (None, None),
     };
 
-    let cache_key = format!("{slug}:{branch}");
+    let cache_key = pr_cache_key(slug, branch, is_primary);
 
     // Check cache and evict expired entries
     {
@@ -2216,9 +2376,111 @@ async fn lookup_pr_cached(
     (pr_number, pr_url)
 }
 
+fn pr_cache_key(slug: &str, branch: &str, is_primary: bool) -> String {
+    format!(
+        "{slug}:{branch}:{}",
+        if is_primary {
+            "primary"
+        } else {
+            "linked"
+        }
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use {
+        super::*,
+        std::sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    struct MockGitHubPrService {
+        lookup_count: AtomicUsize,
+    }
+
+    impl MockGitHubPrService {
+        fn new() -> Self {
+            Self {
+                lookup_count: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl GitHubPrService for MockGitHubPrService {
+        fn lookup_pr_for_branch(
+            &self,
+            _repo_slug: Option<String>,
+            branch: String,
+            is_primary: bool,
+        ) -> futures_util::future::BoxFuture<'static, (Option<u64>, Option<String>)> {
+            self.lookup_count.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                if is_primary {
+                    (None, None)
+                } else {
+                    let url = format!("https://github.com/penso/arbor/pull/{}", 55);
+                    let _ = branch;
+                    (Some(55), Some(url))
+                }
+            })
+        }
+    }
+
+    #[test]
+    fn issue_worktree_data_from_entries_keeps_primary_checkout() {
+        let repo_root = PathBuf::from("/tmp/arbor");
+        let entries = vec![
+            worktree::Worktree {
+                path: repo_root.clone(),
+                branch: Some("refs/heads/issue-55".to_owned()),
+                ..Default::default()
+            },
+            worktree::Worktree {
+                path: repo_root.join("../issue-55-linked"),
+                branch: Some("refs/heads/issue-55-linked".to_owned()),
+                ..Default::default()
+            },
+        ];
+
+        let worktrees = issue_worktree_data_from_entries(entries);
+
+        assert_eq!(worktrees.len(), 2);
+        assert_eq!(worktrees[0].path, repo_root);
+        assert_eq!(worktrees[0].branch, "issue-55");
+    }
+
+    #[tokio::test]
+    async fn lookup_pr_cached_distinguishes_primary_and_linked_results() {
+        let cache = Arc::new(Mutex::new(HashMap::new()));
+        let github_service = Arc::new(MockGitHubPrService::new());
+
+        let primary = lookup_pr_cached(
+            cache.clone(),
+            github_service.clone(),
+            Some("penso/arbor"),
+            "issue-55",
+            true,
+        )
+        .await;
+        let linked = lookup_pr_cached(
+            cache,
+            github_service.clone(),
+            Some("penso/arbor"),
+            "issue-55",
+            false,
+        )
+        .await;
+
+        assert_eq!(primary, (None, None));
+        assert_eq!(
+            linked,
+            (
+                Some(55),
+                Some("https://github.com/penso/arbor/pull/55".to_owned()),
+            )
+        );
+        assert_eq!(github_service.lookup_count.load(Ordering::SeqCst), 2);
+    }
 
     #[test]
     fn notification_webhook_format_detects_provider_specific_urls() {

@@ -10,6 +10,7 @@ impl ArborWindow {
         let diff_summary = worktree.diff_summary;
         let branch_divergence = worktree.branch_divergence;
         let has_ports = !worktree.detected_ports.is_empty();
+        let show_pr_loading_indicator = should_show_worktree_pr_loading_indicator(worktree);
         let checks_expanded = self
             .expanded_pr_checks_worktree
             .as_ref()
@@ -159,7 +160,7 @@ impl ArborWindow {
             );
         }
 
-        if self.worktree_prs_loading {
+        if show_pr_loading_indicator {
             meta_row = meta_row.child(pr_loading_chip(&theme, "Refreshing PR"));
         }
 
@@ -376,7 +377,7 @@ impl ArborWindow {
         } else {
             card = card.child(div().h(px(1.)).bg(rgb(theme.border)).my_1());
 
-            if self.worktree_prs_loading {
+            if show_pr_loading_indicator {
                 card = card.child(pr_loading_row(&theme, "Refreshing PR details"));
             }
 
@@ -407,14 +408,14 @@ impl ArborWindow {
                             div()
                                 .text_xs()
                                 .text_color(rgb(theme.text_disabled))
-                                .child(if self.worktree_prs_loading {
+                                .child(if show_pr_loading_indicator {
                                     "Fetching GitHub details"
                                 } else {
                                     "GitHub details unavailable"
                                 }),
                         ),
                 );
-            } else if !self.worktree_prs_loading {
+            } else if !show_pr_loading_indicator {
                 card = card.child(
                     div()
                         .text_xs()

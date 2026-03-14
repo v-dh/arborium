@@ -1,5 +1,22 @@
-import type { Repository, Worktree, TerminalSession, ChangedFile, AgentSession, AgentActivityWsEvent, RightPaneTab } from "./types";
-import { fetchRepositories, fetchWorktrees, fetchTerminals, fetchChangedFiles } from "./api";
+import type {
+  Repository,
+  Worktree,
+  TerminalSession,
+  ChangedFile,
+  AgentSession,
+  AgentActivityWsEvent,
+  Issue,
+  IssueSource,
+  RightPanelTab,
+  RightPaneTab,
+} from "./types";
+import {
+  fetchRepositories,
+  fetchWorktrees,
+  fetchTerminals,
+  fetchChangedFiles,
+  fetchIssues,
+} from "./api";
 
 export type AppState = {
   repositories: Repository[];
@@ -7,6 +24,15 @@ export type AppState = {
   sessions: TerminalSession[];
   changedFiles: ChangedFile[];
   agentSessions: AgentSession[];
+  issues: Issue[];
+  issueSource: IssueSource | null;
+  issuesNotice: string | null;
+  issuesLoading: boolean;
+  issuesError: string | null;
+  issuesRepoRoot: string | null;
+  issuesLoadedRepoRoot: string | null;
+  issuesRequestGeneration: number;
+  rightPanelTab: RightPanelTab;
 
   selectedRepoRoot: string | null;
   selectedWorktreePath: string | null;
@@ -24,6 +50,15 @@ export function createInitialState(): AppState {
     sessions: [],
     changedFiles: [],
     agentSessions: [],
+    issues: [],
+    issueSource: null,
+    issuesNotice: null,
+    issuesLoading: false,
+    issuesError: null,
+    issuesRepoRoot: null,
+    issuesLoadedRepoRoot: null,
+    issuesRequestGeneration: 0,
+    rightPanelTab: "changes",
     selectedRepoRoot: null,
     selectedWorktreePath: null,
     activeSessionId: null,
@@ -55,102 +90,149 @@ export function updateState(partial: Partial<AppState>): void {
   notify();
 }
 
-let refreshInFlight = false;
+let refreshPromise: Promise<void> | null = null;
 
 export async function refresh(): Promise<void> {
-  if (refreshInFlight) return;
-  refreshInFlight = true;
-  updateState({ loading: true, error: null });
-
-  try {
-    const [repositories, worktrees, sessions] = await Promise.all([
-      fetchRepositories(),
-      fetchWorktrees(),
-      fetchTerminals(),
-    ]);
-
-    // Validate selections still exist, auto-select on first load
-    let selectedRepoRoot =
-      state.selectedRepoRoot !== null &&
-      repositories.some((r) => r.root === state.selectedRepoRoot)
-        ? state.selectedRepoRoot
-        : null;
-
-    // Auto-select first repo on initial load
-    if (selectedRepoRoot === null && repositories.length > 0) {
-      const firstRepository = repositories[0];
-      if (firstRepository !== undefined) {
-        selectedRepoRoot = firstRepository.root;
-      }
-    }
-
-    let selectedWorktreePath =
-      state.selectedWorktreePath !== null &&
-      worktrees.some((w) => w.path === state.selectedWorktreePath)
-        ? state.selectedWorktreePath
-        : null;
-
-    // Auto-select primary worktree (or first) for the selected repo on initial load
-    if (selectedWorktreePath === null && selectedRepoRoot !== null) {
-      const repoWorktrees = worktrees.filter((w) => w.repo_root === selectedRepoRoot);
-      const primary = repoWorktrees.find((w) => w.is_primary_checkout);
-      const first = primary ?? repoWorktrees[0];
-      if (first !== undefined) {
-        selectedWorktreePath = first.path;
-      }
-    }
-
-    let activeSessionId =
-      state.activeSessionId !== null &&
-      sessions.some((s) => s.session_id === state.activeSessionId)
-        ? state.activeSessionId
-        : null;
-
-    // Auto-select first running terminal for the selected worktree
-    const visibleSessions = selectedWorktreePath !== null
-      ? sessions.filter((s) => s.workspace_id === selectedWorktreePath || s.cwd === selectedWorktreePath)
-      : sessions;
-
-    // Clear active session if it doesn't belong to the selected worktree
-    if (activeSessionId !== null && selectedWorktreePath !== null) {
-      const belongs = visibleSessions.some((s) => s.session_id === activeSessionId);
-      if (!belongs) {
-        activeSessionId = null;
-      }
-    }
-
-    if (activeSessionId === null && visibleSessions.length > 0) {
-      const running = visibleSessions.find((s) => s.state === "running");
-      const first = running ?? visibleSessions[0];
-      if (first !== undefined) {
-        activeSessionId = first.session_id;
-      }
-    }
-
-    updateState({
-      repositories,
-      worktrees,
-      sessions,
-      selectedRepoRoot,
-      selectedWorktreePath,
-      activeSessionId,
-      loading: false,
-    });
-
-    // Fetch changed files for selected worktree
-    if (selectedWorktreePath !== null) {
-      refreshChangedFiles(selectedWorktreePath);
-    } else {
-      updateState({ changedFiles: [] });
-    }
-  } catch (error) {
-    updateState({
-      loading: false,
-      error: error instanceof Error ? error.message : "unknown request failure",
-    });
-  } finally {
-    refreshInFlight = false;
+  if (refreshPromise !== null) {
+    return refreshPromise;
   }
+
+  refreshPromise = (async () => {
+    updateState({ loading: true, error: null });
+
+    try {
+      const [repositories, worktrees, sessions] = await Promise.all([
+        fetchRepositories(),
+        fetchWorktrees(),
+        fetchTerminals(),
+      ]);
+
+      // Validate selections still exist, auto-select on first load
+      let selectedRepoRoot =
+        state.selectedRepoRoot !== null &&
+        repositories.some((r) => r.root === state.selectedRepoRoot)
+          ? state.selectedRepoRoot
+          : null;
+
+      // Auto-select first repo on initial load
+      if (selectedRepoRoot === null && repositories.length > 0) {
+        const firstRepository = repositories[0];
+        if (firstRepository !== undefined) {
+          selectedRepoRoot = firstRepository.root;
+        }
+      }
+
+      let selectedWorktreePath =
+        state.selectedWorktreePath !== null &&
+        worktrees.some((w) => w.path === state.selectedWorktreePath)
+          ? state.selectedWorktreePath
+          : null;
+
+      // Auto-select primary worktree (or first) for the selected repo on initial load
+      if (selectedWorktreePath === null && selectedRepoRoot !== null) {
+        const repoWorktrees = worktrees.filter((w) => w.repo_root === selectedRepoRoot);
+        const primary = repoWorktrees.find((w) => w.is_primary_checkout);
+        const first = primary ?? repoWorktrees[0];
+        if (first !== undefined) {
+          selectedWorktreePath = first.path;
+        }
+      }
+
+      if (selectedWorktreePath !== null) {
+        const selectedWorktree = worktrees.find((w) => w.path === selectedWorktreePath);
+        if (selectedWorktree !== undefined) {
+          selectedRepoRoot = selectedWorktree.repo_root;
+        }
+      }
+
+      let activeSessionId =
+        state.activeSessionId !== null &&
+        sessions.some((s) => s.session_id === state.activeSessionId)
+          ? state.activeSessionId
+          : null;
+
+      // Auto-select first running terminal for the selected worktree
+      const visibleSessions = selectedWorktreePath !== null
+        ? sessions.filter((s) => s.workspace_id === selectedWorktreePath || s.cwd === selectedWorktreePath)
+        : sessions;
+
+      // Clear active session if it doesn't belong to the selected worktree
+      if (activeSessionId !== null && selectedWorktreePath !== null) {
+        const belongs = visibleSessions.some((s) => s.session_id === activeSessionId);
+        if (!belongs) {
+          activeSessionId = null;
+        }
+      }
+
+      if (activeSessionId === null && visibleSessions.length > 0) {
+        const running = visibleSessions.find((s) => s.state === "running");
+        const first = running ?? visibleSessions[0];
+        if (first !== undefined) {
+          activeSessionId = first.session_id;
+        }
+      }
+
+      const nextIssuesRepoRoot = selectedIssueRepoRootForSelection(
+        worktrees,
+        selectedRepoRoot,
+        selectedWorktreePath,
+      );
+      const issueRepoChanged = nextIssuesRepoRoot !== state.issuesRepoRoot;
+      const shouldRefreshIssues =
+        state.rightPanelTab === "issues" &&
+        nextIssuesRepoRoot !== null &&
+        (issueRepoChanged || state.issuesLoadedRepoRoot !== nextIssuesRepoRoot);
+
+      updateState({
+        repositories,
+        worktrees,
+        sessions,
+        selectedRepoRoot,
+        selectedWorktreePath,
+        activeSessionId,
+        ...(issueRepoChanged
+          ? {
+              issues: [],
+              issueSource: null,
+              issuesNotice: null,
+              issuesError: null,
+              issuesLoading: false,
+              issuesRepoRoot: nextIssuesRepoRoot,
+              issuesLoadedRepoRoot: null,
+              issuesRequestGeneration: state.issuesRequestGeneration,
+            }
+          : {}),
+        loading: false,
+      });
+
+      // Fetch changed files for selected worktree
+      if (selectedWorktreePath !== null) {
+        refreshChangedFiles(selectedWorktreePath);
+      } else {
+        updateState({ changedFiles: [] });
+      }
+
+      if (shouldRefreshIssues) {
+        refreshIssues(nextIssuesRepoRoot, true);
+      }
+    } catch (error) {
+      updateState({
+        loading: false,
+        error: error instanceof Error ? error.message : "unknown request failure",
+      });
+    } finally {
+      refreshPromise = null;
+    }
+  })();
+
+  return refreshPromise;
+}
+
+export async function forceRefresh(): Promise<void> {
+  if (refreshPromise !== null) {
+    await refreshPromise;
+  }
+  await refresh();
 }
 
 export function refreshChangedFiles(worktreePath: string): void {
@@ -167,6 +249,16 @@ export function refreshChangedFiles(worktreePath: string): void {
 
 export function selectWorktree(path: string | null): void {
   const newPath = state.selectedWorktreePath === path ? null : path;
+  const selectedWorktree = newPath !== null
+    ? state.worktrees.find((worktree) => worktree.path === newPath) ?? null
+    : null;
+  const selectedRepoRoot = selectedWorktree?.repo_root ?? state.selectedRepoRoot;
+  const nextIssuesRepoRoot = selectedIssueRepoRootForSelection(
+    state.worktrees,
+    selectedRepoRoot,
+    newPath,
+  );
+  const issueRepoChanged = nextIssuesRepoRoot !== state.issuesRepoRoot;
 
   // Auto-select a terminal for this worktree
   let activeSessionId = state.activeSessionId;
@@ -177,11 +269,37 @@ export function selectWorktree(path: string | null): void {
     const running = wtSessions.find((s) => s.state === "running");
     const first = running ?? wtSessions[0];
     activeSessionId = first?.session_id ?? null;
+  } else {
+    activeSessionId = null;
   }
 
-  updateState({ selectedWorktreePath: newPath, changedFiles: [], activeSessionId });
+  updateState({
+    selectedRepoRoot,
+    selectedWorktreePath: newPath,
+    changedFiles: [],
+    activeSessionId,
+    ...(issueRepoChanged
+      ? {
+          issues: [],
+          issueSource: null,
+          issuesNotice: null,
+          issuesError: null,
+          issuesLoading: false,
+          issuesRepoRoot: nextIssuesRepoRoot,
+          issuesLoadedRepoRoot: null,
+          issuesRequestGeneration: state.issuesRequestGeneration,
+        }
+      : {}),
+  });
   if (newPath !== null) {
     refreshChangedFiles(newPath);
+  }
+  if (
+    state.rightPanelTab === "issues" &&
+    nextIssuesRepoRoot !== null &&
+    (issueRepoChanged || state.issuesLoadedRepoRoot !== nextIssuesRepoRoot)
+  ) {
+    refreshIssues(nextIssuesRepoRoot, true);
   }
 }
 
@@ -189,10 +307,101 @@ export function setActiveSession(sessionId: string | null): void {
   updateState({ activeSessionId: sessionId });
 }
 
+export function setRightPanelTab(tab: RightPanelTab): void {
+  if (state.rightPanelTab === tab) return;
+  updateState({ rightPanelTab: tab });
+  if (tab === "issues") {
+    const repoRoot = selectedIssueRepoRoot();
+    if (repoRoot !== null) {
+      refreshIssues(
+        repoRoot,
+        state.issuesRepoRoot !== repoRoot || state.issuesLoadedRepoRoot !== repoRoot,
+      );
+    }
+  }
+}
+
+export function selectedIssueRepoRoot(): string | null {
+  return selectedIssueRepoRootForSelection(
+    state.worktrees,
+    state.selectedRepoRoot,
+    state.selectedWorktreePath,
+  );
+}
+
+export function refreshIssues(
+  repoRoot: string | null = selectedIssueRepoRoot(),
+  force = false,
+): void {
+  if (repoRoot === null) {
+    updateState({
+      issues: [],
+      issueSource: null,
+      issuesNotice: null,
+      issuesError: null,
+      issuesLoading: false,
+      issuesRepoRoot: null,
+      issuesLoadedRepoRoot: null,
+      issuesRequestGeneration: state.issuesRequestGeneration,
+    });
+    return;
+  }
+
+  if (!force && state.issuesLoading && state.issuesRepoRoot === repoRoot) {
+    return;
+  }
+
+  const requestGeneration = state.issuesRequestGeneration + 1;
+  updateState({
+    issuesLoading: true,
+    issuesError: null,
+    issuesNotice: null,
+    issuesRepoRoot: repoRoot,
+    issuesRequestGeneration: requestGeneration,
+  });
+
+  fetchIssues(repoRoot)
+    .then((response) => {
+      if (
+        selectedIssueRepoRoot() !== repoRoot ||
+        state.issuesRequestGeneration !== requestGeneration
+      ) {
+        return;
+      }
+      updateState({
+        issues: response.issues,
+        issueSource: response.source,
+        issuesNotice: response.notice,
+        issuesError: null,
+        issuesLoading: false,
+        issuesRepoRoot: repoRoot,
+        issuesLoadedRepoRoot: repoRoot,
+        issuesRequestGeneration: requestGeneration,
+      });
+    })
+    .catch((error) => {
+      if (
+        selectedIssueRepoRoot() !== repoRoot ||
+        state.issuesRequestGeneration !== requestGeneration
+      ) {
+        return;
+      }
+      updateState({
+        issues: [],
+        issueSource: null,
+        issuesNotice: null,
+        issuesError: error instanceof Error ? error.message : "failed to load issues",
+        issuesLoading: false,
+        issuesRepoRoot: repoRoot,
+        issuesLoadedRepoRoot: repoRoot,
+        issuesRequestGeneration: requestGeneration,
+      });
+    });
+}
+
 export function setRightPaneTab(tab: RightPaneTab): void {
   updateState({ rightPaneTab: tab });
 }
-
 export function filteredSessions(): TerminalSession[] {
   if (state.selectedWorktreePath === null) {
     return state.sessions;
@@ -200,6 +409,20 @@ export function filteredSessions(): TerminalSession[] {
   return state.sessions.filter(
     (s) => s.workspace_id === state.selectedWorktreePath || s.cwd === state.selectedWorktreePath,
   );
+}
+
+function selectedIssueRepoRootForSelection(
+  worktrees: Worktree[],
+  selectedRepoRoot: string | null,
+  selectedWorktreePath: string | null,
+): string | null {
+  if (selectedWorktreePath !== null) {
+    const worktree = worktrees.find((candidate) => candidate.path === selectedWorktreePath);
+    if (worktree !== undefined) {
+      return worktree.repo_root;
+    }
+  }
+  return selectedRepoRoot;
 }
 
 // ── Agent activity WebSocket ─────────────────────────────────────────

@@ -158,12 +158,73 @@ impl ArborWindow {
             compact_sidebar: Some(self.compact_sidebar),
             execution_mode: Some(self.execution_mode),
             preferred_checkout_kind: Some(self.preferred_checkout_kind),
-            sidebar_order: self.last_persisted_ui_state.sidebar_order.clone(),
+            sidebar_order: self.sidebar_order.clone(),
+            repository_sidebar_tabs: self.repository_sidebar_tabs_snapshot(),
+            selected_sidebar_selection: self.sidebar_selection_snapshot(),
+            right_pane_tab: Some(persisted_right_pane_tab(self.right_pane_tab)),
+            logs_tab_open: Some(self.logs_tab_open),
+            logs_tab_active: Some(self.logs_tab_active),
+            pull_request_cache: self.pull_request_cache_snapshot(),
         }
     }
 
-    fn sync_ui_state_store(&mut self, window: &Window, cx: &mut Context<Self>) {
-        let next_state = self.ui_state_snapshot(window);
+    fn queued_ui_state_base(&self) -> ui_state_store::UiState {
+        self.pending_ui_state_save
+            .clone()
+            .or_else(|| self.ui_state_save_in_flight.clone())
+            .unwrap_or_else(|| self.last_persisted_ui_state.clone())
+    }
+
+    fn repository_sidebar_tabs_snapshot(&self) -> HashMap<String, RepositorySidebarTab> {
+        self.repository_sidebar_tabs
+            .iter()
+            .filter(|(_, tab)| **tab != RepositorySidebarTab::Worktrees)
+            .map(|(group_key, tab)| (group_key.clone(), *tab))
+            .collect()
+    }
+
+    fn sidebar_selection_snapshot(&self) -> Option<ui_state_store::PersistedSidebarSelection> {
+        if let Some(outpost_index) = self.active_outpost_index {
+            return self.outposts.get(outpost_index).map(|outpost| {
+                ui_state_store::PersistedSidebarSelection::Outpost {
+                    repo_root: outpost.repo_root.display().to_string(),
+                    outpost_id: outpost.outpost_id.clone(),
+                }
+            });
+        }
+
+        if let Some(worktree) = self.active_worktree() {
+            return Some(ui_state_store::PersistedSidebarSelection::Worktree {
+                repo_root: worktree.repo_root.display().to_string(),
+                path: worktree.path.display().to_string(),
+            });
+        }
+
+        self.selected_repository().map(|repository| {
+            ui_state_store::PersistedSidebarSelection::Repository {
+                root: repository.root.display().to_string(),
+            }
+        })
+    }
+
+    fn pull_request_cache_snapshot(
+        &self,
+    ) -> HashMap<String, ui_state_store::CachedPullRequestState> {
+        self.worktrees
+            .iter()
+            .filter_map(|worktree| {
+                worktree
+                    .cached_pull_request_state()
+                    .map(|cached| (worktree_pull_request_cache_key(&worktree.path), cached))
+            })
+            .collect()
+    }
+
+    fn queue_ui_state_save(
+        &mut self,
+        next_state: ui_state_store::UiState,
+        cx: &mut Context<Self>,
+    ) {
         let queued_ui_state_save = next_pending_ui_state_save(
             &self.last_persisted_ui_state,
             self.pending_ui_state_save.as_ref(),
@@ -178,6 +239,10 @@ impl ArborWindow {
         }
 
         self.start_pending_ui_state_save(cx);
+    }
+
+    fn sync_ui_state_store(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.queue_ui_state_save(self.ui_state_snapshot(window), cx);
     }
 
     fn start_pending_ui_state_save(&mut self, cx: &mut Context<Self>) {
@@ -217,6 +282,33 @@ impl ArborWindow {
                 this.maybe_finish_quit_after_persistence_flush(cx);
             });
         }));
+    }
+
+    fn sync_pull_request_cache_store(&mut self, cx: &mut Context<Self>) {
+        let mut next_state = self.queued_ui_state_base();
+        next_state.pull_request_cache = self.pull_request_cache_snapshot();
+        self.queue_ui_state_save(next_state, cx);
+    }
+
+    fn sync_repository_sidebar_tabs_store(&mut self, cx: &mut Context<Self>) {
+        let mut next_state = self.queued_ui_state_base();
+        next_state.repository_sidebar_tabs = self.repository_sidebar_tabs_snapshot();
+        self.queue_ui_state_save(next_state, cx);
+    }
+
+    fn sync_sidebar_order_store(&mut self, cx: &mut Context<Self>) {
+        let mut next_state = self.queued_ui_state_base();
+        next_state.sidebar_order = self.sidebar_order.clone();
+        self.queue_ui_state_save(next_state, cx);
+    }
+
+    fn sync_navigation_ui_state_store(&mut self, cx: &mut Context<Self>) {
+        let mut next_state = self.queued_ui_state_base();
+        next_state.selected_sidebar_selection = self.sidebar_selection_snapshot();
+        next_state.right_pane_tab = Some(persisted_right_pane_tab(self.right_pane_tab));
+        next_state.logs_tab_open = Some(self.logs_tab_open);
+        next_state.logs_tab_active = Some(self.logs_tab_active);
+        self.queue_ui_state_save(next_state, cx);
     }
 
     fn handle_pane_divider_drag_move(
@@ -410,11 +502,6 @@ impl ArborWindow {
                     ))
                     .child(status_text(theme, "•"))
                     .child(status_text(theme, format!("terminals {terminal_count}")))
-                    .child(status_text(theme, "•"))
-                    .child(status_text(
-                        theme,
-                        format!("theme {}", self.theme_kind.label()),
-                    ))
                     .when_some(self.github_rate_limit_remaining(), |this, remaining| {
                         this.child(status_text(theme, "•")).child(
                             div()
@@ -428,16 +515,29 @@ impl ArborWindow {
                     })
                     .child(
                         if self.github_rate_limit_remaining().is_some() {
-                            status_text(theme, "waiting")
-                        } else if self.worktree_stats_loading || self.worktree_prs_loading {
-                            let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-                            let frame_index = (SystemTime::now()
-                                .duration_since(SystemTime::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_millis()
-                                / 100) as usize
-                                % frames.len();
-                            status_text(theme, format!("{} loading", frames[frame_index]))
+                            loading_status_text(theme, "waiting")
+                        } else if let Some(label) = workspace_loading_status_label(
+                            if self.worktree_stats_loading {
+                                self.worktrees
+                                    .iter()
+                                    .filter(|worktree| worktree.diff_summary.is_none())
+                                    .count()
+                            } else {
+                                0
+                            },
+                            self.worktrees
+                                .iter()
+                                .filter(|worktree| worktree.pr_loading)
+                                .count(),
+                            self.worktrees.iter().any(|worktree| worktree.pr_loaded),
+                        ) {
+                            loading_status_text(
+                                theme,
+                                format!(
+                                    "{} {label}",
+                                    loading_spinner_frame(self.loading_animation_frame)
+                                ),
+                            )
                         } else {
                             status_text(theme, "ready")
                         },

@@ -121,6 +121,18 @@ impl ArborWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.activate_remote_worktree(daemon_index, worktree_path, cx);
+        self.terminal_scroll_handle.scroll_to_bottom();
+        window.focus(&self.terminal_focus);
+        cx.notify();
+    }
+
+    fn activate_remote_worktree(
+        &mut self,
+        daemon_index: usize,
+        worktree_path: String,
+        cx: &mut Context<Self>,
+    ) {
         let Some(state) = self.remote_daemon_states.get(&daemon_index) else {
             return;
         };
@@ -133,12 +145,19 @@ impl ArborWindow {
             "selecting remote worktree (keeping local daemon)"
         );
 
+        let repo_root = state
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.path == worktree_path)
+            .map(|worktree| worktree.repo_root.clone())
+            .unwrap_or_else(|| worktree_path.clone());
         let cwd = PathBuf::from(&worktree_path);
         self.active_worktree_index = None;
         self.active_outpost_index = None;
         self.active_remote_worktree = Some(ActiveRemoteWorktree {
             daemon_index,
             worktree_path: cwd.clone(),
+            repo_root,
         });
         let has_terminal = self
             .terminals
@@ -281,10 +300,6 @@ impl ArborWindow {
             })
             .detach();
         }
-
-        self.terminal_scroll_handle.scroll_to_bottom();
-        window.focus(&self.terminal_focus);
-        cx.notify();
     }
 
     fn toggle_discovered_daemon(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -311,7 +326,8 @@ impl ArborWindow {
         let url = daemon.base_url();
         let hostname = daemon.display_name().to_owned();
 
-        let client = match terminal_daemon_http::HttpTerminalDaemon::new(&url) {
+        let client: terminal_daemon_http::SharedTerminalDaemonClient =
+            match terminal_daemon_http::HttpTerminalDaemon::new(&url) {
             Ok(client) => Arc::new(client),
             Err(error) => {
                 tracing::error!(%error, %url, "failed to create HTTP client for LAN daemon");

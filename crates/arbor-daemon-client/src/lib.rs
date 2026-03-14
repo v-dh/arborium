@@ -1,10 +1,12 @@
 mod types;
 
 pub use types::{
-    AgentSessionDto, ChangedFileDto, CommitWorktreeRequest, CreateTerminalRequest,
-    CreateTerminalResponse, CreateWorktreeRequest, DeleteWorktreeRequest, GitActionResponse,
-    HealthResponse, PushWorktreeRequest, RepositoryDto, TerminalResizeRequest,
-    TerminalSignalRequest, WorktreeDto, WorktreeMutationResponse,
+    AgentSessionDto, ChangedFileDto, CommitWorktreeRequest, CreateManagedWorktreeRequest,
+    CreateTerminalRequest, CreateTerminalResponse, CreateWorktreeRequest, DeleteWorktreeRequest,
+    GitActionResponse, HealthResponse, IssueDto, IssueListResponse, IssueReviewDto,
+    IssueReviewKind, IssueSourceDto, ManagedWorktreePreviewRequest, ManagedWorktreePreviewResponse,
+    PushWorktreeRequest, RepositoryDto, TerminalResizeRequest, TerminalSignalRequest, WorktreeDto,
+    WorktreeMutationResponse,
 };
 use {
     arbor_core::{
@@ -93,11 +95,32 @@ impl DaemonClient {
         self.post_json("/api/v1/worktrees", request)
     }
 
+    pub fn preview_managed_worktree(
+        &self,
+        request: &ManagedWorktreePreviewRequest,
+    ) -> Result<ManagedWorktreePreviewResponse, DaemonClientError> {
+        self.post_json("/api/v1/worktrees/managed/preview", request)
+    }
+
+    pub fn create_managed_worktree(
+        &self,
+        request: &CreateManagedWorktreeRequest,
+    ) -> Result<WorktreeMutationResponse, DaemonClientError> {
+        self.post_json("/api/v1/worktrees/managed", request)
+    }
+
     pub fn delete_worktree(
         &self,
         request: &DeleteWorktreeRequest,
     ) -> Result<WorktreeMutationResponse, DaemonClientError> {
         self.post_json("/api/v1/worktrees/delete", request)
+    }
+
+    pub fn list_issues(&self, repo_root: &str) -> Result<IssueListResponse, DaemonClientError> {
+        self.get_json(&format!(
+            "/api/v1/issues?repo_root={}",
+            encode_query_value(repo_root)
+        ))
     }
 
     pub fn list_changed_files(&self, path: &str) -> Result<Vec<ChangedFileDto>, DaemonClientError> {

@@ -96,6 +96,68 @@ pub struct RemoteWorktreeDto {
     pub pr_url: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct IssueSourceDto {
+    pub provider: String,
+    pub label: String,
+    pub repository: String,
+    pub url: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IssueReviewKind {
+    PullRequest,
+    MergeRequest,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct IssueReviewDto {
+    pub kind: IssueReviewKind,
+    pub label: String,
+    pub url: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct IssueDto {
+    pub id: String,
+    pub display_id: String,
+    pub title: String,
+    pub state: String,
+    pub url: Option<String>,
+    #[serde(default)]
+    pub body: Option<String>,
+    pub suggested_worktree_name: String,
+    pub updated_at: Option<String>,
+    pub linked_branch: Option<String>,
+    pub linked_review: Option<IssueReviewDto>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct IssueListResponseDto {
+    pub source: Option<IssueSourceDto>,
+    pub issues: Vec<IssueDto>,
+    pub notice: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct ManagedWorktreePreviewDto {
+    pub sanitized_worktree_name: String,
+    pub branch: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct WorktreeMutationResponseDto {
+    pub repo_root: String,
+    pub path: String,
+    pub branch: Option<String>,
+    pub deleted_branch: Option<String>,
+    pub message: String,
+}
+
 #[derive(Debug, Serialize)]
 struct SetBindModeRequest {
     allow_remote: bool,
@@ -135,6 +197,18 @@ struct TerminalResizeRequest {
 #[derive(Debug, Serialize)]
 struct TerminalSignalRequest {
     signal: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct ManagedWorktreePreviewRequest {
+    repo_root: String,
+    worktree_name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CreateManagedWorktreeRequest {
+    repo_root: String,
+    worktree_name: String,
 }
 
 impl HttpTerminalDaemon {
@@ -290,6 +364,52 @@ impl HttpTerminalDaemon {
 
     pub fn list_worktrees(&self) -> Result<Vec<RemoteWorktreeDto>, HttpTerminalDaemonError> {
         let response = self.send_empty("GET", &format!("{API_PATH_PREFIX}/worktrees"))?;
+        self.decode_json_response(response, &[200])
+    }
+
+    pub fn list_issues(
+        &self,
+        repo_root: &str,
+    ) -> Result<IssueListResponseDto, HttpTerminalDaemonError> {
+        let response = self.send_empty(
+            "GET",
+            &format!(
+                "{API_PATH_PREFIX}/issues?repo_root={}",
+                encode_query_value(repo_root)
+            ),
+        )?;
+        self.decode_json_response(response, &[200])
+    }
+
+    pub fn preview_managed_worktree(
+        &self,
+        repo_root: &str,
+        worktree_name: &str,
+    ) -> Result<ManagedWorktreePreviewDto, HttpTerminalDaemonError> {
+        let response = self.send_json(
+            "POST",
+            &format!("{API_PATH_PREFIX}/worktrees/managed/preview"),
+            &ManagedWorktreePreviewRequest {
+                repo_root: repo_root.to_owned(),
+                worktree_name: worktree_name.to_owned(),
+            },
+        )?;
+        self.decode_json_response(response, &[200])
+    }
+
+    pub fn create_managed_worktree(
+        &self,
+        repo_root: &str,
+        worktree_name: &str,
+    ) -> Result<WorktreeMutationResponseDto, HttpTerminalDaemonError> {
+        let response = self.send_json(
+            "POST",
+            &format!("{API_PATH_PREFIX}/worktrees/managed"),
+            &CreateManagedWorktreeRequest {
+                repo_root: repo_root.to_owned(),
+                worktree_name: worktree_name.to_owned(),
+            },
+        )?;
         self.decode_json_response(response, &[200])
     }
 
@@ -450,7 +570,7 @@ impl HttpTerminalDaemon {
     }
 }
 
-pub trait TerminalDaemonClient: Send + Sync {
+pub trait TerminalDaemonClient: Send + Sync + fmt::Debug {
     fn base_url(&self) -> String;
     fn set_auth_token(&self, token: Option<String>);
     fn websocket_connect_config(
@@ -476,6 +596,20 @@ pub trait TerminalDaemonClient: Send + Sync {
     ) -> Result<Option<TerminalSnapshot>, HttpTerminalDaemonError>;
     fn list_sessions(&self) -> Result<Vec<DaemonSessionRecord>, HttpTerminalDaemonError>;
     fn health(&self) -> Result<HealthInfo, HttpTerminalDaemonError>;
+    fn list_repositories(&self) -> Result<Vec<RemoteRepositoryDto>, HttpTerminalDaemonError>;
+    fn list_worktrees(&self) -> Result<Vec<RemoteWorktreeDto>, HttpTerminalDaemonError>;
+    fn list_issues(&self, repo_root: &str)
+    -> Result<IssueListResponseDto, HttpTerminalDaemonError>;
+    fn preview_managed_worktree(
+        &self,
+        repo_root: &str,
+        worktree_name: &str,
+    ) -> Result<ManagedWorktreePreviewDto, HttpTerminalDaemonError>;
+    fn create_managed_worktree(
+        &self,
+        repo_root: &str,
+        worktree_name: &str,
+    ) -> Result<WorktreeMutationResponseDto, HttpTerminalDaemonError>;
     fn shutdown(&self) -> Result<(), HttpTerminalDaemonError>;
     fn set_bind_mode(&self, allow_remote: bool) -> Result<(), HttpTerminalDaemonError>;
 }
@@ -543,6 +677,37 @@ impl TerminalDaemonClient for HttpTerminalDaemon {
 
     fn health(&self) -> Result<HealthInfo, HttpTerminalDaemonError> {
         HttpTerminalDaemon::health(self)
+    }
+
+    fn list_repositories(&self) -> Result<Vec<RemoteRepositoryDto>, HttpTerminalDaemonError> {
+        HttpTerminalDaemon::list_repositories(self)
+    }
+
+    fn list_worktrees(&self) -> Result<Vec<RemoteWorktreeDto>, HttpTerminalDaemonError> {
+        HttpTerminalDaemon::list_worktrees(self)
+    }
+
+    fn list_issues(
+        &self,
+        repo_root: &str,
+    ) -> Result<IssueListResponseDto, HttpTerminalDaemonError> {
+        HttpTerminalDaemon::list_issues(self, repo_root)
+    }
+
+    fn preview_managed_worktree(
+        &self,
+        repo_root: &str,
+        worktree_name: &str,
+    ) -> Result<ManagedWorktreePreviewDto, HttpTerminalDaemonError> {
+        HttpTerminalDaemon::preview_managed_worktree(self, repo_root, worktree_name)
+    }
+
+    fn create_managed_worktree(
+        &self,
+        repo_root: &str,
+        worktree_name: &str,
+    ) -> Result<WorktreeMutationResponseDto, HttpTerminalDaemonError> {
+        HttpTerminalDaemon::create_managed_worktree(self, repo_root, worktree_name)
     }
 
     fn shutdown(&self) -> Result<(), HttpTerminalDaemonError> {
@@ -903,6 +1068,10 @@ fn encode_path_segment(value: &str) -> String {
     encoded
 }
 
+fn encode_query_value(value: &str) -> String {
+    encode_path_segment(value)
+}
+
 fn hex_upper(value: u8) -> char {
     match value {
         0..=9 => char::from(b'0' + value),
@@ -1004,7 +1173,100 @@ mod tests {
         assert_eq!(config.auth_token.as_deref(), Some("agent-secret"));
     }
 
+    #[test]
+    fn list_issues_encodes_repo_root_in_query_string() {
+        let response = br#"{"source":null,"issues":[],"notice":"nothing to see here"}"#.to_vec();
+        let (base_url, receiver, handle) = spawn_capture_server_with_response(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n",
+            response,
+        );
+        let daemon = match HttpTerminalDaemon::new(&base_url) {
+            Ok(daemon) => daemon,
+            Err(error) => panic!("failed to create daemon client: {error}"),
+        };
+
+        let issues = daemon.list_issues("/tmp/repo with spaces");
+        if let Err(error) = &issues {
+            panic!("issues request failed: {error}");
+        }
+
+        let captured = match receiver.recv_timeout(Duration::from_secs(2)) {
+            Ok(captured) => captured,
+            Err(error) => panic!("did not capture issues request: {error}"),
+        };
+        assert!(
+            captured.headers.starts_with(
+                "GET /api/v1/issues?repo_root=%2Ftmp%2Frepo%20with%20spaces HTTP/1.1\r\n"
+            ),
+            "unexpected request line: {:?}",
+            captured.headers
+        );
+
+        match handle.join() {
+            Ok(()) => {},
+            Err(_) => panic!("capture server thread panicked"),
+        }
+    }
+
+    #[test]
+    fn preview_managed_worktree_posts_json_payload() {
+        let response = br#"{"sanitized_worktree_name":"issue-42","branch":"codex/issue-42","path":"/tmp/issue-42"}"#.to_vec();
+        let (base_url, receiver, handle) = spawn_capture_server_with_response(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n",
+            response,
+        );
+        let daemon = match HttpTerminalDaemon::new(&base_url) {
+            Ok(daemon) => daemon,
+            Err(error) => panic!("failed to create daemon client: {error}"),
+        };
+
+        let preview = daemon.preview_managed_worktree("/tmp/repo", "Issue 42");
+        if let Err(error) = &preview {
+            panic!("preview request failed: {error}");
+        }
+
+        let captured = match receiver.recv_timeout(Duration::from_secs(2)) {
+            Ok(captured) => captured,
+            Err(error) => panic!("did not capture preview request: {error}"),
+        };
+        assert!(
+            captured
+                .headers
+                .starts_with("POST /api/v1/worktrees/managed/preview HTTP/1.1\r\n"),
+            "unexpected request line: {:?}",
+            captured.headers
+        );
+        assert!(
+            captured
+                .headers
+                .to_ascii_lowercase()
+                .contains("content-type: application/json\r\n"),
+            "missing json content type: {:?}",
+            captured.headers
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&captured.body),
+            r#"{"repo_root":"/tmp/repo","worktree_name":"Issue 42"}"#
+        );
+
+        match handle.join() {
+            Ok(()) => {},
+            Err(_) => panic!("capture server thread panicked"),
+        }
+    }
+
     fn spawn_capture_server() -> (
+        String,
+        mpsc::Receiver<CapturedRequest>,
+        thread::JoinHandle<()>,
+    ) {
+        spawn_capture_server_with_response("HTTP/1.1 204 No Content\r\n", Vec::new())
+    }
+
+    fn spawn_capture_server_with_response(
+        status_and_headers: &'static str,
+        body: Vec<u8>,
+    ) -> (
         String,
         mpsc::Receiver<CapturedRequest>,
         thread::JoinHandle<()>,
@@ -1034,9 +1296,11 @@ mod tests {
             if let Err(error) = sender.send(request) {
                 panic!("failed to send captured request: {error}");
             }
-            if let Err(error) =
-                stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
-            {
+            let mut response = status_and_headers.as_bytes().to_vec();
+            response
+                .extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
+            response.extend_from_slice(&body);
+            if let Err(error) = stream.write_all(&response) {
                 panic!("failed to write HTTP response: {error}");
             }
             if let Err(error) = stream.flush() {

@@ -132,10 +132,8 @@ impl WorkspaceManager {
         };
 
         tracing::info!(hook = hook_name, cwd = %cwd.display(), "running workspace hook");
-        let mut command = Command::new("sh");
+        let mut command = shell_command(script);
         command
-            .arg("-lc")
-            .arg(script)
             .current_dir(cwd)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -206,10 +204,34 @@ fn truncate_hook_output(value: &str) -> String {
     format!("{}...", &trimmed[..240])
 }
 
+#[cfg(target_os = "windows")]
+fn shell_command(command: &str) -> Command {
+    let mut process = Command::new("cmd");
+    process.arg("/C").arg(command);
+    process
+}
+
+#[cfg(not(target_os = "windows"))]
+fn shell_command(command: &str) -> Command {
+    let mut process = Command::new("sh");
+    process.arg("-lc").arg(command);
+    process
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "windows")]
+    fn create_marker_command(marker_name: &str) -> String {
+        format!("type nul > {marker_name}")
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn create_marker_command(marker_name: &str) -> String {
+        format!(": > {marker_name}")
+    }
 
     #[test]
     fn sanitizes_workspace_keys() {
@@ -222,8 +244,8 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let marker_name = "marker.txt";
         let manager = WorkspaceManager::new(temp.path().to_path_buf(), HookScripts {
-            after_create: Some(format!(": > {marker_name}")),
-            timeout_ms: 1_000,
+            after_create: Some(create_marker_command(marker_name)),
+            timeout_ms: 5_000,
             ..HookScripts::default()
         });
 

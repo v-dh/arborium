@@ -54,7 +54,10 @@ use {
         net::TcpListener,
         path::{Path, PathBuf},
         process::{Child, Command, Stdio},
-        sync::{Arc, Mutex, OnceLock, atomic::Ordering},
+        sync::{
+            Arc, Mutex, OnceLock,
+            atomic::{AtomicBool, Ordering},
+        },
         time::{Duration, Instant, SystemTime},
     },
     syntect::{easy::HighlightLines, highlighting::ThemeSet, parsing::SyntaxSet},
@@ -71,6 +74,7 @@ include!("theme_picker.rs");
 include!("repo_presets.rs");
 include!("prompt_runner.rs");
 include!("command_palette.rs");
+include!("issue_details_modal.rs");
 include!("git_actions.rs");
 include!("worktree_lifecycle.rs");
 include!("welcome_ui.rs");
@@ -145,7 +149,16 @@ impl ArborWindow {
                         Vec::new()
                     },
                 };
-                let active_repository_index = if repositories.is_empty() {
+                let startup_repository_root = persisted_sidebar_selection_repository_root(
+                    startup_ui_state.selected_sidebar_selection.as_ref(),
+                );
+                let active_repository_index = if let Some(root) = startup_repository_root.as_deref()
+                {
+                    repositories
+                        .iter()
+                        .position(|repository| repository.contains_checkout_root(root))
+                        .or(Some(0))
+                } else if repositories.is_empty() {
                     None
                 } else {
                     Some(0)
@@ -157,7 +170,9 @@ impl ArborWindow {
                     .as_ref()
                     .map(|r| r.root.clone())
                     .unwrap_or_else(|| PathBuf::from("."));
-                let github_repo_slug = active_repository.and_then(|r| r.github_repo_slug);
+                let github_repo_slug = active_repository
+                    .as_ref()
+                    .and_then(|repository| repository.github_repo_slug.clone());
 
                 let active_backend_kind = match parse_terminal_backend_kind(
                     loaded_config.config.terminal_backend.as_deref(),
@@ -183,6 +198,8 @@ impl ArborWindow {
                         ThemeKind::One
                     },
                 };
+                let startup_sidebar_order = startup_ui_state.sidebar_order.clone();
+                let repository_sidebar_tabs = startup_ui_state.repository_sidebar_tabs.clone();
                 let configured_embedded_shell = loaded_config.config.embedded_shell.clone();
                 let notifications_enabled = loaded_config.config.notifications.unwrap_or(true);
                 let remote_hosts: Vec<arbor_core::outpost::RemoteHost> = loaded_config
@@ -204,6 +221,14 @@ impl ArborWindow {
                 let agent_presets = normalize_agent_presets(&loaded_config.config.agent_presets);
                 let outpost_store = Arc::new(arbor_core::outpost_store::default_outpost_store());
                 let outposts = load_outpost_summaries(outpost_store.as_ref(), &remote_hosts);
+                let active_outpost_index = persisted_sidebar_selection_outpost_index(
+                    startup_ui_state.selected_sidebar_selection.as_ref(),
+                    &outposts,
+                );
+                let startup_right_pane_tab =
+                    right_pane_tab_from_persisted(startup_ui_state.right_pane_tab);
+                let startup_logs_tab_open = persisted_logs_tab_open(&startup_ui_state);
+                let startup_logs_tab_active = persisted_logs_tab_active(&startup_ui_state);
                 let (terminal_poll_tx, terminal_poll_rx) = std::sync::mpsc::channel();
 
                 let app = Self {
@@ -219,17 +244,25 @@ impl ArborWindow {
                     github_auth_in_progress: false,
                     github_auth_copy_feedback_active: false,
                     github_auth_copy_feedback_generation: 0,
+                    next_create_modal_instance_id: 1,
                     config_last_modified,
                     repositories,
                     active_repository_index,
-                    repo_root,
+                    repo_root: active_repository
+                        .as_ref()
+                        .map(|repository| repository.root.clone())
+                        .or(startup_repository_root)
+                        .unwrap_or(repo_root),
                     github_repo_slug,
                     worktrees: Vec::new(),
                     worktree_stats_loading: false,
                     worktree_prs_loading: false,
+                    loading_animation_active: false,
+                    loading_animation_frame: 0,
                     github_rate_limited_until: None,
                     expanded_pr_checks_worktree: None,
                     active_worktree_index: None,
+                    pending_local_worktree_selection: None,
                     worktree_selection_epoch: 0,
                     changed_files: Vec::new(),
                     selected_changed_file: None,
@@ -264,6 +297,7 @@ impl ArborWindow {
                     terminal_selection: None,
                     terminal_selection_drag_anchor: None,
                     create_modal: None,
+                    issue_details_modal: None,
                     preferred_checkout_kind: startup_ui_state
                         .preferred_checkout_kind
                         .unwrap_or_default(),
@@ -272,7 +306,7 @@ impl ArborWindow {
                     commit_modal: None,
                     outposts,
                     outpost_store,
-                    active_outpost_index: None,
+                    active_outpost_index,
                     remote_hosts,
                     ssh_connection_pool: Arc::new(arbor_ssh::connection::SshConnectionPool::new()),
                     ssh_daemon_tunnel: None,
@@ -330,10 +364,13 @@ impl ArborWindow {
                     notice: (!notice_parts.is_empty()).then_some(notice_parts.join(" | ")),
                     theme_toast: None,
                     theme_toast_generation: 0,
-                    right_pane_tab: RightPaneTab::Changes,
+                    right_pane_tab: startup_right_pane_tab,
                     right_pane_search: String::new(),
                     right_pane_search_cursor: 0,
                     right_pane_search_active: false,
+                    sidebar_order: startup_sidebar_order,
+                    repository_sidebar_tabs,
+                    issue_lists: HashMap::new(),
                     worktree_notes_lines: vec![String::new()],
                     worktree_notes_cursor: FileViewCursor { line: 0, col: 0 },
                     worktree_notes_path: None,
@@ -382,8 +419,8 @@ impl ArborWindow {
                     log_generation: 0,
                     log_scroll_handle: ScrollHandle::new(),
                     log_auto_scroll: true,
-                    logs_tab_open: false,
-                    logs_tab_active: false,
+                    logs_tab_open: startup_logs_tab_open,
+                    logs_tab_active: startup_logs_tab_active,
                     quit_overlay_until: None,
                     quit_after_persistence_flush: false,
                     ime_marked_text: None,
@@ -511,7 +548,13 @@ impl ArborWindow {
             persist_repositories = true;
         }
 
-        let active_repository_index = if let Some(ref root) = repo_root {
+        let startup_repository_root = persisted_sidebar_selection_repository_root(
+            startup_ui_state.selected_sidebar_selection.as_ref(),
+        );
+        let preferred_repo_root = repo_root
+            .clone()
+            .or_else(|| startup_repository_root.clone());
+        let active_repository_index = if let Some(ref root) = preferred_repo_root {
             repositories
                 .iter()
                 .position(|repository| repository.contains_checkout_root(root))
@@ -553,6 +596,14 @@ impl ArborWindow {
 
         let outpost_store = Arc::new(arbor_core::outpost_store::default_outpost_store());
         let outposts = load_outpost_summaries(outpost_store.as_ref(), &remote_hosts);
+        let active_outpost_index = if repo_root.is_none() {
+            persisted_sidebar_selection_outpost_index(
+                startup_ui_state.selected_sidebar_selection.as_ref(),
+                &outposts,
+            )
+        } else {
+            None
+        };
 
         let active_backend_kind =
             match parse_terminal_backend_kind(loaded_config.config.terminal_backend.as_deref()) {
@@ -577,8 +628,13 @@ impl ArborWindow {
                 ThemeKind::One
             },
         };
+        let startup_sidebar_order = startup_ui_state.sidebar_order.clone();
+        let repository_sidebar_tabs = startup_ui_state.repository_sidebar_tabs.clone();
         let configured_embedded_shell = loaded_config.config.embedded_shell.clone();
         let notifications_enabled = loaded_config.config.notifications.unwrap_or(true);
+        let startup_right_pane_tab = right_pane_tab_from_persisted(startup_ui_state.right_pane_tab);
+        let startup_logs_tab_open = persisted_logs_tab_open(&startup_ui_state);
+        let startup_logs_tab_active = persisted_logs_tab_active(&startup_ui_state);
         let (terminal_poll_tx, terminal_poll_rx) = std::sync::mpsc::channel();
 
         let mut app = Self {
@@ -594,21 +650,25 @@ impl ArborWindow {
             github_auth_in_progress: false,
             github_auth_copy_feedback_active: false,
             github_auth_copy_feedback_generation: 0,
+            next_create_modal_instance_id: 1,
             config_last_modified,
             repositories,
             active_repository_index,
             repo_root: active_repository
                 .as_ref()
                 .map(|repository| repository.root.clone())
-                .or(repo_root)
+                .or(preferred_repo_root)
                 .unwrap_or(cwd),
             github_repo_slug: active_repository.and_then(|repository| repository.github_repo_slug),
             worktrees: Vec::new(),
             worktree_stats_loading: false,
             worktree_prs_loading: false,
+            loading_animation_active: false,
+            loading_animation_frame: 0,
             github_rate_limited_until: None,
             expanded_pr_checks_worktree: None,
             active_worktree_index: None,
+            pending_local_worktree_selection: None,
             worktree_selection_epoch: 0,
             changed_files: Vec::new(),
             selected_changed_file: None,
@@ -643,13 +703,14 @@ impl ArborWindow {
             terminal_selection: None,
             terminal_selection_drag_anchor: None,
             create_modal: None,
+            issue_details_modal: None,
             preferred_checkout_kind: startup_ui_state.preferred_checkout_kind.unwrap_or_default(),
             github_auth_modal: None,
             delete_modal: None,
             commit_modal: None,
             outposts,
             outpost_store,
-            active_outpost_index: None,
+            active_outpost_index,
             remote_hosts,
             ssh_connection_pool: Arc::new(arbor_ssh::connection::SshConnectionPool::new()),
             ssh_daemon_tunnel: None,
@@ -738,10 +799,13 @@ impl ArborWindow {
             notice: (!notice_parts.is_empty()).then_some(notice_parts.join(" | ")),
             theme_toast: None,
             theme_toast_generation: 0,
-            right_pane_tab: RightPaneTab::Changes,
+            right_pane_tab: startup_right_pane_tab,
             right_pane_search: String::new(),
             right_pane_search_cursor: 0,
             right_pane_search_active: false,
+            sidebar_order: startup_sidebar_order,
+            repository_sidebar_tabs,
+            issue_lists: HashMap::new(),
             worktree_notes_lines: vec![String::new()],
             worktree_notes_cursor: FileViewCursor { line: 0, col: 0 },
             worktree_notes_path: None,
@@ -759,8 +823,8 @@ impl ArborWindow {
             log_generation: 0,
             log_scroll_handle: ScrollHandle::new(),
             log_auto_scroll: true,
-            logs_tab_open: false,
-            logs_tab_active: false,
+            logs_tab_open: startup_logs_tab_open,
+            logs_tab_active: startup_logs_tab_active,
             quit_overlay_until: None,
             quit_after_persistence_flush: false,
             ime_marked_text: None,
@@ -777,7 +841,11 @@ impl ArborWindow {
         app.refresh_repo_config_if_changed(cx);
         app.refresh_github_auth_identity(cx);
         app.restore_terminal_sessions_from_records(initial_daemon_records, attach_daemon_runtime);
-        let _ = app.ensure_selected_worktree_terminal(cx);
+        if app.active_outpost_index.is_some() {
+            app.refresh_remote_changed_files(cx);
+        } else {
+            let _ = app.ensure_selected_worktree_terminal(cx);
+        }
         app.sync_daemon_session_store(cx);
         app.start_terminal_poller(cx);
         app.start_log_poller(cx);
@@ -955,6 +1023,51 @@ impl ArborWindow {
                 });
                 if updated.is_err() {
                     break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn has_active_loading_indicator(&self) -> bool {
+        self.worktree_stats_loading
+            || self.worktree_prs_loading
+            || self.issue_lists.values().any(|state| state.loading)
+            || self
+                .create_modal
+                .as_ref()
+                .is_some_and(|modal| modal.managed_preview_loading)
+    }
+
+    fn ensure_loading_animation(&mut self, cx: &mut Context<Self>) {
+        if self.loading_animation_active || !self.has_active_loading_indicator() {
+            return;
+        }
+
+        self.loading_animation_active = true;
+
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_spawn(async move {
+                    std::thread::sleep(Duration::from_millis(100));
+                })
+                .await;
+
+                let updated = this.update(cx, |this, cx| {
+                    if !this.has_active_loading_indicator() {
+                        this.loading_animation_active = false;
+                        return false;
+                    }
+
+                    this.loading_animation_frame =
+                        this.loading_animation_frame.wrapping_add(1) % LOADING_SPINNER_FRAMES.len();
+                    cx.notify();
+                    true
+                });
+
+                match updated {
+                    Ok(true) => {},
+                    Ok(false) | Err(_) => break,
                 }
             }
         })
@@ -1629,6 +1742,7 @@ impl ArborWindow {
                 self.ui_state_save_in_flight.as_ref(),
             )
             || self.worktree_notes_save_pending
+            || self._worktree_notes_save_task.is_some()
         {
             return;
         }
@@ -1944,7 +2058,12 @@ impl ArborWindow {
         cx: &mut Context<Self>,
         mode: WorktreeInventoryRefreshMode,
     ) -> WorktreeInventoryRefreshResult {
-        let previous_local_selection = self.selected_local_worktree_path().map(Path::to_path_buf);
+        let queued_ui_state = self.queued_ui_state_base();
+        let previous_local_selection = refresh_worktree_previous_local_selection(
+            self.pending_local_worktree_selection.as_deref(),
+            self.selected_local_worktree_path(),
+            queued_ui_state.selected_sidebar_selection.as_ref(),
+        );
         let active_repository_group_key = self
             .active_repository_index
             .and_then(|repository_index| self.repositories.get(repository_index))
@@ -1969,6 +2088,21 @@ impl ArborWindow {
                     .pr_number
                     .map(|pr_number| (worktree.path.clone(), pr_number))
             })
+            .collect();
+        let previous_branches: HashMap<PathBuf, String> = self
+            .worktrees
+            .iter()
+            .map(|worktree| (worktree.path.clone(), worktree.branch.clone()))
+            .collect();
+        let previous_pr_loading: HashMap<PathBuf, bool> = self
+            .worktrees
+            .iter()
+            .map(|worktree| (worktree.path.clone(), worktree.pr_loading))
+            .collect();
+        let previous_pr_loaded: HashMap<PathBuf, bool> = self
+            .worktrees
+            .iter()
+            .map(|worktree| (worktree.path.clone(), worktree.pr_loaded))
             .collect();
         let previous_pr_urls: HashMap<PathBuf, String> = self
             .worktrees
@@ -2046,6 +2180,7 @@ impl ArborWindow {
                     .map(|ts| (worktree.path.clone(), ts))
             })
             .collect();
+        let persisted_pr_cache = self.last_persisted_ui_state.pull_request_cache.clone();
         let next_epoch = self.worktree_refresh_epoch.wrapping_add(1);
         self.worktree_refresh_epoch = next_epoch;
         self._worktree_refresh_task = Some(cx.spawn(async move |this, cx| {
@@ -2089,10 +2224,29 @@ impl ArborWindow {
                 .await;
 
             for worktree in &mut next_worktrees {
+                let branch_unchanged = previous_branches
+                    .get(&worktree.path)
+                    .is_some_and(|previous_branch| previous_branch == &worktree.branch);
+                worktree.pr_loading = branch_unchanged
+                    && previous_pr_loading
+                        .get(&worktree.path)
+                        .copied()
+                        .unwrap_or(false);
+                worktree.pr_loaded = branch_unchanged
+                    && previous_pr_loaded
+                        .get(&worktree.path)
+                        .copied()
+                        .unwrap_or(false);
                 worktree.diff_summary = previous_summaries.get(&worktree.path).copied();
-                worktree.pr_number = previous_pr_numbers.get(&worktree.path).copied();
-                worktree.pr_url = previous_pr_urls.get(&worktree.path).cloned();
-                worktree.pr_details = previous_pr_details.get(&worktree.path).cloned();
+                if branch_unchanged {
+                    worktree.pr_number = previous_pr_numbers.get(&worktree.path).copied();
+                    worktree.pr_url = previous_pr_urls.get(&worktree.path).cloned();
+                    worktree.pr_details = previous_pr_details.get(&worktree.path).cloned();
+                } else if let Some(cached) =
+                    cached_pull_request_state_for_worktree(worktree, &persisted_pr_cache)
+                {
+                    worktree.apply_cached_pull_request_state(cached);
+                }
                 worktree.agent_state = previous_agent_states.get(&worktree.path).copied();
                 worktree.agent_task = previous_agent_tasks.get(&worktree.path).cloned();
                 worktree.detected_ports = previous_detected_ports
@@ -2124,6 +2278,11 @@ impl ArborWindow {
                         return;
                     }
 
+                    let should_refresh_pull_requests =
+                        should_refresh_pull_requests_after_worktree_refresh(
+                            &this.worktrees,
+                            &next_worktrees,
+                        );
                     let rows_changed = worktree_rows_changed(&this.worktrees, &next_worktrees);
                     this.worktrees = next_worktrees;
                     reconcile_worktree_agent_activity(this, false, cx);
@@ -2138,6 +2297,22 @@ impl ArborWindow {
                         &this.worktrees,
                         preserve_non_local_selection,
                     );
+                    if this
+                        .pending_local_worktree_selection
+                        .as_ref()
+                        .is_some_and(|path| {
+                            this.worktrees
+                                .iter()
+                                .any(|worktree| worktree.path.as_path() == path.as_path())
+                        })
+                    {
+                        this.pending_local_worktree_selection = None;
+                    }
+                    if this.right_pane_tab == RightPaneTab::FileTree
+                        && this.file_tree_entries.is_empty()
+                    {
+                        this.rebuild_file_tree(cx);
+                    }
 
                     this.active_terminal_by_worktree.retain(|path, _| {
                         this.worktrees
@@ -2159,6 +2334,9 @@ impl ArborWindow {
                     }
 
                     this.sync_active_repository_from_selected_worktree();
+                    this.sync_visible_repository_issue_tabs(cx);
+                    this.sync_pull_request_cache_store(cx);
+                    this.sync_navigation_ui_state_store(cx);
 
                     if refresh_errors.is_empty() {
                         if this.notice.as_deref().is_some_and(|notice| {
@@ -2178,7 +2356,9 @@ impl ArborWindow {
                     this.refresh_worktree_ports(cx);
                     this.refresh_agent_tasks(cx);
                     this.refresh_agent_sessions(cx);
-                    this.refresh_worktree_pull_requests(cx);
+                    if should_refresh_pull_requests {
+                        this.refresh_worktree_pull_requests(cx);
+                    }
                     if this.active_outpost_index.is_some() {
                         this.refresh_remote_changed_files(cx);
                     } else {
@@ -2547,7 +2727,7 @@ impl ArborWindow {
             return;
         }
 
-        self.clear_expired_github_rate_limit();
+        let rate_limit_expired = self.clear_expired_github_rate_limit();
 
         let repository_slug_by_group_key: HashMap<String, String> = self
             .repositories
@@ -2560,37 +2740,52 @@ impl ArborWindow {
             })
             .collect();
 
-        let tracked_branches: Vec<(PathBuf, String, Option<String>)> = self
+        let tracked_branches: Vec<(PathBuf, String, String)> = self
             .worktrees
             .iter()
             .filter(|worktree| should_lookup_pull_request_for_worktree(worktree))
-            .map(|worktree| {
-                (
-                    worktree.path.clone(),
-                    worktree.branch.clone(),
-                    repository_slug_by_group_key
-                        .get(&worktree.group_key)
-                        .cloned(),
-                )
+            .filter_map(|worktree| {
+                repository_slug_by_group_key
+                    .get(&worktree.group_key)
+                    .cloned()
+                    .map(|slug| (worktree.path.clone(), worktree.branch.clone(), slug))
             })
             .collect();
+        let github_token = self.github_access_token();
+        let github_service = self.github_service.clone();
         let tracked_paths: HashSet<PathBuf> = tracked_branches
             .iter()
             .map(|(path, ..)| path.clone())
             .collect();
-        let github_token = self.github_access_token();
-        let github_service = self.github_service.clone();
+        let rate_limit_remaining = self.github_rate_limit_remaining();
+
+        let mut changed = rate_limit_expired;
+        for worktree in &mut self.worktrees {
+            let next_pr_loading =
+                rate_limit_remaining.is_none() && tracked_paths.contains(&worktree.path);
+
+            if worktree.pr_loading != next_pr_loading {
+                worktree.pr_loading = next_pr_loading;
+                changed = true;
+            }
+        }
         let cleared_untracked =
             clear_pull_request_data_for_untracked_worktrees(&mut self.worktrees, &tracked_paths);
         if cleared_untracked {
-            cx.notify();
+            changed = true;
         }
 
-        if tracked_branches.is_empty() {
-            return;
+        let next_prs_loading = rate_limit_remaining.is_none() && !tracked_branches.is_empty();
+        if self.worktree_prs_loading != next_prs_loading {
+            self.worktree_prs_loading = next_prs_loading;
+            changed = true;
         }
 
-        if let Some(remaining) = self.github_rate_limit_remaining() {
+        if let Some(remaining) = rate_limit_remaining {
+            if changed {
+                self.sync_pull_request_cache_store(cx);
+                cx.notify();
+            }
             tracing::info!(
                 remaining_seconds = remaining.as_secs(),
                 tracked_worktrees = tracked_branches.len(),
@@ -2599,51 +2794,133 @@ impl ArborWindow {
             return;
         }
 
+        if tracked_branches.is_empty() {
+            if changed {
+                self.sync_pull_request_cache_store(cx);
+                cx.notify();
+            }
+            return;
+        }
+
+        if changed {
+            self.sync_pull_request_cache_store(cx);
+            cx.notify();
+        }
+
         tracing::info!(
             tracked_worktrees = tracked_branches.len(),
             refresh_interval_seconds = GITHUB_PR_REFRESH_INTERVAL.as_secs(),
             "refreshing GitHub PR details"
         );
 
-        self.worktree_prs_loading = true;
-        cx.spawn(async move |this, cx| {
-            let results = cx
-                .background_spawn(async move {
-                    let mut results = Vec::with_capacity(tracked_branches.len());
+        self.ensure_loading_animation(cx);
 
-                    for (path, branch, repo_slug) in tracked_branches {
+        cx.spawn(async move |this, cx| {
+            let worker_count = tracked_branches.len().min(GITHUB_PR_REFRESH_CONCURRENCY);
+            let (work_tx, work_rx) = smol::channel::unbounded::<(PathBuf, String, String)>();
+            let (result_tx, result_rx) = smol::channel::unbounded::<(
+                PathBuf,
+                String,
+                Option<u64>,
+                Option<String>,
+                Option<github_service::PrDetails>,
+                Option<SystemTime>,
+            )>();
+            let stop_due_to_rate_limit = Arc::new(AtomicBool::new(false));
+
+            for work_item in tracked_branches {
+                if work_tx.send(work_item).await.is_err() {
+                    break;
+                }
+            }
+            drop(work_tx);
+
+            for worker_index in 0..worker_count {
+                let work_rx = work_rx.clone();
+                let result_tx = result_tx.clone();
+                let github_service = github_service.clone();
+                let github_token = github_token.clone();
+                let stop_due_to_rate_limit = stop_due_to_rate_limit.clone();
+
+                cx.background_spawn(async move {
+                    if let Some(delay) =
+                        GITHUB_PR_REFRESH_WORKER_STAGGER.checked_mul(worker_index as u32)
+                        && !delay.is_zero()
+                    {
+                        smol::Timer::after(delay).await;
+                    }
+
+                    while !stop_due_to_rate_limit.load(Ordering::Relaxed) {
+                        let Ok((path, branch, repo_slug)) = work_rx.recv().await else {
+                            break;
+                        };
+                        if stop_due_to_rate_limit.load(Ordering::Relaxed) {
+                            break;
+                        }
+
+                        let lookup_branch = branch.clone();
                         let result = Self::lookup_worktree_pull_request(
                             github_service.as_ref(),
                             github_token.as_deref(),
                             path,
-                            branch,
-                            repo_slug,
+                            lookup_branch,
+                            Some(repo_slug),
                         );
-                        let stop_due_to_rate_limit = result.4.is_some();
-                        results.push(result);
-                        if stop_due_to_rate_limit {
+                        if result.4.is_some() {
+                            stop_due_to_rate_limit.store(true, Ordering::Relaxed);
+                        }
+
+                        if result_tx
+                            .send((result.0, branch, result.1, result.2, result.3, result.4))
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }
-
-                    results
                 })
-                .await;
+                .detach();
+            }
+            drop(result_tx);
 
-            let _ = this.update(cx, |this, cx| {
-                for (path, next_num, next_url, next_details, rate_limited_until) in results {
+            while let Ok((
+                path_for_update,
+                branch_for_update,
+                next_num,
+                next_url,
+                next_details,
+                rate_limited_until,
+            )) = result_rx.recv().await
+            {
+                let _ = this.update(cx, |this, cx| {
+                    let Some(worktree) = this
+                        .worktrees
+                        .iter_mut()
+                        .find(|worktree| worktree.path == path_for_update)
+                    else {
+                        return;
+                    };
+                    if worktree.branch != branch_for_update {
+                        return;
+                    }
+
                     let preserve_cached_pr_data = should_preserve_cached_pr_data_on_rate_limit(
                         next_num,
                         next_url.as_deref(),
                         next_details.as_ref(),
                         rate_limited_until,
                     );
+                    let mut changed = false;
 
-                    if let Some(worktree) = this
-                        .worktrees
-                        .iter_mut()
-                        .find(|worktree| worktree.path == path)
-                        && !preserve_cached_pr_data
+                    if worktree.pr_loading {
+                        worktree.pr_loading = false;
+                        changed = true;
+                    }
+                    if !preserve_cached_pr_data && !worktree.pr_loaded {
+                        worktree.pr_loaded = true;
+                        changed = true;
+                    }
+                    if !preserve_cached_pr_data
                         && (worktree.pr_number != next_num
                             || worktree.pr_url != next_url
                             || worktree.pr_details != next_details)
@@ -2651,13 +2928,42 @@ impl ArborWindow {
                         worktree.pr_number = next_num;
                         worktree.pr_url = next_url;
                         worktree.pr_details = next_details;
+                        changed = true;
                     }
 
-                    this.extend_github_rate_limit(rate_limited_until);
-                }
+                    if this.extend_github_rate_limit(rate_limited_until) {
+                        changed = true;
+                    }
 
-                this.worktree_prs_loading = false;
-                cx.notify();
+                    let still_loading = this.worktrees.iter().any(|worktree| worktree.pr_loading);
+                    if this.worktree_prs_loading != still_loading {
+                        this.worktree_prs_loading = still_loading;
+                        changed = true;
+                    }
+
+                    if changed {
+                        this.sync_pull_request_cache_store(cx);
+                        cx.notify();
+                    }
+                });
+            }
+
+            let _ = this.update(cx, |this, cx| {
+                let mut changed = false;
+                for worktree in &mut this.worktrees {
+                    if worktree.pr_loading {
+                        worktree.pr_loading = false;
+                        changed = true;
+                    }
+                }
+                if this.worktree_prs_loading {
+                    this.worktree_prs_loading = false;
+                    changed = true;
+                }
+                if changed {
+                    this.sync_pull_request_cache_store(cx);
+                    cx.notify();
+                }
             });
         })
         .detach();
@@ -3305,6 +3611,21 @@ impl ArborWindow {
             return;
         }
 
+        if self.issue_details_modal.is_some() {
+            match event.keystroke.key.as_str() {
+                "escape" => {
+                    self.close_issue_details_modal(cx);
+                    cx.stop_propagation();
+                },
+                "enter" | "return" => {
+                    self.open_create_modal_from_issue_details(cx);
+                    cx.stop_propagation();
+                },
+                _ => {},
+            }
+            return;
+        }
+
         let Some(modal) = self.create_modal.as_ref() else {
             return;
         };
@@ -3533,6 +3854,7 @@ impl ArborWindow {
             if self.ensure_selected_worktree_terminal(cx) {
                 self.sync_daemon_session_store(cx);
             }
+            self.sync_navigation_ui_state_store(cx);
             self.terminal_scroll_handle.scroll_to_bottom();
             window.focus(&self.terminal_focus);
             self.focus_terminal_on_next_render = false;
@@ -3557,6 +3879,7 @@ impl ArborWindow {
             if self.ensure_selected_worktree_terminal(cx) {
                 self.sync_daemon_session_store(cx);
             }
+            self.sync_navigation_ui_state_store(cx);
             self.terminal_scroll_handle.scroll_to_bottom();
             window.focus(&self.terminal_focus);
             self.focus_terminal_on_next_render = false;
@@ -3608,6 +3931,7 @@ impl ArborWindow {
         self.logs_tab_open = true;
         self.logs_tab_active = true;
         self.active_diff_session_id = None;
+        self.sync_navigation_ui_state_store(cx);
         cx.notify();
     }
 
@@ -4173,6 +4497,7 @@ impl ArborWindow {
         self.active_diff_session_id = None;
         self.active_file_view_session_id = None;
         self.logs_tab_active = false;
+        self.sync_navigation_ui_state_store(cx);
         self.terminal_scroll_handle.scroll_to_bottom();
         window.focus(&self.terminal_focus);
         self.focus_terminal_on_next_render = false;
@@ -4252,6 +4577,7 @@ impl ArborWindow {
         self.pending_diff_scroll_to_file = Some(selected_file_path.clone());
         if !should_rebuild {
             let _ = self.scroll_diff_to_file(selected_file_path.as_path());
+            self.sync_navigation_ui_state_store(cx);
             cx.notify();
             return;
         }
@@ -4268,6 +4594,7 @@ impl ArborWindow {
             session.file_row_indices.clear();
             session.wrapped_columns = 0;
         }
+        self.sync_navigation_ui_state_store(cx);
         cx.notify();
 
         cx.spawn(async move |this, cx| {
@@ -4356,6 +4683,7 @@ impl ArborWindow {
         {
             self.pending_diff_scroll_to_file = Some(selected_path);
         }
+        self.sync_navigation_ui_state_store(cx);
         cx.notify();
     }
 }
@@ -4449,6 +4777,8 @@ impl WorktreeSummary {
             label,
             branch,
             is_primary_checkout,
+            pr_loading: false,
+            pr_loaded: false,
             pr_number: None,
             pr_url: None,
             pr_details: None,
@@ -4463,6 +4793,23 @@ impl WorktreeSummary {
             agent_task: None,
             last_activity_unix_ms,
         }
+    }
+
+    fn apply_cached_pull_request_state(&mut self, cached: &ui_state_store::CachedPullRequestState) {
+        self.pr_loaded = true;
+        self.pr_number = cached.number;
+        self.pr_url = cached.url.clone();
+        self.pr_details = cached.details.clone();
+    }
+
+    fn cached_pull_request_state(&self) -> Option<ui_state_store::CachedPullRequestState> {
+        self.pr_loaded
+            .then(|| ui_state_store::CachedPullRequestState {
+                branch: self.branch.clone(),
+                number: self.pr_number,
+                url: self.pr_url.clone(),
+                details: self.pr_details.clone(),
+            })
     }
 }
 
@@ -4523,6 +4870,34 @@ impl WorktreeInventoryRefreshMode {
             Self::EnsureSelectedTerminal => ensure_selected_terminal(),
         }
     }
+}
+
+#[cfg(test)]
+fn selected_worktree_terminal_was_created<F>(
+    has_existing_terminal: bool,
+    ensure_selected_terminal: F,
+) -> bool
+where
+    F: FnOnce() -> bool,
+{
+    if has_existing_terminal {
+        false
+    } else {
+        ensure_selected_terminal()
+    }
+}
+
+fn worktree_notes_load_is_current(
+    started_generation: u64,
+    current_generation: u64,
+    current_path: Option<&Path>,
+    expected_path: &Path,
+    started_edit_generation: u64,
+    current_edit_generation: u64,
+) -> bool {
+    started_generation == current_generation
+        && current_path == Some(expected_path)
+        && started_edit_generation == current_edit_generation
 }
 
 impl EntityInputHandler for ArborWindow {
@@ -4745,6 +5120,7 @@ impl Render for ArborWindow {
             .child(self.render_status_bar())
             .child(self.render_top_bar_worktree_quick_actions_menu(cx))
             .child(self.render_notice_toast(cx))
+            .child(self.render_issue_details_modal(cx))
             .child(self.render_create_modal(cx))
             .child(self.render_github_auth_modal(cx))
             .child(self.render_repository_context_menu(cx))
@@ -6273,6 +6649,174 @@ fn notice_looks_like_error(notice: &str) -> bool {
     ]
     .iter()
     .any(|needle| lower.contains(needle))
+}
+
+fn workspace_loading_status_label(
+    diff_loading_count: usize,
+    pr_loading_count: usize,
+    has_resolved_pull_request_state: bool,
+) -> Option<String> {
+    let diff_label = match diff_loading_count {
+        0 => None,
+        1 => Some("1 diff".to_owned()),
+        count => Some(format!("{count} diffs")),
+    };
+    let pr_label = match pr_loading_count {
+        0 => None,
+        1 => Some("1 PR".to_owned()),
+        count => Some(format!("{count} PRs")),
+    };
+    let verb = if pr_loading_count > 0 && has_resolved_pull_request_state {
+        "updating"
+    } else {
+        "loading"
+    };
+
+    match (pr_label, diff_label) {
+        (None, None) => None,
+        (Some(pr_label), None) => Some(format!("{verb} {pr_label}")),
+        (None, Some(diff_label)) => Some(format!("{verb} {diff_label}")),
+        (Some(pr_label), Some(diff_label)) => Some(format!("{verb} {pr_label} · {diff_label}")),
+    }
+}
+
+fn persisted_right_pane_tab(tab: RightPaneTab) -> ui_state_store::PersistedRightPaneTab {
+    match tab {
+        RightPaneTab::Changes => ui_state_store::PersistedRightPaneTab::Changes,
+        RightPaneTab::FileTree => ui_state_store::PersistedRightPaneTab::FileTree,
+        RightPaneTab::Procfile => ui_state_store::PersistedRightPaneTab::Procfile,
+        RightPaneTab::Notes => ui_state_store::PersistedRightPaneTab::Notes,
+    }
+}
+
+fn right_pane_tab_from_persisted(
+    tab: Option<ui_state_store::PersistedRightPaneTab>,
+) -> RightPaneTab {
+    match tab.unwrap_or(ui_state_store::PersistedRightPaneTab::Changes) {
+        ui_state_store::PersistedRightPaneTab::Changes => RightPaneTab::Changes,
+        ui_state_store::PersistedRightPaneTab::FileTree => RightPaneTab::FileTree,
+        ui_state_store::PersistedRightPaneTab::Procfile => RightPaneTab::Procfile,
+        ui_state_store::PersistedRightPaneTab::Notes => RightPaneTab::Notes,
+    }
+}
+
+fn persisted_sidebar_selection_repository_root(
+    selection: Option<&ui_state_store::PersistedSidebarSelection>,
+) -> Option<PathBuf> {
+    match selection {
+        Some(ui_state_store::PersistedSidebarSelection::Repository { root })
+        | Some(ui_state_store::PersistedSidebarSelection::Worktree {
+            repo_root: root, ..
+        })
+        | Some(ui_state_store::PersistedSidebarSelection::Outpost {
+            repo_root: root, ..
+        }) => Some(PathBuf::from(root)),
+        None => None,
+    }
+}
+
+fn persisted_sidebar_selection_worktree_path(
+    selection: Option<&ui_state_store::PersistedSidebarSelection>,
+) -> Option<PathBuf> {
+    match selection {
+        Some(ui_state_store::PersistedSidebarSelection::Worktree { path, .. }) => {
+            Some(PathBuf::from(path))
+        },
+        _ => None,
+    }
+}
+
+fn refresh_worktree_previous_local_selection(
+    pending_local_selection: Option<&Path>,
+    current_local_selection: Option<&Path>,
+    persisted_selection: Option<&ui_state_store::PersistedSidebarSelection>,
+) -> Option<PathBuf> {
+    pending_local_selection
+        .map(Path::to_path_buf)
+        .or_else(|| current_local_selection.map(Path::to_path_buf))
+        .or_else(|| persisted_sidebar_selection_worktree_path(persisted_selection))
+}
+
+fn persisted_sidebar_selection_outpost_index(
+    selection: Option<&ui_state_store::PersistedSidebarSelection>,
+    outposts: &[OutpostSummary],
+) -> Option<usize> {
+    let ui_state_store::PersistedSidebarSelection::Outpost { outpost_id, .. } = selection? else {
+        return None;
+    };
+
+    outposts
+        .iter()
+        .position(|outpost| outpost.outpost_id == *outpost_id)
+}
+
+fn persisted_logs_tab_open(startup_ui_state: &ui_state_store::UiState) -> bool {
+    startup_ui_state
+        .logs_tab_open
+        .unwrap_or(startup_ui_state.logs_tab_active.unwrap_or(false))
+}
+
+fn persisted_logs_tab_active(startup_ui_state: &ui_state_store::UiState) -> bool {
+    persisted_logs_tab_open(startup_ui_state) && startup_ui_state.logs_tab_active.unwrap_or(false)
+}
+
+fn worktree_pull_request_cache_key(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+fn cached_pull_request_state_for_worktree<'a>(
+    worktree: &WorktreeSummary,
+    cache: &'a HashMap<String, ui_state_store::CachedPullRequestState>,
+) -> Option<&'a ui_state_store::CachedPullRequestState> {
+    cache
+        .get(&worktree_pull_request_cache_key(&worktree.path))
+        .filter(|cached| cached.branch == worktree.branch)
+}
+
+fn should_refresh_pull_requests_after_worktree_refresh(
+    previous: &[WorktreeSummary],
+    next: &[WorktreeSummary],
+) -> bool {
+    let previous_tracked: HashMap<&Path, &str> = previous
+        .iter()
+        .filter(|worktree| should_lookup_pull_request_for_worktree(worktree))
+        .map(|worktree| (worktree.path.as_path(), worktree.branch.as_str()))
+        .collect();
+
+    let mut next_tracked_count = 0usize;
+    for worktree in next
+        .iter()
+        .filter(|worktree| should_lookup_pull_request_for_worktree(worktree))
+    {
+        next_tracked_count += 1;
+
+        if !worktree.pr_loaded {
+            return true;
+        }
+
+        match previous_tracked.get(worktree.path.as_path()) {
+            Some(previous_branch) if previous_branch == &worktree.branch.as_str() => {},
+            _ => return true,
+        }
+    }
+
+    next_tracked_count != previous_tracked.len()
+}
+
+fn should_show_worktree_pr_loading_indicator(worktree: &WorktreeSummary) -> bool {
+    worktree.pr_loading && !worktree.pr_loaded
+}
+
+fn loading_status_text(theme: ThemePalette, text: impl Into<String>) -> Div {
+    div()
+        .text_xs()
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(rgb(theme.accent))
+        .child(text.into())
+}
+
+fn loading_spinner_frame(frame: usize) -> &'static str {
+    LOADING_SPINNER_FRAMES[frame % LOADING_SPINNER_FRAMES.len()]
 }
 
 fn action_button(
@@ -8281,10 +8825,10 @@ fn parse_theme_kind(theme: Option<&str>) -> Result<ThemeKind, String> {
 mod tests {
     use {
         crate::{
-            DaemonTerminalRuntime, DaemonTerminalWsState, DiffLineKind, PendingSave,
-            TerminalRuntimeHandle, TerminalRuntimeKind, TerminalSession, TerminalState,
-            WorktreeHoverPopover, WorktreeSummary, apply_daemon_snapshot, auto_commit_body,
-            auto_commit_subject, build_side_by_side_diff_lines,
+            DaemonTerminalRuntime, DaemonTerminalWsState, DiffLineKind, OutpostSummary,
+            PendingSave, TerminalRuntimeHandle, TerminalRuntimeKind, TerminalSession,
+            TerminalState, WorktreeHoverPopover, WorktreeSummary, apply_daemon_snapshot,
+            auto_commit_body, auto_commit_subject, build_side_by_side_diff_lines,
             checkout::CheckoutKind,
             estimated_worktree_hover_popover_card_height, extract_first_url,
             parse_terminal_backend_kind, prioritized_pr_checks_for_display,
@@ -8295,7 +8839,7 @@ mod tests {
             },
             terminal_daemon_http::{HttpTerminalDaemon, WebsocketConnectConfig},
             theme::ThemeKind,
-            track_terminal_command_keystroke, worktree_hover_popover_zone_bounds,
+            track_terminal_command_keystroke, ui_state_store, worktree_hover_popover_zone_bounds,
             worktree_hover_safe_zone_contains,
         },
         arbor_core::{
@@ -8376,6 +8920,8 @@ mod tests {
             label: "wt".to_owned(),
             branch: "feature/hover".to_owned(),
             is_primary_checkout: false,
+            pr_loading: false,
+            pr_loaded: false,
             pr_number: None,
             pr_url: None,
             pr_details: None,
@@ -8700,6 +9246,164 @@ mod tests {
                 false,
             ),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn pull_request_refresh_only_restarts_when_tracked_worktrees_change() {
+        let mut previous = sample_worktree_summary();
+        previous.pr_loaded = true;
+
+        let mut next = sample_worktree_summary();
+        next.pr_loaded = true;
+
+        assert!(!crate::should_refresh_pull_requests_after_worktree_refresh(
+            &[previous],
+            &[next]
+        ));
+    }
+
+    #[test]
+    fn pull_request_refresh_restarts_for_unresolved_or_changed_worktrees() {
+        let mut previous = sample_worktree_summary();
+        previous.pr_loaded = true;
+
+        let unresolved = sample_worktree_summary();
+        assert!(crate::should_refresh_pull_requests_after_worktree_refresh(
+            &[previous.clone()],
+            &[unresolved]
+        ));
+
+        let mut changed_branch = sample_worktree_summary();
+        changed_branch.pr_loaded = true;
+        changed_branch.branch = "feature/other".to_owned();
+        assert!(crate::should_refresh_pull_requests_after_worktree_refresh(
+            &[previous],
+            &[changed_branch]
+        ));
+    }
+
+    #[test]
+    fn persisted_sidebar_selection_helpers_restore_saved_targets() {
+        let worktree_selection = ui_state_store::PersistedSidebarSelection::Worktree {
+            repo_root: "/tmp/repo".to_owned(),
+            path: "/tmp/repo/issue-42".to_owned(),
+        };
+        assert_eq!(
+            crate::persisted_sidebar_selection_repository_root(Some(&worktree_selection)),
+            Some(PathBuf::from("/tmp/repo"))
+        );
+        assert_eq!(
+            crate::persisted_sidebar_selection_worktree_path(Some(&worktree_selection)),
+            Some(PathBuf::from("/tmp/repo/issue-42"))
+        );
+
+        let outpost_selection = ui_state_store::PersistedSidebarSelection::Outpost {
+            repo_root: "/tmp/repo".to_owned(),
+            outpost_id: "outpost-1".to_owned(),
+        };
+        let outposts = vec![OutpostSummary {
+            outpost_id: "outpost-1".to_owned(),
+            repo_root: PathBuf::from("/tmp/repo"),
+            remote_path: "/srv/repo".to_owned(),
+            label: "prod".to_owned(),
+            branch: "main".to_owned(),
+            host_name: "prod".to_owned(),
+            hostname: "prod.example.com".to_owned(),
+            status: arbor_core::outpost::OutpostStatus::Available,
+        }];
+        assert_eq!(
+            crate::persisted_sidebar_selection_outpost_index(Some(&outpost_selection), &outposts),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn refresh_worktree_previous_local_selection_prefers_pending_created_path() {
+        let persisted = ui_state_store::PersistedSidebarSelection::Worktree {
+            repo_root: "/tmp/repo".to_owned(),
+            path: "/tmp/repo/old".to_owned(),
+        };
+
+        assert_eq!(
+            crate::refresh_worktree_previous_local_selection(
+                Some(Path::new("/tmp/repo/new")),
+                Some(Path::new("/tmp/repo/current")),
+                Some(&persisted),
+            ),
+            Some(PathBuf::from("/tmp/repo/new"))
+        );
+    }
+
+    #[test]
+    fn persisted_logs_tab_state_only_restores_active_when_open() {
+        let state = ui_state_store::UiState {
+            logs_tab_open: Some(false),
+            logs_tab_active: Some(true),
+            ..ui_state_store::UiState::default()
+        };
+        assert!(!crate::persisted_logs_tab_open(&state));
+        assert!(!crate::persisted_logs_tab_active(&state));
+
+        let state = ui_state_store::UiState {
+            logs_tab_open: Some(true),
+            logs_tab_active: Some(true),
+            ..ui_state_store::UiState::default()
+        };
+        assert!(crate::persisted_logs_tab_open(&state));
+        assert!(crate::persisted_logs_tab_active(&state));
+    }
+
+    #[test]
+    fn normalized_sidebar_order_keeps_saved_items_and_appends_new_ones() {
+        let saved = vec![
+            crate::SidebarItemId::Outpost("outpost-1".to_owned()),
+            crate::SidebarItemId::Worktree(PathBuf::from("/tmp/repo/wt-2")),
+        ];
+        let worktrees = vec![
+            crate::SidebarItemId::Worktree(PathBuf::from("/tmp/repo/wt-1")),
+            crate::SidebarItemId::Worktree(PathBuf::from("/tmp/repo/wt-2")),
+        ];
+        let outposts = vec![crate::SidebarItemId::Outpost("outpost-1".to_owned())];
+
+        assert_eq!(
+            crate::normalized_sidebar_order(Some(saved.as_slice()), worktrees, outposts),
+            vec![
+                crate::SidebarItemId::Outpost("outpost-1".to_owned()),
+                crate::SidebarItemId::Worktree(PathBuf::from("/tmp/repo/wt-2")),
+                crate::SidebarItemId::Worktree(PathBuf::from("/tmp/repo/wt-1")),
+            ]
+        );
+    }
+
+    #[test]
+    fn reordered_sidebar_items_moves_dragged_item_to_requested_slot() {
+        let items = vec![
+            crate::SidebarItemId::Worktree(PathBuf::from("/tmp/repo/wt-1")),
+            crate::SidebarItemId::Worktree(PathBuf::from("/tmp/repo/wt-2")),
+            crate::SidebarItemId::Outpost("outpost-1".to_owned()),
+        ];
+
+        assert_eq!(
+            crate::reordered_sidebar_items(
+                &items,
+                &crate::SidebarItemId::Outpost("outpost-1".to_owned()),
+                0,
+            ),
+            Some(vec![
+                crate::SidebarItemId::Outpost("outpost-1".to_owned()),
+                crate::SidebarItemId::Worktree(PathBuf::from("/tmp/repo/wt-1")),
+                crate::SidebarItemId::Worktree(PathBuf::from("/tmp/repo/wt-2")),
+            ])
+        );
+
+        assert_eq!(
+            crate::reordered_sidebar_items(
+                &items,
+                &crate::SidebarItemId::Worktree(PathBuf::from("/tmp/repo/wt-1")),
+                1,
+            ),
+            None
         );
     }
 
@@ -9925,7 +10629,7 @@ mod tests {
 
     #[test]
     fn ui_state_save_has_work_for_pending_and_inflight_states() {
-        let state = crate::ui_state_store::UiState::default();
+        let state = ui_state_store::UiState::default();
 
         assert!(!crate::ui_state_save_has_work(None, None));
         assert!(crate::ui_state_save_has_work(Some(&state), None));
@@ -9934,13 +10638,13 @@ mod tests {
 
     #[test]
     fn next_pending_ui_state_save_keeps_reverted_state_queued_while_other_save_is_in_flight() {
-        let persisted = crate::ui_state_store::UiState {
+        let persisted = ui_state_store::UiState {
             left_pane_width: Some(240),
-            ..crate::ui_state_store::UiState::default()
+            ..ui_state_store::UiState::default()
         };
-        let in_flight = crate::ui_state_store::UiState {
+        let in_flight = ui_state_store::UiState {
             left_pane_width: Some(320),
-            ..crate::ui_state_store::UiState::default()
+            ..ui_state_store::UiState::default()
         };
 
         assert_eq!(
@@ -9951,14 +10655,14 @@ mod tests {
 
     #[test]
     fn next_pending_ui_state_save_does_not_duplicate_inflight_state() {
-        let state = crate::ui_state_store::UiState {
+        let state = ui_state_store::UiState {
             left_pane_width: Some(320),
-            ..crate::ui_state_store::UiState::default()
+            ..ui_state_store::UiState::default()
         };
 
         assert_eq!(
             crate::next_pending_ui_state_save(
-                &crate::ui_state_store::UiState::default(),
+                &ui_state_store::UiState::default(),
                 None,
                 Some(&state),
                 &state,

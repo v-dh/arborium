@@ -76,6 +76,11 @@ pub(crate) struct WorktreeQuery {
 }
 
 #[derive(Debug, Deserialize)]
+pub(crate) struct IssuesQuery {
+    pub(crate) repo_root: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub(crate) struct ChangesQuery {
     pub(crate) path: String,
 }
@@ -218,6 +223,7 @@ pub(crate) struct AppState {
     pub(crate) symphony: Option<arbor_symphony::ServiceHandle>,
     pub(crate) task_scheduler: Arc<Mutex<crate::task_scheduler::TaskScheduler>>,
     pub(crate) github_service: Arc<dyn crate::github_service::GitHubPrService>,
+    pub(crate) issue_service: Arc<crate::issue_provider::RepositoryIssueService>,
     pub(crate) agent_sessions: Arc<Mutex<HashMap<String, AgentSession>>>,
     pub(crate) agent_broadcast: tokio::sync::broadcast::Sender<AgentWsEvent>,
     pub(crate) log_broadcast: tokio::sync::broadcast::Sender<String>,

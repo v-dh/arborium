@@ -13,6 +13,7 @@ impl ArborWindow {
             self.right_pane_tab,
             RightPaneTab::Changes | RightPaneTab::FileTree
         );
+        let search_placeholder = "Filter files…";
 
         div()
             .w(px(self.right_pane_width))
@@ -59,7 +60,7 @@ impl ArborWindow {
                                     active_input_display(
                                         theme,
                                         "",
-                                        "Filter files…",
+                                        search_placeholder,
                                         theme.text_disabled,
                                         self.right_pane_search_cursor,
                                         28,
@@ -68,7 +69,7 @@ impl ArborWindow {
                                     active_input_display(
                                         theme,
                                         &search_text,
-                                        "Filter files…",
+                                        search_placeholder,
                                         theme.text_primary,
                                         self.right_pane_search_cursor,
                                         28,
@@ -77,7 +78,7 @@ impl ArborWindow {
                             } else if search_text.is_empty() {
                                 div()
                                     .text_color(rgb(theme.text_disabled))
-                                    .child("Filter files…")
+                                    .child(search_placeholder)
                                     .into_any_element()
                             } else {
                                 div()
@@ -178,10 +179,14 @@ impl ArborWindow {
         let selected_path = self.selected_changed_file.clone();
         let can_run_actions = self.can_run_local_git_actions();
         let is_busy = self.git_action_in_flight.is_some();
+        let selected_worktree_has_pull_request = self.selected_local_worktree_has_pull_request();
         let commit_enabled = can_run_actions && !is_busy && !self.changed_files.is_empty();
-        let stacked_pr_enabled = can_run_actions && !is_busy && !self.changed_files.is_empty();
+        let stacked_pr_enabled = can_run_actions
+            && !is_busy
+            && !self.changed_files.is_empty()
+            && !selected_worktree_has_pull_request;
         let push_enabled = can_run_actions && !is_busy;
-        let pr_enabled = can_run_actions && !is_busy;
+        let pr_enabled = can_run_actions && !is_busy && !selected_worktree_has_pull_request;
         let search_lower = self.right_pane_search.to_lowercase();
         let filtered_changes: Vec<_> = self
             .changed_files

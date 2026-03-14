@@ -394,6 +394,7 @@ impl ArborWindow {
                                                                 CenterTab::Logs => {
                                                                     this.logs_tab_open = false;
                                                                     this.logs_tab_active = false;
+                                                                    this.sync_navigation_ui_state_store(cx);
                                                                     cx.notify();
                                                                 },
                                                             }
@@ -431,6 +432,7 @@ impl ArborWindow {
                                                 CenterTab::Logs => {
                                                     this.logs_tab_active = true;
                                                     this.active_diff_session_id = None;
+                                                    this.sync_navigation_ui_state_store(cx);
                                                     cx.notify();
                                                 },
                                             }))

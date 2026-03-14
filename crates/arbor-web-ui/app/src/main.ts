@@ -1,6 +1,7 @@
 import "@xterm/xterm/css/xterm.css";
 import "./styles/variables.css";
 import "./styles/layout.css";
+import "./styles/overlays.css";
 import "./styles/sidebar.css";
 import "./styles/terminal.css";
 import "./styles/changes.css";
@@ -10,6 +11,8 @@ import "./styles/mobile.css";
 import { createSidebar } from "./components/sidebar";
 import { createTerminalPanel } from "./components/terminal-panel";
 import { createChangesPanel } from "./components/changes-panel";
+import { createCommandPalette } from "./components/command-palette";
+import { createWorktreeModal } from "./components/create-worktree-modal";
 import { createStatusBar } from "./components/status-bar";
 import { refresh, startAgentActivityWs } from "./state";
 
@@ -56,13 +59,15 @@ function bootstrap(): void {
   const terminalPanel = createTerminalPanel();
   const rightHandle = createResizeHandle(null, "right");
   const changesPanel = createChangesPanel();
+  const commandPalette = createCommandPalette();
+  const worktreeModal = createWorktreeModal();
   rightHandle.dataset["target"] = "right";
 
   mainLayout.append(sidebar, leftHandle, terminalPanel, rightHandle, changesPanel);
 
   const statusBar = createStatusBar();
 
-  shell.append(mobileBar, overlay, mainLayout, statusBar);
+  shell.append(mobileBar, overlay, mainLayout, statusBar, commandPalette, worktreeModal);
   appNode.append(shell);
 
   // Sidebar toggle

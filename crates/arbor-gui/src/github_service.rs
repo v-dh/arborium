@@ -1,6 +1,6 @@
 use {
     graphql_client::GraphQLQuery,
-    serde::Deserialize,
+    serde::{Deserialize, Serialize},
     std::{
         process::{Command, Stdio},
         sync::{
@@ -11,7 +11,7 @@ use {
     },
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PrState {
     Open,
     Draft,
@@ -19,28 +19,28 @@ pub enum PrState {
     Closed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReviewDecision {
     Approved,
     ChangesRequested,
     Pending,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CheckStatus {
     Success,
     Failure,
     Pending,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MergeableState {
     Conflicting,
     Mergeable,
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MergeStateStatus {
     Behind,
     Blocked,
@@ -52,7 +52,7 @@ pub enum MergeStateStatus {
     Unstable,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrDetails {
     pub number: u64,
     pub title: String,
@@ -673,7 +673,7 @@ pub trait GitHubService: Send + Sync {
         token: &str,
     ) -> Result<String, String>;
 
-    fn pull_request_number(&self, repo_slug: &str, branch: &str, token: &str) -> Option<u64>;
+    fn open_pull_request_number(&self, repo_slug: &str, branch: &str, token: &str) -> Option<u64>;
 }
 
 pub struct OctocrabGitHubService;
@@ -719,7 +719,7 @@ impl GitHubService for OctocrabGitHubService {
         })
     }
 
-    fn pull_request_number(&self, repo_slug: &str, branch: &str, token: &str) -> Option<u64> {
+    fn open_pull_request_number(&self, repo_slug: &str, branch: &str, token: &str) -> Option<u64> {
         let (owner, repo_name) = repo_slug.split_once('/')?;
         let owner = owner.to_owned();
         let repo_name = repo_name.to_owned();
@@ -737,7 +737,7 @@ impl GitHubService for OctocrabGitHubService {
                 .pulls(&owner, &repo_name)
                 .list()
                 .head(format!("{owner}:{branch}"))
-                .state(octocrab::params::State::All)
+                .state(octocrab::params::State::Open)
                 .per_page(1)
                 .send()
                 .await

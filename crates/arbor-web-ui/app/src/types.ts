@@ -5,6 +5,8 @@ export type Repository = {
   avatar_url: string | null;
 };
 
+export type RightPanelTab = "changes" | "issues";
+
 export type Worktree = {
   repo_root: string;
   path: string;
@@ -42,6 +44,53 @@ export type ChangedFile = {
   kind: ChangeKind;
   additions: number;
   deletions: number;
+};
+
+export type IssueSource = {
+  provider: string;
+  label: string;
+  repository: string;
+  url: string | null;
+};
+
+export type IssueReviewKind = "pull_request" | "merge_request";
+
+export type IssueReview = {
+  kind: IssueReviewKind;
+  label: string;
+  url: string | null;
+};
+
+export type Issue = {
+  id: string;
+  display_id: string;
+  title: string;
+  state: string;
+  url: string | null;
+  suggested_worktree_name: string;
+  updated_at: string | null;
+  linked_branch: string | null;
+  linked_review: IssueReview | null;
+};
+
+export type IssueListResponse = {
+  source: IssueSource | null;
+  issues: Issue[];
+  notice: string | null;
+};
+
+export type ManagedWorktreePreview = {
+  sanitized_worktree_name: string;
+  branch: string;
+  path: string;
+};
+
+export type WorktreeMutationResponse = {
+  repo_root: string;
+  path: string;
+  branch: string | null;
+  deleted_branch: string | null;
+  message: string;
 };
 
 export type ChangeKind =

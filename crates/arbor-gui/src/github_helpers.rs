@@ -132,7 +132,7 @@ fn github_pr_number_by_head_branch(
 ) -> Option<u64> {
     let slug = github_repo_slug_for_repo(worktree_path)?;
     let token = resolve_github_access_token(github_token)?;
-    github_service.pull_request_number(&slug, branch, &token)
+    github_service.open_pull_request_number(&slug, branch, &token)
 }
 
 fn github_pr_url(repo_slug: &str, pr_number: u64) -> String {

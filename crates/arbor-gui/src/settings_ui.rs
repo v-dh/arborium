@@ -263,14 +263,13 @@ impl ArborWindow {
         };
         let bind_mode_button = |mode: DaemonBindMode, title: &str, detail: &str| {
             let selected = modal.daemon_bind_mode == mode;
-            let active = modal.active_control == SettingsControl::DaemonBindMode;
             div()
                 .flex_1()
                 .min_w_0()
                 .cursor_pointer()
                 .rounded_sm()
                 .border_1()
-                .border_color(rgb(if selected || active {
+                .border_color(rgb(if selected {
                     theme.accent
                 } else {
                     theme.border

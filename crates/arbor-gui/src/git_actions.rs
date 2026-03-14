@@ -58,6 +58,14 @@ impl ArborWindow {
             return;
         };
 
+        if create_pull_request && self.selected_local_worktree_has_pull_request() {
+            if let Some(modal) = self.commit_modal.as_mut() {
+                modal.error = Some("This worktree already has a pull request.".to_owned());
+            }
+            cx.notify();
+            return;
+        }
+
         let message = modal.message.trim().to_owned();
         if message.is_empty() {
             if let Some(modal) = self.commit_modal.as_mut() {
@@ -372,6 +380,12 @@ impl ArborWindow {
             return;
         };
 
+        if self.selected_local_worktree_has_pull_request() {
+            self.notice = Some("selected worktree already has a pull request".to_owned());
+            cx.notify();
+            return;
+        }
+
         let repo_slug = self
             .github_repo_slug
             .clone()
@@ -420,6 +434,7 @@ impl ArborWindow {
         };
         let theme = self.theme();
         let default_message = default_commit_message(&self.changed_files);
+        let has_existing_pull_request = self.selected_local_worktree_has_pull_request();
 
         div()
             .absolute()
@@ -493,6 +508,20 @@ impl ArborWindow {
                             .text_color(rgb(0xffd7d7))
                             .child(error)
                     }))
+                    .when(has_existing_pull_request, |this| {
+                        this.child(
+                            div()
+                                .rounded_sm()
+                                .border_1()
+                                .border_color(rgb(theme.border))
+                                .bg(rgb(theme.panel_bg))
+                                .px_2()
+                                .py_1()
+                                .text_xs()
+                                .text_color(rgb(theme.text_muted))
+                                .child("This worktree already has a pull request."),
+                        )
+                    })
                     .child(
                         div()
                             .w_full()
@@ -578,9 +607,9 @@ impl ArborWindow {
                                             "commit-submit-pr",
                                             "Commit + Push + PR",
                                             ActionButtonStyle::Primary,
-                                            !modal.generating,
+                                            !modal.generating && !has_existing_pull_request,
                                         )
-                                        .when(!modal.generating, |this| {
+                                        .when(!modal.generating && !has_existing_pull_request, |this| {
                                             this.on_click(cx.listener(|this, _, _, cx| {
                                                 this.submit_commit_modal_and_create_pr(cx);
                                             }))
@@ -850,6 +879,15 @@ fn run_create_pr_for_worktree(
 
     let token = resolve_github_access_token(github_token)
         .ok_or_else(|| "GitHub authentication required, click GitHub Sign in first".to_owned())?;
+
+    if let Some(existing_pr_number) =
+        github_service.open_pull_request_number(&slug, &branch, &token)
+    {
+        return Err(format!(
+            "pull request already exists: {}",
+            github_pr_url(&slug, existing_pr_number)
+        ));
+    }
 
     github_service.create_pull_request(&slug, &title, &branch, &base_branch, &token)
 }

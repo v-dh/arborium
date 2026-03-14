@@ -16,6 +16,10 @@
   background: var(--bg-surface2);
 }
 
+.changes-subtabs {
+  background: color-mix(in srgb, var(--bg-surface2) 70%, var(--bg-surface));
+}
+
 .changes-tab-button {
   flex: 1;
   height: 30px;
@@ -33,6 +37,11 @@
   display: inline-flex;
   align-items: center;
   gap: 4px;
+}
+
+.changes-tab-label {
+  font-size: 12px;
+  font-weight: 600;
 }
 
 .changes-tab-count {
@@ -73,6 +82,7 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 12px;
   padding: 10px 14px 8px;
   border-bottom: 1px solid var(--border);
 }
@@ -94,12 +104,46 @@
   text-align: center;
 }
 
+.changes-actions,
+.issues-source-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.changes-action-btn {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  padding: 6px 10px;
+  transition: background 0.12s, color 0.12s, border-color 0.12s, opacity 0.12s;
+}
+
+.changes-action-btn:hover:not(:disabled) {
+  border-color: var(--border-strong);
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.changes-action-btn:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
 .changes-empty {
   padding: 20px 14px;
   font-size: 12px;
   color: var(--text-faint);
   font-style: italic;
   text-align: center;
+}
+
+.changes-empty-error {
+  color: var(--red);
 }
 
 .procfile-list {
@@ -300,4 +344,147 @@
 
 .changes-deletions {
   color: var(--red);
+}
+
+.issues-panel {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+}
+
+.issues-source {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 12px 14px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+.issues-source-label {
+  min-width: 0;
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.issues-source-link {
+  flex-shrink: 0;
+  font-size: 12px;
+}
+
+.issues-list {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+  gap: 8px;
+  overflow-y: auto;
+  padding: 10px;
+}
+
+.issue-item {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  border: 1px solid rgba(109, 114, 125, 0.18);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.02);
+  cursor: pointer;
+  padding: 12px;
+  transition: border-color 0.12s, background 0.12s, transform 0.12s;
+}
+
+.issue-item:hover,
+.issue-item:focus-visible {
+  border-color: rgba(137, 180, 250, 0.34);
+  background: rgba(137, 180, 250, 0.08);
+  outline: none;
+  transform: translateY(-1px);
+}
+
+.issue-item-top,
+.issue-item-bottom {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.issue-item-top {
+  min-width: 0;
+}
+
+.issue-item-bottom {
+  flex-wrap: wrap;
+}
+
+.issue-linked {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.issue-display-id {
+  flex-shrink: 0;
+  border-radius: 999px;
+  background: rgba(137, 180, 250, 0.14);
+  color: var(--accent-hover);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  padding: 4px 8px;
+}
+
+.issue-title {
+  min-width: 0;
+  flex: 1;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.issue-link {
+  flex-shrink: 0;
+  font-size: 12px;
+}
+
+.issue-state,
+.issue-age {
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+.issue-linked-chip {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  border: 1px solid rgba(109, 114, 125, 0.18);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 4px 8px;
+}
+
+.issue-linked-review {
+  border-color: rgba(137, 180, 250, 0.3);
+  background: rgba(137, 180, 250, 0.1);
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.issue-linked-branch {
+  font-family: var(--font-mono);
+}
+
+.issue-cta {
+  margin-left: auto;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
 }

@@ -56,6 +56,9 @@ pub(crate) const DEFAULT_WINDOW_DECORATIONS: WindowDecorations = WindowDecoratio
 
 pub(crate) const WORKTREE_AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
 pub(crate) const GITHUB_PR_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+pub(crate) const GITHUB_PR_REFRESH_CONCURRENCY: usize = 4;
+pub(crate) const GITHUB_PR_REFRESH_WORKER_STAGGER: Duration = Duration::from_millis(75);
+pub(crate) const LOADING_SPINNER_FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 pub(crate) const GITHUB_DEVICE_FLOW_POLL_MIN_INTERVAL: Duration = Duration::from_secs(5);
 pub(crate) const GITHUB_OAUTH_DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
 pub(crate) const GITHUB_OAUTH_ACCESS_TOKEN_URL: &str =

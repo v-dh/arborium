@@ -7,6 +7,68 @@ pub(crate) enum SidebarItemId {
     Outpost(String),
 }
 
+/// Payload carried while dragging a sidebar worktree or outpost row.
+#[derive(Debug, Clone)]
+pub(crate) struct DraggedSidebarItem {
+    pub(crate) item_id: SidebarItemId,
+    pub(crate) group_key: String,
+    pub(crate) label: String,
+    pub(crate) icon: String,
+    pub(crate) icon_color: u32,
+    pub(crate) bg_color: u32,
+    pub(crate) border_color: u32,
+    pub(crate) text_color: u32,
+}
+
+impl Render for DraggedSidebarItem {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .w(px(220.))
+            .font_family(FONT_MONO)
+            .rounded_sm()
+            .border_1()
+            .border_color(rgb(self.border_color))
+            .bg(rgb(self.bg_color))
+            .px_2()
+            .py_1()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.))
+            .opacity(0.9)
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(18.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(16.))
+                    .text_color(rgb(self.icon_color))
+                    .child(self.icon.clone()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(self.text_color))
+                    .child(self.label.clone()),
+            )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub(crate) enum RepositorySidebarTab {
+    #[default]
+    Worktrees,
+    Issues,
+}
+
 #[derive(Debug, Clone)]
 struct WorktreeSummary {
     group_key: String,
@@ -16,6 +78,8 @@ struct WorktreeSummary {
     label: String,
     branch: String,
     is_primary_checkout: bool,
+    pr_loading: bool,
+    pr_loaded: bool,
     pr_number: Option<u64>,
     pr_url: Option<String>,
     pr_details: Option<github_service::PrDetails>,
@@ -76,6 +140,44 @@ struct RepositorySummary {
     label: String,
     avatar_url: Option<String>,
     github_repo_slug: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ManagedDaemonTarget {
+    Primary,
+    Remote(usize),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct IssueTarget {
+    daemon_target: ManagedDaemonTarget,
+    repo_root: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct IssueListState {
+    issues: Vec<terminal_daemon_http::IssueDto>,
+    source: Option<terminal_daemon_http::IssueSourceDto>,
+    notice: Option<String>,
+    error: Option<String>,
+    loading: bool,
+    loaded: bool,
+    refresh_generation: u64,
+}
+
+#[derive(Debug, Clone)]
+struct CreateModalIssueContext {
+    source_label: String,
+    display_id: String,
+    title: String,
+    url: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct IssueDetailsModal {
+    target: IssueTarget,
+    source_label: String,
+    issue: terminal_daemon_http::IssueDto,
 }
 
 type SharedTerminalRuntime = Arc<dyn TerminalRuntimeHandle>;
@@ -333,7 +435,7 @@ struct DaemonTerminalRuntime {
     daemon: terminal_daemon_http::SharedTerminalDaemonClient,
     ws_state: Arc<DaemonTerminalWsState>,
     last_synced_ws_generation: std::sync::atomic::AtomicU64,
-    snapshot_request_in_flight: Arc<std::sync::atomic::AtomicBool>,
+    snapshot_request_in_flight: Arc<AtomicBool>,
     kind: TerminalRuntimeKind,
     resize_error_label: &'static str,
     exit_labels: Option<RuntimeExitLabels>,
@@ -367,8 +469,8 @@ impl Default for DaemonTerminalCachedSnapshot {
 
 struct DaemonTerminalWsState {
     event_generation: std::sync::atomic::AtomicU64,
-    closed: std::sync::atomic::AtomicBool,
-    connection_refused: std::sync::atomic::AtomicBool,
+    closed: AtomicBool,
+    connection_refused: AtomicBool,
     /// Channel to send keystroke bytes to the WS thread for low-latency binary transmission.
     ws_writer: Mutex<Option<std::sync::mpsc::Sender<Vec<u8>>>>,
     /// Channel to wake the terminal poller when new data arrives.
@@ -394,8 +496,8 @@ impl DaemonTerminalWsState {
         let cols = cols.max(2);
         Self {
             event_generation: std::sync::atomic::AtomicU64::new(0),
-            closed: std::sync::atomic::AtomicBool::new(false),
-            connection_refused: std::sync::atomic::AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+            connection_refused: AtomicBool::new(false),
             ws_writer: Mutex::new(None),
             poll_notify,
             size: Mutex::new((rows, cols)),
@@ -1366,6 +1468,7 @@ enum CreateReviewPrField {
 
 #[derive(Debug, Clone)]
 struct CreateModal {
+    instance_id: u64,
     tab: CreateModalTab,
     // Worktree fields
     repository_path: String,
@@ -1386,12 +1489,19 @@ struct CreateModal {
     outpost_name: String,
     outpost_name_cursor: usize,
     outpost_active_field: CreateOutpostField,
+    daemon_managed_target: Option<ManagedDaemonTarget>,
+    managed_preview: Option<terminal_daemon_http::ManagedWorktreePreviewDto>,
+    managed_preview_loading: bool,
+    managed_preview_error: Option<String>,
+    managed_preview_generation: u64,
+    branch_preview_generation: u64,
+    local_branch_preview: String,
+    review_branch_preview: String,
+    outpost_branch_preview: String,
+    issue_context: Option<CreateModalIssueContext>,
     // Shared
     is_creating: bool,
     creating_status: Option<String>,
-    worktree_branch_preview: String,
-    review_branch_preview: String,
-    outpost_branch_preview: String,
     error: Option<String>,
 }
 
@@ -1494,9 +1604,16 @@ struct CommitModal {
 
 #[derive(Debug, Clone)]
 struct CommandPaletteModal {
+    scope: CommandPaletteScope,
     query: String,
     query_cursor: usize,
     selected_index: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandPaletteScope {
+    Actions,
+    Issues,
 }
 
 #[derive(Debug, Clone)]
@@ -1510,6 +1627,7 @@ struct CommandPaletteItem {
 #[derive(Debug, Clone)]
 enum CommandPaletteAction {
     OpenCreateWorktree,
+    BrowseIssues,
     OpenReviewPullRequest,
     RefreshWorktrees,
     ToggleCompactSidebar,
@@ -1520,6 +1638,7 @@ enum CommandPaletteAction {
     LaunchRepoPreset(usize),
     SelectRepository(usize),
     SelectWorktree(usize),
+    OpenIssueCreateModal(terminal_daemon_http::IssueDto),
     LaunchTaskTemplate(TaskTemplate),
 }
 
@@ -1713,6 +1832,7 @@ struct ArborWindow {
     github_auth_in_progress: bool,
     github_auth_copy_feedback_active: bool,
     github_auth_copy_feedback_generation: u64,
+    next_create_modal_instance_id: u64,
     config_last_modified: Option<SystemTime>,
     repositories: Vec<RepositorySummary>,
     active_repository_index: Option<usize>,
@@ -1721,9 +1841,12 @@ struct ArborWindow {
     worktrees: Vec<WorktreeSummary>,
     worktree_stats_loading: bool,
     worktree_prs_loading: bool,
+    loading_animation_active: bool,
+    loading_animation_frame: usize,
     github_rate_limited_until: Option<SystemTime>,
     expanded_pr_checks_worktree: Option<PathBuf>,
     active_worktree_index: Option<usize>,
+    pending_local_worktree_selection: Option<PathBuf>,
     worktree_selection_epoch: usize,
     changed_files: Vec<ChangedFile>,
     selected_changed_file: Option<PathBuf>,
@@ -1754,6 +1877,7 @@ struct ArborWindow {
     terminal_selection: Option<TerminalSelection>,
     terminal_selection_drag_anchor: Option<TerminalGridPosition>,
     create_modal: Option<CreateModal>,
+    issue_details_modal: Option<IssueDetailsModal>,
     preferred_checkout_kind: CheckoutKind,
     github_auth_modal: Option<GitHubAuthModal>,
     delete_modal: Option<DeleteModal>,
@@ -1821,6 +1945,9 @@ struct ArborWindow {
     right_pane_search: String,
     right_pane_search_cursor: usize,
     right_pane_search_active: bool,
+    sidebar_order: HashMap<String, Vec<SidebarItemId>>,
+    repository_sidebar_tabs: HashMap<String, RepositorySidebarTab>,
+    issue_lists: HashMap<IssueTarget, IssueListState>,
     worktree_notes_lines: Vec<String>,
     worktree_notes_cursor: FileViewCursor,
     worktree_notes_path: Option<PathBuf>,
@@ -1888,7 +2015,7 @@ struct ArborWindow {
 
 #[derive(Debug, Clone)]
 struct RemoteDaemonState {
-    client: Arc<terminal_daemon_http::HttpTerminalDaemon>,
+    client: terminal_daemon_http::SharedTerminalDaemonClient,
     hostname: String,
     repositories: Vec<terminal_daemon_http::RemoteRepositoryDto>,
     worktrees: Vec<terminal_daemon_http::RemoteWorktreeDto>,
@@ -1903,4 +2030,5 @@ struct RemoteDaemonState {
 struct ActiveRemoteWorktree {
     daemon_index: usize,
     worktree_path: PathBuf,
+    repo_root: String,
 }

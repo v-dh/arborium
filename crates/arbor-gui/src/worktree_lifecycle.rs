@@ -1,4 +1,78 @@
 impl ArborWindow {
+    fn next_create_modal_instance_id(&mut self) -> u64 {
+        let instance_id = self.next_create_modal_instance_id;
+        self.next_create_modal_instance_id = self.next_create_modal_instance_id.wrapping_add(1);
+        instance_id
+    }
+
+    fn queue_local_worktree_selection_after_refresh(
+        &mut self,
+        worktree_path: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_local_worktree_selection = Some(worktree_path);
+        self.refresh_worktrees(cx);
+        self.terminal_scroll_handle.scroll_to_bottom();
+        self.focus_terminal_on_next_render = true;
+    }
+
+    fn refresh_create_modal_branch_previews(&mut self, cx: &mut Context<Self>) {
+        let Some(modal) = self.create_modal.as_mut() else {
+            return;
+        };
+
+        modal.branch_preview_generation = modal.branch_preview_generation.wrapping_add(1);
+        let modal_instance_id = modal.instance_id;
+        let generation = modal.branch_preview_generation;
+        let repository_path = modal.repository_path.trim().to_owned();
+        let worktree_name = modal.worktree_name.clone();
+        let pr_reference = modal.pr_reference.clone();
+        let review_name_preview =
+            review_worktree_name_preview(pr_reference.trim(), modal.worktree_name.trim());
+        let outpost_name = modal.outpost_name.clone();
+        let repo_root = self.repo_root.clone();
+        let github_login = self.branch_prefix_github_login();
+
+        self._create_modal_preview_task = Some(cx.spawn(async move |this, cx| {
+            let previews = cx
+                .background_spawn(async move {
+                    resolve_create_modal_branch_previews(
+                        &repository_path,
+                        &worktree_name,
+                        review_name_preview.as_deref(),
+                        &outpost_name,
+                        &repo_root,
+                        github_login.as_deref(),
+                    )
+                })
+                .await;
+
+            let _ = this.update(cx, |this, cx| {
+                let Some(modal) = this.create_modal.as_mut() else {
+                    return;
+                };
+                if !create_modal_branch_preview_matches(modal, modal_instance_id, generation) {
+                    return;
+                }
+
+                modal.local_branch_preview = previews.local_branch_preview;
+                modal.review_branch_preview = previews.review_branch_preview;
+                modal.outpost_branch_preview = previews.outpost_branch_preview;
+                cx.notify();
+            });
+        }));
+    }
+
+    fn repository_for_issue_target(&self, target: &IssueTarget) -> Option<&RepositorySummary> {
+        match target.daemon_target {
+            ManagedDaemonTarget::Primary => self
+                .repositories
+                .iter()
+                .find(|repository| repository.root == Path::new(&target.repo_root)),
+            ManagedDaemonTarget::Remote(_) => None,
+        }
+    }
+
     fn open_create_modal(
         &mut self,
         repo_index: usize,
@@ -16,7 +90,9 @@ impl ArborWindow {
             .and_then(|r| r.github_repo_slug.as_ref())
             .map(|slug| format!("git@github.com:{slug}.git"))
             .unwrap_or_default();
+        self.issue_details_modal = None;
         self.create_modal = Some(CreateModal {
+            instance_id: self.next_create_modal_instance_id(),
             tab,
             repository_path_cursor: char_count(&repository_path),
             repository_path,
@@ -34,15 +110,178 @@ impl ArborWindow {
             outpost_name: String::new(),
             outpost_name_cursor: 0,
             outpost_active_field: CreateOutpostField::CloneUrl,
+            daemon_managed_target: None,
+            managed_preview: None,
+            managed_preview_loading: false,
+            managed_preview_error: None,
+            managed_preview_generation: 0,
+            branch_preview_generation: 0,
+            local_branch_preview: derive_branch_name(""),
+            review_branch_preview: "Will derive from pull request".to_owned(),
+            outpost_branch_preview: derive_branch_name(""),
+            issue_context: None,
             is_creating: false,
             creating_status: None,
-            worktree_branch_preview: String::new(),
-            review_branch_preview: String::new(),
-            outpost_branch_preview: String::new(),
             error: None,
         });
-        self.refresh_create_modal_previews(cx);
+        self.refresh_create_modal_branch_previews(cx);
         cx.notify();
+    }
+
+    fn open_issue_create_modal(
+        &mut self,
+        issue: terminal_daemon_http::IssueDto,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(target) = self.issue_target_for_current_selection() else {
+            self.notice = Some("No daemon-backed repository is selected for this issue.".to_owned());
+            cx.notify();
+            return;
+        };
+
+        let source_label = self
+            .issue_list_state(&target)
+            .and_then(|state| state.source.as_ref())
+            .map(issue_modal_source_label)
+            .unwrap_or_else(|| "Issue".to_owned());
+
+        self.open_issue_create_modal_for_target(target, source_label, issue, cx);
+    }
+
+    fn open_issue_create_modal_for_target(
+        &mut self,
+        target: IssueTarget,
+        source_label: String,
+        issue: terminal_daemon_http::IssueDto,
+        cx: &mut Context<Self>,
+    ) {
+        let repository_path = target.repo_root.clone();
+        let worktree_name = issue.suggested_worktree_name.clone();
+        let clone_url = self
+            .repository_for_issue_target(&target)
+            .and_then(|repository| repository.github_repo_slug.as_ref())
+            .map(|slug| format!("git@github.com:{slug}.git"))
+            .unwrap_or_default();
+        self.issue_details_modal = None;
+
+        self.create_modal = Some(CreateModal {
+            instance_id: self.next_create_modal_instance_id(),
+            tab: CreateModalTab::LocalWorktree,
+            repository_path_cursor: char_count(&repository_path),
+            repository_path,
+            worktree_name_cursor: char_count(&worktree_name),
+            worktree_name,
+            checkout_kind: CheckoutKind::LinkedWorktree,
+            worktree_active_field: CreateWorktreeField::WorktreeName,
+            pr_reference: String::new(),
+            pr_reference_cursor: 0,
+            review_active_field: CreateReviewPrField::PullRequestReference,
+            host_index: 0,
+            host_dropdown_open: false,
+            clone_url_cursor: char_count(&clone_url),
+            clone_url,
+            outpost_name: String::new(),
+            outpost_name_cursor: 0,
+            outpost_active_field: CreateOutpostField::CloneUrl,
+            daemon_managed_target: Some(target.daemon_target),
+            managed_preview: None,
+            managed_preview_loading: false,
+            managed_preview_error: None,
+            managed_preview_generation: 0,
+            branch_preview_generation: 0,
+            local_branch_preview: derive_branch_name(issue.suggested_worktree_name.as_str()),
+            review_branch_preview: "Will derive from pull request".to_owned(),
+            outpost_branch_preview: derive_branch_name(""),
+            issue_context: Some(CreateModalIssueContext {
+                source_label,
+                display_id: issue.display_id,
+                title: issue.title,
+                url: issue.url,
+            }),
+            is_creating: false,
+            creating_status: None,
+            error: None,
+        });
+        self.refresh_create_modal_branch_previews(cx);
+        self.refresh_create_modal_managed_preview(cx);
+        cx.notify();
+    }
+
+    fn refresh_create_modal_managed_preview(&mut self, cx: &mut Context<Self>) {
+        let Some(modal) = self.create_modal.as_mut() else {
+            return;
+        };
+        let Some(target) = modal.daemon_managed_target else {
+            return;
+        };
+
+        let repository_path = modal.repository_path.trim().to_owned();
+        let worktree_name = modal.worktree_name.trim().to_owned();
+        modal.managed_preview_generation = modal.managed_preview_generation.wrapping_add(1);
+        let modal_instance_id = modal.instance_id;
+        let generation = modal.managed_preview_generation;
+
+        if repository_path.is_empty() || worktree_name.is_empty() {
+            modal.managed_preview = None;
+            modal.managed_preview_loading = false;
+            modal.managed_preview_error = None;
+            cx.notify();
+            return;
+        }
+
+        let client = match target {
+            ManagedDaemonTarget::Primary => self.terminal_daemon.clone(),
+            ManagedDaemonTarget::Remote(index) => self
+                .remote_daemon_states
+                .get(&index)
+                .map(|state| state.client.clone()),
+        };
+        let Some(client) = client else {
+            modal.managed_preview = None;
+            modal.managed_preview_loading = false;
+            modal.managed_preview_error =
+                Some("No daemon connection is available for this issue.".to_owned());
+            cx.notify();
+            return;
+        };
+
+        modal.managed_preview = None;
+        modal.managed_preview_loading = true;
+        modal.managed_preview_error = None;
+        self.ensure_loading_animation(cx);
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let preview = cx
+                .background_spawn(async move {
+                    client.preview_managed_worktree(&repository_path, &worktree_name)
+                })
+                .await;
+
+            let _ = this.update(cx, |this, cx| {
+                let Some(modal) = this.create_modal.as_mut() else {
+                    return;
+                };
+                if !managed_preview_request_matches(modal, modal_instance_id, generation) {
+                    return;
+                }
+
+                modal.managed_preview_loading = false;
+                match preview {
+                    Ok(preview) => {
+                        modal.managed_preview = Some(preview);
+                        modal.managed_preview_error = None;
+                    },
+                    Err(error) => {
+                        modal.managed_preview = None;
+                        modal.managed_preview_error =
+                            Some(format!("failed to resolve worktree preview: {error}"));
+                    },
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn update_create_review_pr_modal_input(
@@ -50,6 +289,7 @@ impl ArborWindow {
         input: ReviewPrModalInputEvent,
         cx: &mut Context<Self>,
     ) {
+        let mut refresh_branch_previews = false;
         let Some(modal) = self.create_modal.as_mut() else {
             return;
         };
@@ -87,6 +327,7 @@ impl ArborWindow {
                         &mut modal.repository_path_cursor,
                         &action,
                     );
+                    refresh_branch_previews = true;
                 },
                 CreateReviewPrField::PullRequestReference => {
                     apply_text_edit_action(
@@ -94,6 +335,7 @@ impl ArborWindow {
                         &mut modal.pr_reference_cursor,
                         &action,
                     );
+                    refresh_branch_previews = true;
                 },
                 CreateReviewPrField::WorktreeName => {
                     apply_text_edit_action(
@@ -101,6 +343,7 @@ impl ArborWindow {
                         &mut modal.worktree_name_cursor,
                         &action,
                     );
+                    refresh_branch_previews = true;
                 },
             },
             ReviewPrModalInputEvent::ClearError => {
@@ -108,8 +351,10 @@ impl ArborWindow {
             },
         }
 
-        self.refresh_create_modal_previews(cx);
         cx.notify();
+        if refresh_branch_previews {
+            self.refresh_create_modal_branch_previews(cx);
+        }
     }
 
     fn set_create_modal_checkout_kind(
@@ -127,13 +372,11 @@ impl ArborWindow {
         modal.checkout_kind = checkout_kind;
         modal.error = None;
         self.preferred_checkout_kind = checkout_kind;
-        self.refresh_create_modal_previews(cx);
         cx.notify();
     }
 
     fn close_create_modal(&mut self, cx: &mut Context<Self>) {
         self.create_modal = None;
-        self._create_modal_preview_task = None;
         cx.notify();
     }
 
@@ -325,6 +568,8 @@ impl ArborWindow {
         input: ModalInputEvent,
         cx: &mut Context<Self>,
     ) {
+        let mut refresh_managed_preview = false;
+        let mut refresh_branch_previews = false;
         let Some(modal) = self.create_modal.as_mut() else {
             return;
         };
@@ -358,6 +603,8 @@ impl ArborWindow {
                         &mut modal.repository_path_cursor,
                         &action,
                     );
+                    refresh_managed_preview = modal.daemon_managed_target.is_some();
+                    refresh_branch_previews = true;
                 },
                 CreateWorktreeField::WorktreeName => {
                     apply_text_edit_action(
@@ -365,6 +612,8 @@ impl ArborWindow {
                         &mut modal.worktree_name_cursor,
                         &action,
                     );
+                    refresh_managed_preview = modal.daemon_managed_target.is_some();
+                    refresh_branch_previews = true;
                 },
             },
             ModalInputEvent::ClearError => {
@@ -372,8 +621,13 @@ impl ArborWindow {
             },
         }
 
-        self.refresh_create_modal_previews(cx);
         cx.notify();
+        if refresh_branch_previews {
+            self.refresh_create_modal_branch_previews(cx);
+        }
+        if refresh_managed_preview {
+            self.refresh_create_modal_managed_preview(cx);
+        }
     }
 
     fn submit_create_worktree_modal(&mut self, cx: &mut Context<Self>) {
@@ -389,6 +643,7 @@ impl ArborWindow {
         let repository_input = modal.repository_path.trim().to_owned();
         let worktree_input = modal.worktree_name.trim().to_owned();
         let checkout_kind = modal.checkout_kind;
+        let daemon_managed_target = modal.daemon_managed_target;
         if repository_input.is_empty() {
             modal.error = Some("Repository path is required.".to_owned());
             cx.notify();
@@ -402,7 +657,95 @@ impl ArborWindow {
         }
 
         modal.is_creating = true;
+        modal.creating_status = daemon_managed_target.map(|_| "Creating managed worktree…".to_owned());
         cx.notify();
+
+        if let Some(target) = daemon_managed_target {
+            let client = match target {
+                ManagedDaemonTarget::Primary => self.terminal_daemon.clone(),
+                ManagedDaemonTarget::Remote(index) => self
+                    .remote_daemon_states
+                    .get(&index)
+                    .map(|state| state.client.clone()),
+            };
+            let Some(client) = client else {
+                if let Some(modal) = self.create_modal.as_mut() {
+                    modal.is_creating = false;
+                    modal.creating_status = None;
+                    modal.error =
+                        Some("No daemon connection is available for this issue.".to_owned());
+                }
+                cx.notify();
+                return;
+            };
+
+            cx.spawn(async move |this, cx| {
+                let creation = cx
+                    .background_spawn(async move {
+                        client.create_managed_worktree(&repository_input, &worktree_input)
+                    })
+                    .await;
+
+                let _ = this.update(cx, |this, cx| {
+                    match creation {
+                        Ok(created) => {
+                            this.create_modal = None;
+                            this.notice = Some(created.message.clone());
+
+                            match target {
+                                ManagedDaemonTarget::Primary => {
+                                    let worktree_path = PathBuf::from(&created.path);
+                                    this.queue_local_worktree_selection_after_refresh(
+                                        worktree_path,
+                                        cx,
+                                    );
+                                },
+                                ManagedDaemonTarget::Remote(index) => {
+                                    if let Some(state) = this.remote_daemon_states.get_mut(&index) {
+                                        let branch = created.branch.clone().unwrap_or_default();
+                                        if !state.worktrees.iter().any(|worktree| worktree.path == created.path)
+                                        {
+                                            state.worktrees.push(
+                                                terminal_daemon_http::RemoteWorktreeDto {
+                                                    repo_root: created.repo_root.clone(),
+                                                    path: created.path.clone(),
+                                                    branch,
+                                                    is_primary_checkout: false,
+                                                    last_activity_unix_ms: None,
+                                                    diff_additions: None,
+                                                    diff_deletions: None,
+                                                    pr_number: None,
+                                                    pr_url: None,
+                                                },
+                                            );
+                                        }
+                                    }
+
+                                    this.activate_remote_worktree(
+                                        index,
+                                        created.path,
+                                        cx,
+                                    );
+                                },
+                            }
+                        },
+                        Err(error) => {
+                            tracing::error!("daemon worktree creation failed: {error}");
+                            if let Some(modal) = this.create_modal.as_mut() {
+                                modal.is_creating = false;
+                                modal.creating_status = None;
+                                modal.error = Some(format!("{error}"));
+                            } else {
+                                this.notice = Some(format!("{error}"));
+                            }
+                        },
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+            return;
+        }
 
         cx.spawn(async move |this, cx| {
             let creation = cx
@@ -447,20 +790,10 @@ impl ArborWindow {
                             created.branch_name
                         ));
                         this.create_modal = None;
-                        this.refresh_worktrees(cx);
-                        if let Some(index) = this
-                            .worktrees
-                            .iter()
-                            .position(|worktree| worktree.path == created.worktree_path)
-                        {
-                            this.active_worktree_index = Some(index);
-                            this.refresh_changed_files(cx);
-                            if this.ensure_selected_worktree_terminal(cx) {
-                                this.sync_daemon_session_store(cx);
-                            }
-                            this.terminal_scroll_handle.scroll_to_bottom();
-                            this.focus_terminal_on_next_render = true;
-                        }
+                        this.queue_local_worktree_selection_after_refresh(
+                            created.worktree_path,
+                            cx,
+                        );
                     },
                     Err(error) => {
                         tracing::error!("worktree creation failed: {error}");
@@ -564,20 +897,10 @@ impl ArborWindow {
                         };
                         this.notice = Some(notice);
                         this.create_modal = None;
-                        this.refresh_worktrees(cx);
-                        if let Some(index) = this
-                            .worktrees
-                            .iter()
-                            .position(|worktree| worktree.path == created.worktree_path)
-                        {
-                            this.active_worktree_index = Some(index);
-                            this.refresh_changed_files(cx);
-                            if this.ensure_selected_worktree_terminal(cx) {
-                                this.sync_daemon_session_store(cx);
-                            }
-                            this.terminal_scroll_handle.scroll_to_bottom();
-                            this.focus_terminal_on_next_render = true;
-                        }
+                        this.queue_local_worktree_selection_after_refresh(
+                            created.worktree_path,
+                            cx,
+                        );
                     },
                     Err(error) => {
                         tracing::error!("pull request review creation failed: {error}");
@@ -601,6 +924,7 @@ impl ArborWindow {
         input: OutpostModalInputEvent,
         cx: &mut Context<Self>,
     ) {
+        let mut refresh_branch_previews = false;
         let Some(modal) = self.create_modal.as_mut() else {
             return;
         };
@@ -672,6 +996,7 @@ impl ArborWindow {
                             &mut modal.outpost_name_cursor,
                             &action,
                         );
+                        refresh_branch_previews = true;
                     },
                 }
             },
@@ -680,73 +1005,10 @@ impl ArborWindow {
             },
         }
 
-        self.refresh_create_modal_previews(cx);
         cx.notify();
-    }
-
-    fn refresh_create_modal_previews(&mut self, cx: &mut Context<Self>) {
-        let Some(modal) = self.create_modal.clone() else {
-            self._create_modal_preview_task = None;
-            return;
-        };
-
-        let github_login = self.branch_prefix_github_login();
-        let repo_root = self.repo_root.clone();
-        self._create_modal_preview_task = Some(cx.spawn(async move |this, cx| {
-            let repository_path = modal.repository_path.clone();
-            let worktree_name = modal.worktree_name.clone();
-            let pr_reference = modal.pr_reference.clone();
-            let outpost_name = modal.outpost_name.clone();
-            let previews = cx
-                .background_spawn(async move {
-                    let worktree_branch_preview = derive_branch_name_for_repo_with_login(
-                        Path::new(repository_path.trim()),
-                        worktree_name.trim(),
-                        github_login.as_deref(),
-                    );
-                    let review_branch_preview = review_worktree_name_preview(
-                        pr_reference.trim(),
-                        worktree_name.trim(),
-                    )
-                    .map(|name| {
-                        derive_branch_name_for_repo_with_login(
-                            Path::new(repository_path.trim()),
-                            &name,
-                            github_login.as_deref(),
-                        )
-                    })
-                    .unwrap_or_else(|| "Will derive from pull request".to_owned());
-                    let outpost_branch_preview = derive_branch_name_for_repo_with_login(
-                        &repo_root,
-                        outpost_name.trim(),
-                        github_login.as_deref(),
-                    );
-                    (
-                        worktree_branch_preview,
-                        review_branch_preview,
-                        outpost_branch_preview,
-                    )
-                })
-                .await;
-
-            let _ = this.update(cx, |this, cx| {
-                let Some(current) = this.create_modal.as_mut() else {
-                    return;
-                };
-                if current.repository_path != modal.repository_path
-                    || current.worktree_name != modal.worktree_name
-                    || current.pr_reference != modal.pr_reference
-                    || current.outpost_name != modal.outpost_name
-                {
-                    return;
-                }
-
-                current.worktree_branch_preview = previews.0;
-                current.review_branch_preview = previews.1;
-                current.outpost_branch_preview = previews.2;
-                cx.notify();
-            });
-        }));
+        if refresh_branch_previews {
+            self.refresh_create_modal_branch_previews(cx);
+        }
     }
 
     fn submit_create_outpost_modal(&mut self, cx: &mut Context<Self>) {
@@ -1010,19 +1272,34 @@ impl ArborWindow {
         let is_worktree_tab = modal.tab == CreateModalTab::LocalWorktree;
         let is_review_pr_tab = modal.tab == CreateModalTab::ReviewPullRequest;
         let is_outpost_tab = modal.tab == CreateModalTab::RemoteOutpost;
+        let daemon_managed_worktree = modal.daemon_managed_target.is_some();
+        let issue_context = modal.issue_context.clone();
 
         // Worktree tab data
-        let branch_name = modal.worktree_branch_preview.clone();
-        let target_path_preview =
+        let branch_name = if let Some(preview) = modal.managed_preview.as_ref() {
+            preview.branch.clone()
+        } else if daemon_managed_worktree && modal.managed_preview_loading {
+            "Resolving preview…".to_owned()
+        } else {
+            modal.local_branch_preview.clone()
+        };
+        let target_path_preview = if let Some(preview) = modal.managed_preview.as_ref() {
+            preview.path.clone()
+        } else if daemon_managed_worktree && modal.managed_preview_loading {
+            "Resolving preview…".to_owned()
+        } else {
             preview_managed_worktree_path(modal.repository_path.trim(), modal.worktree_name.trim())
-                .unwrap_or_else(|_| "-".to_owned());
+                .unwrap_or_else(|_| "-".to_owned())
+        };
         let checkout_kind = modal.checkout_kind;
         let is_discrete_clone = checkout_kind == CheckoutKind::DiscreteClone;
         let repository_active = modal.worktree_active_field == CreateWorktreeField::RepositoryPath;
         let worktree_active = modal.worktree_active_field == CreateWorktreeField::WorktreeName;
         let worktree_create_disabled = modal.is_creating
             || modal.repository_path.trim().is_empty()
-            || modal.worktree_name.trim().is_empty();
+            || modal.worktree_name.trim().is_empty()
+            || (daemon_managed_worktree
+                && (modal.managed_preview_loading || modal.managed_preview.is_none()));
 
         // Review PR tab data
         let review_repository_active =
@@ -1080,9 +1357,12 @@ impl ArborWindow {
         } else {
             outpost_create_disabled
         };
+        let modal_body_max_height = px(460.);
         let creating_status = modal.creating_status.clone();
         let submit_label: String = if modal.is_creating {
             creating_status.as_deref().unwrap_or("Creating…").to_owned()
+        } else if daemon_managed_worktree && is_worktree_tab {
+            "Create Worktree".to_owned()
         } else if is_worktree_tab {
             checkout_kind.action_label().to_owned()
         } else if is_review_pr_tab {
@@ -1116,6 +1396,7 @@ impl ArborWindow {
                 div()
                     .w(px(620.))
                     .max_w(px(620.))
+                    .h_auto()
                     .flex_none()
                     .overflow_hidden()
                     .rounded_md()
@@ -1244,556 +1525,555 @@ impl ArborWindow {
                                 )
                             }),
                     )
-                    // Local Worktree tab content
-                    .when(is_worktree_tab, |this| {
-                        this.child(
-                            div()
-                                .flex_none()
-                                .text_xs()
-                                .text_color(rgb(theme.text_muted))
-                                .child("Target base: ~/.arbor/worktrees/<repo>/<worktree>/"),
-                        )
-                        .child(
-                            div()
-                                .flex_none()
-                                .id("create-discrete-clone-checkbox")
-                                .cursor_pointer()
-                                .rounded_sm()
-                                .border_1()
-                                .border_color(rgb(if is_discrete_clone {
-                                    theme.accent
-                                } else {
-                                    theme.border
-                                }))
-                                .bg(rgb(theme.panel_bg))
-                                .hover(|this| this.bg(rgb(theme.panel_active_bg)))
-                                .px_2()
-                                .py_2()
-                                .flex()
-                                .items_start()
-                                .gap_2()
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    let next_kind = if is_discrete_clone {
-                                        CheckoutKind::LinkedWorktree
-                                    } else {
-                                        CheckoutKind::DiscreteClone
-                                    };
-                                    this.set_create_modal_checkout_kind(next_kind, cx);
-                                }))
-                                .child(
-                                    div()
-                                        .mt(px(1.))
-                                        .w(px(14.))
-                                        .h(px(14.))
-                                        .rounded_sm()
-                                        .border_1()
-                                        .border_color(rgb(if is_discrete_clone {
-                                            theme.accent
-                                        } else {
-                                            theme.border
-                                        }))
-                                        .bg(rgb(if is_discrete_clone {
-                                            theme.accent
-                                        } else {
-                                            theme.panel_bg
-                                        }))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .child(
-                                            div()
-                                                .font_family(FONT_MONO)
-                                                .text_size(px(9.))
-                                                .text_color(rgb(if is_discrete_clone {
-                                                    theme.sidebar_bg
-                                                } else {
-                                                    theme.panel_bg
-                                                }))
-                                                .child(if is_discrete_clone {
-                                                    "\u{f00c}"
-                                                } else {
-                                                    ""
-                                                }),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .flex()
-                                        .flex_col()
-                                        .gap(px(2.))
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .font_weight(FontWeight::SEMIBOLD)
-                                                .text_color(rgb(theme.text_primary))
-                                                .child("Discrete clone"),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(rgb(theme.text_muted))
-                                                .child(checkout_kind.description()),
-                                        ),
-                                ),
-                        )
-                        .child(
-                            modal_input_field(
-                                theme,
-                                "create-worktree-repo-input",
-                                "Repository",
-                                &modal.repository_path,
-                                modal.repository_path_cursor,
-                                "Path to git repository",
-                                repository_active,
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.update_create_worktree_modal_input(
-                                    ModalInputEvent::SetActiveField(
-                                        CreateWorktreeField::RepositoryPath,
-                                    ),
-                                    cx,
-                                );
-                            })),
-                        )
-                        .child(
-                            modal_input_field(
-                                theme,
-                                "create-worktree-name-input",
-                                "Worktree Name",
-                                &modal.worktree_name,
-                                modal.worktree_name_cursor,
-                                "e.g. remote-ssh",
-                                worktree_active,
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.update_create_worktree_modal_input(
-                                    ModalInputEvent::SetActiveField(
-                                        CreateWorktreeField::WorktreeName,
-                                    ),
-                                    cx,
-                                );
-                            })),
-                        )
-                        .child(
-                            div()
-                                .flex_none()
-                                .rounded_sm()
-                                .border_1()
-                                .border_color(rgb(theme.border))
-                                .bg(rgb(theme.panel_bg))
-                                .p_2()
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(theme.text_muted))
-                                        .child("Branch"),
-                                )
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_family(FONT_MONO)
-                                        .text_color(rgb(theme.text_primary))
-                                        .child(branch_name),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .flex_none()
-                                .rounded_sm()
-                                .border_1()
-                                .border_color(rgb(theme.border))
-                                .bg(rgb(theme.panel_bg))
-                                .p_2()
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(theme.text_muted))
-                                        .child("Path"),
-                                )
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_family(FONT_MONO)
-                                        .text_color(rgb(theme.text_primary))
-                                        .child(target_path_preview),
-                                ),
-                        )
-                    })
-                    // Review PR tab content
-                    .when(is_review_pr_tab, |this| {
-                        this.child(
-                            div()
-                                .flex_none()
-                                .text_xs()
-                                .text_color(rgb(theme.text_muted))
-                                .child("Paste a GitHub PR number, `#123`, or full pull-request URL."),
-                        )
-                        .child(
-                            div()
-                                .flex_none()
-                                .id("create-review-pr-discrete-clone-checkbox")
-                                .cursor_pointer()
-                                .rounded_sm()
-                                .border_1()
-                                .border_color(rgb(if is_discrete_clone {
-                                    theme.accent
-                                } else {
-                                    theme.border
-                                }))
-                                .bg(rgb(theme.panel_bg))
-                                .hover(|this| this.bg(rgb(theme.panel_active_bg)))
-                                .px_2()
-                                .py_2()
-                                .flex()
-                                .items_start()
-                                .gap_2()
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    let next_kind = if is_discrete_clone {
-                                        CheckoutKind::LinkedWorktree
-                                    } else {
-                                        CheckoutKind::DiscreteClone
-                                    };
-                                    this.set_create_modal_checkout_kind(next_kind, cx);
-                                }))
-                                .child(
-                                    div()
-                                        .mt(px(1.))
-                                        .w(px(14.))
-                                        .h(px(14.))
-                                        .rounded_sm()
-                                        .border_1()
-                                        .border_color(rgb(if is_discrete_clone {
-                                            theme.accent
-                                        } else {
-                                            theme.border
-                                        }))
-                                        .bg(rgb(if is_discrete_clone {
-                                            theme.accent
-                                        } else {
-                                            theme.panel_bg
-                                        }))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .child(
-                                            div()
-                                                .font_family(FONT_MONO)
-                                                .text_size(px(9.))
-                                                .text_color(rgb(if is_discrete_clone {
-                                                    theme.sidebar_bg
-                                                } else {
-                                                    theme.panel_bg
-                                                }))
-                                                .child(if is_discrete_clone {
-                                                    "\u{f00c}"
-                                                } else {
-                                                    ""
-                                                }),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .flex()
-                                        .flex_col()
-                                        .gap(px(2.))
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .font_weight(FontWeight::SEMIBOLD)
-                                                .text_color(rgb(theme.text_primary))
-                                                .child("Discrete clone"),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(rgb(theme.text_muted))
-                                                .child(checkout_kind.description()),
-                                        ),
-                                ),
-                        )
-                        .child(
-                            modal_input_field(
-                                theme,
-                                "review-pr-repo-input",
-                                "Repository",
-                                &modal.repository_path,
-                                modal.repository_path_cursor,
-                                "Path to git repository",
-                                review_repository_active,
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.update_create_review_pr_modal_input(
-                                    ReviewPrModalInputEvent::SetActiveField(
-                                        CreateReviewPrField::RepositoryPath,
-                                    ),
-                                    cx,
-                                );
-                            })),
-                        )
-                        .child(
-                            modal_input_field(
-                                theme,
-                                "review-pr-reference-input",
-                                "Pull Request",
-                                &modal.pr_reference,
-                                modal.pr_reference_cursor,
-                                "e.g. 42, #42, or https://github.com/org/repo/pull/42",
-                                review_pr_active,
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.update_create_review_pr_modal_input(
-                                    ReviewPrModalInputEvent::SetActiveField(
-                                        CreateReviewPrField::PullRequestReference,
-                                    ),
-                                    cx,
-                                );
-                            })),
-                        )
-                        .child(
-                            modal_input_field(
-                                theme,
-                                "review-pr-name-input",
-                                "Worktree Name",
-                                &modal.worktree_name,
-                                modal.worktree_name_cursor,
-                                "Optional. Defaults from the pull request title.",
-                                review_name_active,
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.update_create_review_pr_modal_input(
-                                    ReviewPrModalInputEvent::SetActiveField(
-                                        CreateReviewPrField::WorktreeName,
-                                    ),
-                                    cx,
-                                );
-                            })),
-                        )
-                        .child(
-                            div()
-                                .flex_none()
-                                .rounded_sm()
-                                .border_1()
-                                .border_color(rgb(theme.border))
-                                .bg(rgb(theme.panel_bg))
-                                .p_2()
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(theme.text_muted))
-                                        .child("Branch"),
-                                )
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_family(FONT_MONO)
-                                        .text_color(rgb(theme.text_primary))
-                                        .child(review_branch_preview),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .flex_none()
-                                .rounded_sm()
-                                .border_1()
-                                .border_color(rgb(theme.border))
-                                .bg(rgb(theme.panel_bg))
-                                .p_2()
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(theme.text_muted))
-                                        .child("Path"),
-                                )
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_family(FONT_MONO)
-                                        .text_color(rgb(theme.text_primary))
-                                        .child(review_path_preview),
-                                ),
-                        )
-                    })
-                    // Remote Outpost tab content
-                    .when(is_outpost_tab, |this| {
-                        this.child(
-                            div()
-                                .flex_none()
-                                .id("outpost-host-selector")
-                                .cursor_pointer()
-                                .rounded_sm()
-                                .border_1()
-                                .border_color(rgb(if host_active {
-                                    theme.accent
-                                } else {
-                                    theme.border
-                                }))
-                                .bg(rgb(theme.panel_bg))
-                                .hover(|this| this.bg(rgb(theme.panel_active_bg)))
-                                .p_2()
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(theme.text_muted))
-                                        .child("Host"),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .justify_between()
-                                        .child(
-                                            div()
-                                                .text_sm()
-                                                .font_family(FONT_MONO)
-                                                .text_color(rgb(theme.text_primary))
-                                                .child(host_name),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(rgb(theme.text_muted))
-                                                .child(if host_dropdown_open {
-                                                    "\u{25b2}"
-                                                } else {
-                                                    "\u{25bc}"
-                                                }),
-                                        ),
-                                )
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.update_create_outpost_modal_input(
-                                        OutpostModalInputEvent::ToggleHostDropdown,
-                                        cx,
-                                    );
-                                })),
-                        )
-                        .when(host_dropdown_open, |this| {
-                            this.child(
+                    .child(
+                        div()
+                            .id("create-modal-body")
+                            .flex_none()
+                            .min_h_0()
+                            .max_h(modal_body_max_height)
+                            .overflow_y_scroll()
+                            .pr_1()
+                            .child(
                                 div()
-                                    .id("outpost-host-dropdown")
-                                    .rounded_sm()
-                                    .border_1()
-                                    .border_color(rgb(theme.accent))
-                                    .bg(rgb(theme.panel_bg))
-                                    .py_1()
-                                    .max_h(px(200.))
-                                    .overflow_y_scroll()
-                                    .children(host_names.into_iter().map(
-                                        |(index, name)| {
-                                            let is_selected = index == selected_host_index;
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    // Local Worktree tab content
+                                    .when(is_worktree_tab, |this| {
+                                        this.child(
                                             div()
-                                                .id(("host-option", index))
-                                                .cursor_pointer()
-                                                .px_2()
-                                                .py_1()
-                                                .text_sm()
-                                                .font_family(FONT_MONO)
-                                                .rounded_sm()
-                                                .mx_1()
-                                                .text_color(rgb(theme.text_primary))
-                                                .when(is_selected, |this| {
-                                                    this.bg(rgb(theme.panel_active_bg))
-                                                })
-                                                .hover(|this| {
-                                                    this.bg(rgb(theme.panel_active_bg))
-                                                })
-                                                .child(name)
-                                                .on_click(cx.listener(
-                                                    move |this, _, _, cx| {
-                                                        this.update_create_outpost_modal_input(
-                                                            OutpostModalInputEvent::SelectHost(
-                                                                index,
+                                                .flex_none()
+                                                .text_xs()
+                                                .text_color(rgb(theme.text_muted))
+                                                .child(if daemon_managed_worktree {
+                                                    "Managed worktrees are created by the daemon under ~/.arbor/worktrees/<repo>/<worktree>/."
+                                                } else {
+                                                    "Target base: ~/.arbor/worktrees/<repo>/<worktree>/"
+                                                }),
+                                        )
+                                        .when_some(issue_context.clone(), |this, issue| {
+                                            this.child(
+                                                div()
+                                                    .w_full()
+                                                    .min_w_0()
+                                                    .rounded_sm()
+                                                    .border_1()
+                                                    .border_color(rgb(theme.border))
+                                                    .bg(rgb(theme.panel_bg))
+                                                    .p_2()
+                                                    .flex()
+                                                    .flex_col()
+                                                    .gap(px(4.))
+                                                    .child(
+                                                        div()
+                                                            .flex()
+                                                            .items_center()
+                                                            .justify_between()
+                                                            .gap_2()
+                                                            .child(
+                                                                div()
+                                                                    .text_xs()
+                                                                    .font_family(FONT_MONO)
+                                                                    .text_color(rgb(theme.accent))
+                                                                    .child(issue.display_id),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .text_xs()
+                                                                    .text_color(rgb(theme.text_muted))
+                                                                    .child(issue.source_label),
                                                             ),
-                                                            cx,
-                                                        );
-                                                    },
-                                                ))
-                                        },
-                                    )),
-                            )
-                        })
-                        .child(
-                            modal_input_field(
-                                theme,
-                                "outpost-clone-url-input",
-                                "Clone URL",
-                                &modal.clone_url,
-                                modal.clone_url_cursor,
-                                "git@github.com:user/repo.git",
-                                clone_url_active,
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.update_create_outpost_modal_input(
-                                    OutpostModalInputEvent::SetActiveField(
-                                        CreateOutpostField::CloneUrl,
-                                    ),
-                                    cx,
-                                );
-                            })),
-                        )
-                        .child(
-                            modal_input_field(
-                                theme,
-                                "outpost-name-input",
-                                "Outpost Name",
-                                &modal.outpost_name,
-                                modal.outpost_name_cursor,
-                                "e.g. my-feature",
-                                outpost_name_active,
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.update_create_outpost_modal_input(
-                                    OutpostModalInputEvent::SetActiveField(
-                                        CreateOutpostField::OutpostName,
-                                    ),
-                                    cx,
-                                );
-                            })),
-                        )
-                        .child(
-                            div()
-                                .rounded_sm()
-                                .border_1()
-                                .border_color(rgb(theme.border))
-                                .bg(rgb(theme.panel_bg))
-                                .p_2()
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(theme.text_muted))
-                                        .child("Branch"),
-                                )
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_family(FONT_MONO)
-                                        .text_color(rgb(theme.text_primary))
-                                        .child(outpost_branch_preview),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .rounded_sm()
-                                .border_1()
-                                .border_color(rgb(theme.border))
-                                .bg(rgb(theme.panel_bg))
-                                .p_2()
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(theme.text_muted))
-                                        .child("Remote Path"),
-                                )
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_family(FONT_MONO)
-                                        .text_color(rgb(theme.text_primary))
-                                        .child(remote_preview),
-                                ),
-                        )
-                    })
+                                                    )
+                                                    .child(
+                                                        modal_preview_line(
+                                                            modal_text_preview(&issue.title),
+                                                            theme.text_primary,
+                                                            false,
+                                                        ),
+                                                    )
+                                                    .when_some(issue.url, |this, url| {
+                                                        this.child(
+                                                            modal_preview_line(
+                                                                modal_mono_preview(&url),
+                                                                theme.text_muted,
+                                                                true,
+                                                            )
+                                                            .text_xs(),
+                                                        )
+                                                    }),
+                                            )
+                                        })
+                                        .when(!daemon_managed_worktree, |this| {
+                                            this.child(
+                                                div()
+                                                    .flex_none()
+                                                    .id("create-discrete-clone-checkbox")
+                                                    .cursor_pointer()
+                                                    .rounded_sm()
+                                                    .border_1()
+                                                    .border_color(rgb(if is_discrete_clone {
+                                                        theme.accent
+                                                    } else {
+                                                        theme.border
+                                                    }))
+                                                    .bg(rgb(theme.panel_bg))
+                                                    .hover(|this| this.bg(rgb(theme.panel_active_bg)))
+                                                    .px_2()
+                                                    .py_2()
+                                                    .flex()
+                                                    .items_start()
+                                                    .gap_2()
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        let next_kind = if is_discrete_clone {
+                                                            CheckoutKind::LinkedWorktree
+                                                        } else {
+                                                            CheckoutKind::DiscreteClone
+                                                        };
+                                                        this.set_create_modal_checkout_kind(next_kind, cx);
+                                                    }))
+                                                    .child(
+                                                        div()
+                                                            .mt(px(1.))
+                                                            .w(px(14.))
+                                                            .h(px(14.))
+                                                            .rounded_sm()
+                                                            .border_1()
+                                                            .border_color(rgb(if is_discrete_clone {
+                                                                theme.accent
+                                                            } else {
+                                                                theme.border
+                                                            }))
+                                                            .bg(rgb(if is_discrete_clone {
+                                                                theme.accent
+                                                            } else {
+                                                                theme.panel_bg
+                                                            }))
+                                                            .flex()
+                                                            .items_center()
+                                                            .justify_center()
+                                                            .child(
+                                                                div()
+                                                                    .font_family(FONT_MONO)
+                                                                    .text_size(px(9.))
+                                                                    .text_color(rgb(if is_discrete_clone {
+                                                                        theme.sidebar_bg
+                                                                    } else {
+                                                                        theme.panel_bg
+                                                                    }))
+                                                                    .child(if is_discrete_clone {
+                                                                        "\u{f00c}"
+                                                                    } else {
+                                                                        ""
+                                                                    }),
+                                                            ),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .min_w_0()
+                                                            .flex()
+                                                            .flex_col()
+                                                            .gap(px(2.))
+                                                            .child(
+                                                                div()
+                                                                    .text_xs()
+                                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                                    .text_color(rgb(theme.text_primary))
+                                                                    .child("Discrete clone"),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .text_xs()
+                                                                    .text_color(rgb(theme.text_muted))
+                                                                    .child(checkout_kind.description()),
+                                                            ),
+                                                    ),
+                                            )
+                                        })
+                                        .child(
+                                            modal_input_field(
+                                                theme,
+                                                "create-worktree-repo-input",
+                                                "Repository",
+                                                &modal.repository_path,
+                                                modal.repository_path_cursor,
+                                                "Path to git repository",
+                                                repository_active,
+                                            )
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.update_create_worktree_modal_input(
+                                                    ModalInputEvent::SetActiveField(
+                                                        CreateWorktreeField::RepositoryPath,
+                                                    ),
+                                                    cx,
+                                                );
+                                            })),
+                                        )
+                                        .child(
+                                            modal_input_field(
+                                                theme,
+                                                "create-worktree-name-input",
+                                                "Worktree Name",
+                                                &modal.worktree_name,
+                                                modal.worktree_name_cursor,
+                                                "e.g. remote-ssh",
+                                                worktree_active,
+                                            )
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.update_create_worktree_modal_input(
+                                                    ModalInputEvent::SetActiveField(
+                                                        CreateWorktreeField::WorktreeName,
+                                                    ),
+                                                    cx,
+                                                );
+                                            })),
+                                        )
+                                        .child(
+                                            modal_preview_box(
+                                                theme,
+                                                "Branch",
+                                                modal_mono_preview(&branch_name),
+                                            ),
+                                        )
+                                        .child(
+                                            modal_preview_box(
+                                                theme,
+                                                "Path",
+                                                modal_mono_preview(&target_path_preview),
+                                            ),
+                                        )
+                                        .when_some(modal.managed_preview_error.clone(), |this, error| {
+                                            this.child(
+                                                div()
+                                                    .rounded_sm()
+                                                    .border_1()
+                                                    .border_color(rgb(0xa44949))
+                                                    .bg(rgb(0x4d2a2a))
+                                                    .px_2()
+                                                    .py_1()
+                                                    .text_xs()
+                                                    .text_color(rgb(0xffd7d7))
+                                                    .child(error),
+                                            )
+                                        })
+                                    })
+                                    // Review PR tab content
+                                    .when(is_review_pr_tab, |this| {
+                                        this.child(
+                                            div()
+                                                .flex_none()
+                                                .text_xs()
+                                                .text_color(rgb(theme.text_muted))
+                                                .child("Paste a GitHub PR number, `#123`, or full pull-request URL."),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_none()
+                                                .id("create-review-pr-discrete-clone-checkbox")
+                                                .cursor_pointer()
+                                                .rounded_sm()
+                                                .border_1()
+                                                .border_color(rgb(if is_discrete_clone {
+                                                    theme.accent
+                                                } else {
+                                                    theme.border
+                                                }))
+                                                .bg(rgb(theme.panel_bg))
+                                                .hover(|this| this.bg(rgb(theme.panel_active_bg)))
+                                                .px_2()
+                                                .py_2()
+                                                .flex()
+                                                .items_start()
+                                                .gap_2()
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    let next_kind = if is_discrete_clone {
+                                                        CheckoutKind::LinkedWorktree
+                                                    } else {
+                                                        CheckoutKind::DiscreteClone
+                                                    };
+                                                    this.set_create_modal_checkout_kind(next_kind, cx);
+                                                }))
+                                                .child(
+                                                    div()
+                                                        .mt(px(1.))
+                                                        .w(px(14.))
+                                                        .h(px(14.))
+                                                        .rounded_sm()
+                                                        .border_1()
+                                                        .border_color(rgb(if is_discrete_clone {
+                                                            theme.accent
+                                                        } else {
+                                                            theme.border
+                                                        }))
+                                                        .bg(rgb(if is_discrete_clone {
+                                                            theme.accent
+                                                        } else {
+                                                            theme.panel_bg
+                                                        }))
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .child(
+                                                            div()
+                                                                .font_family(FONT_MONO)
+                                                                .text_size(px(9.))
+                                                                .text_color(rgb(if is_discrete_clone {
+                                                                    theme.sidebar_bg
+                                                                } else {
+                                                                    theme.panel_bg
+                                                                }))
+                                                                .child(if is_discrete_clone {
+                                                                    "\u{f00c}"
+                                                                } else {
+                                                                    ""
+                                                                }),
+                                                        ),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .min_w_0()
+                                                        .flex()
+                                                        .flex_col()
+                                                        .gap(px(2.))
+                                                        .child(
+                                                            div()
+                                                                .text_xs()
+                                                                .font_weight(FontWeight::SEMIBOLD)
+                                                                .text_color(rgb(theme.text_primary))
+                                                                .child("Discrete clone"),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .text_xs()
+                                                                .text_color(rgb(theme.text_muted))
+                                                                .child(checkout_kind.description()),
+                                                        ),
+                                                ),
+                                        )
+                                        .child(
+                                            modal_input_field(
+                                                theme,
+                                                "review-pr-repo-input",
+                                                "Repository",
+                                                &modal.repository_path,
+                                                modal.repository_path_cursor,
+                                                "Path to git repository",
+                                                review_repository_active,
+                                            )
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.update_create_review_pr_modal_input(
+                                                    ReviewPrModalInputEvent::SetActiveField(
+                                                        CreateReviewPrField::RepositoryPath,
+                                                    ),
+                                                    cx,
+                                                );
+                                            })),
+                                        )
+                                        .child(
+                                            modal_input_field(
+                                                theme,
+                                                "review-pr-reference-input",
+                                                "Pull Request",
+                                                &modal.pr_reference,
+                                                modal.pr_reference_cursor,
+                                                "e.g. 42, #42, or https://github.com/org/repo/pull/42",
+                                                review_pr_active,
+                                            )
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.update_create_review_pr_modal_input(
+                                                    ReviewPrModalInputEvent::SetActiveField(
+                                                        CreateReviewPrField::PullRequestReference,
+                                                    ),
+                                                    cx,
+                                                );
+                                            })),
+                                        )
+                                        .child(
+                                            modal_input_field(
+                                                theme,
+                                                "review-pr-name-input",
+                                                "Worktree Name",
+                                                &modal.worktree_name,
+                                                modal.worktree_name_cursor,
+                                                "Optional. Defaults from the pull request title.",
+                                                review_name_active,
+                                            )
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.update_create_review_pr_modal_input(
+                                                    ReviewPrModalInputEvent::SetActiveField(
+                                                        CreateReviewPrField::WorktreeName,
+                                                    ),
+                                                    cx,
+                                                );
+                                            })),
+                                        )
+                                        .child(
+                                            modal_preview_box(
+                                                theme,
+                                                "Branch",
+                                                modal_mono_preview(&review_branch_preview),
+                                            ),
+                                        )
+                                        .child(
+                                            modal_preview_box(
+                                                theme,
+                                                "Path",
+                                                modal_mono_preview(&review_path_preview),
+                                            ),
+                                        )
+                                    })
+                                    // Remote Outpost tab content
+                                    .when(is_outpost_tab, |this| {
+                                        this.child(
+                                            div()
+                                                .flex_none()
+                                                .id("outpost-host-selector")
+                                                .cursor_pointer()
+                                                .rounded_sm()
+                                                .border_1()
+                                                .border_color(rgb(if host_active {
+                                                    theme.accent
+                                                } else {
+                                                    theme.border
+                                                }))
+                                                .bg(rgb(theme.panel_bg))
+                                                .hover(|this| this.bg(rgb(theme.panel_active_bg)))
+                                                .p_2()
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(rgb(theme.text_muted))
+                                                        .child("Host"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_between()
+                                                        .child(
+                                                            div()
+                                                                .text_sm()
+                                                                .font_family(FONT_MONO)
+                                                                .text_color(rgb(theme.text_primary))
+                                                                .child(host_name),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .text_xs()
+                                                                .text_color(rgb(theme.text_muted))
+                                                                .child(if host_dropdown_open {
+                                                                    "\u{25b2}"
+                                                                } else {
+                                                                    "\u{25bc}"
+                                                                }),
+                                                        ),
+                                                )
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.update_create_outpost_modal_input(
+                                                        OutpostModalInputEvent::ToggleHostDropdown,
+                                                        cx,
+                                                    );
+                                                })),
+                                        )
+                                        .when(host_dropdown_open, |this| {
+                                            this.child(
+                                                div()
+                                                    .id("outpost-host-dropdown")
+                                                    .rounded_sm()
+                                                    .border_1()
+                                                    .border_color(rgb(theme.accent))
+                                                    .bg(rgb(theme.panel_bg))
+                                                    .py_1()
+                                                    .max_h(px(200.))
+                                                    .overflow_y_scroll()
+                                                    .children(host_names.into_iter().map(
+                                                        |(index, name)| {
+                                                            let is_selected = index == selected_host_index;
+                                                            div()
+                                                                .id(("host-option", index))
+                                                                .cursor_pointer()
+                                                                .px_2()
+                                                                .py_1()
+                                                                .text_sm()
+                                                                .font_family(FONT_MONO)
+                                                                .rounded_sm()
+                                                                .mx_1()
+                                                                .text_color(rgb(theme.text_primary))
+                                                                .when(is_selected, |this| {
+                                                                    this.bg(rgb(theme.panel_active_bg))
+                                                                })
+                                                                .hover(|this| {
+                                                                    this.bg(rgb(theme.panel_active_bg))
+                                                                })
+                                                                .child(name)
+                                                                .on_click(cx.listener(
+                                                                    move |this, _, _, cx| {
+                                                                        this.update_create_outpost_modal_input(
+                                                                            OutpostModalInputEvent::SelectHost(
+                                                                                index,
+                                                                            ),
+                                                                            cx,
+                                                                        );
+                                                                    },
+                                                                ))
+                                                        },
+                                                    )),
+                                            )
+                                        })
+                                        .child(
+                                            modal_input_field(
+                                                theme,
+                                                "outpost-clone-url-input",
+                                                "Clone URL",
+                                                &modal.clone_url,
+                                                modal.clone_url_cursor,
+                                                "git@github.com:user/repo.git",
+                                                clone_url_active,
+                                            )
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.update_create_outpost_modal_input(
+                                                    OutpostModalInputEvent::SetActiveField(
+                                                        CreateOutpostField::CloneUrl,
+                                                    ),
+                                                    cx,
+                                                );
+                                            })),
+                                        )
+                                        .child(
+                                            modal_input_field(
+                                                theme,
+                                                "outpost-name-input",
+                                                "Outpost Name",
+                                                &modal.outpost_name,
+                                                modal.outpost_name_cursor,
+                                                "e.g. my-feature",
+                                                outpost_name_active,
+                                            )
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.update_create_outpost_modal_input(
+                                                    OutpostModalInputEvent::SetActiveField(
+                                                        CreateOutpostField::OutpostName,
+                                                    ),
+                                                    cx,
+                                                );
+                                            })),
+                                        )
+                                        .child(
+                                            modal_preview_box(
+                                                theme,
+                                                "Branch",
+                                                modal_mono_preview(&outpost_branch_preview),
+                                            ),
+                                        )
+                                        .child(
+                                            modal_preview_box(
+                                                theme,
+                                                "Remote Path",
+                                                modal_mono_preview(&remote_preview),
+                                            ),
+                                        )
+                                    }),
+                            ),
+                    )
                     // Error
                     .when_some(modal.error.clone(), |this, error| {
                         this.child(
@@ -2087,6 +2367,49 @@ impl ArborWindow {
     }
 }
 
+const CREATE_MODAL_MONO_PREVIEW_MAX_CHARS: usize = 56;
+const CREATE_MODAL_TEXT_PREVIEW_MAX_CHARS: usize = 72;
+
+fn modal_mono_preview(value: &str) -> String {
+    truncate_middle_text(value, CREATE_MODAL_MONO_PREVIEW_MAX_CHARS)
+}
+
+fn modal_text_preview(value: &str) -> String {
+    truncate_with_ellipsis(value, CREATE_MODAL_TEXT_PREVIEW_MAX_CHARS)
+}
+
+fn modal_preview_line(value: String, color: u32, mono: bool) -> Div {
+    div()
+        .w_full()
+        .min_w_0()
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .text_ellipsis()
+        .text_sm()
+        .text_color(rgb(color))
+        .when(mono, |this| this.font_family(FONT_MONO))
+        .child(value)
+}
+
+fn modal_preview_box(theme: ThemePalette, label: &'static str, value: String) -> Div {
+    div()
+        .flex_none()
+        .w_full()
+        .min_w_0()
+        .rounded_sm()
+        .border_1()
+        .border_color(rgb(theme.border))
+        .bg(rgb(theme.panel_bg))
+        .p_2()
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(theme.text_muted))
+                .child(label),
+        )
+        .child(modal_preview_line(value, theme.text_primary, true))
+}
+
 fn preview_managed_worktree_path(
     repository_path: &str,
     worktree_name: &str,
@@ -2112,6 +2435,40 @@ fn review_worktree_name_preview(pr_reference: &str, explicit_worktree_name: &str
     }
 
     github_service::parse_pull_request_number(pr_reference).map(|number| format!("pr-{number}"))
+}
+
+struct CreateModalBranchPreviews {
+    local_branch_preview: String,
+    review_branch_preview: String,
+    outpost_branch_preview: String,
+}
+
+fn resolve_create_modal_branch_previews(
+    repository_path: &str,
+    worktree_name: &str,
+    review_worktree_name: Option<&str>,
+    outpost_name: &str,
+    outpost_repo_root: &Path,
+    github_login: Option<&str>,
+) -> CreateModalBranchPreviews {
+    let repository_root = Path::new(repository_path.trim());
+    let review_branch_preview = review_worktree_name
+        .map(|name| derive_branch_name_for_repo_with_login(repository_root, name, github_login))
+        .unwrap_or_else(|| "Will derive from pull request".to_owned());
+
+    CreateModalBranchPreviews {
+        local_branch_preview: derive_branch_name_for_repo_with_login(
+            repository_root,
+            worktree_name,
+            github_login,
+        ),
+        review_branch_preview,
+        outpost_branch_preview: derive_branch_name_for_repo_with_login(
+            outpost_repo_root,
+            outpost_name,
+            github_login,
+        ),
+    }
 }
 
 fn create_managed_worktree(
@@ -2489,9 +2846,61 @@ fn rollback_created_checkout(
     Ok(())
 }
 
+fn managed_preview_request_matches(
+    modal: &CreateModal,
+    modal_instance_id: u64,
+    generation: u64,
+) -> bool {
+    modal.instance_id == modal_instance_id && modal.managed_preview_generation == generation
+}
+
+fn create_modal_branch_preview_matches(
+    modal: &CreateModal,
+    modal_instance_id: u64,
+    generation: u64,
+) -> bool {
+    modal.instance_id == modal_instance_id && modal.branch_preview_generation == generation
+}
+
 #[cfg(test)]
 mod worktree_lifecycle_tests {
     use super::*;
+
+    fn sample_create_modal() -> CreateModal {
+        CreateModal {
+            instance_id: 7,
+            tab: CreateModalTab::LocalWorktree,
+            repository_path: "/tmp/repo".to_owned(),
+            repository_path_cursor: 9,
+            worktree_name: "issue-42".to_owned(),
+            worktree_name_cursor: 8,
+            checkout_kind: CheckoutKind::LinkedWorktree,
+            worktree_active_field: CreateWorktreeField::WorktreeName,
+            pr_reference: String::new(),
+            pr_reference_cursor: 0,
+            review_active_field: CreateReviewPrField::PullRequestReference,
+            host_index: 0,
+            host_dropdown_open: false,
+            clone_url: String::new(),
+            clone_url_cursor: 0,
+            outpost_name: String::new(),
+            outpost_name_cursor: 0,
+            outpost_active_field: CreateOutpostField::CloneUrl,
+            daemon_managed_target: Some(ManagedDaemonTarget::Primary),
+            managed_preview: None,
+            managed_preview_loading: false,
+            managed_preview_error: None,
+            managed_preview_generation: 3,
+            branch_preview_generation: 5,
+            local_branch_preview: "codex/issue-42".to_owned(),
+            review_branch_preview: "codex/pr-42".to_owned(),
+            outpost_branch_preview: "codex/outpost".to_owned(),
+            issue_context: None,
+            is_creating: false,
+            creating_status: None,
+            error: None,
+        }
+    }
 
     #[test]
     fn review_worktree_name_preview_prefers_explicit_name() {
@@ -2520,5 +2929,23 @@ mod worktree_lifecycle_tests {
             default_review_worktree_name(&pull_request),
             "pr-42-fix-auth-callback-race"
         );
+    }
+
+    #[test]
+    fn managed_preview_request_matches_current_modal_instance() {
+        let modal = sample_create_modal();
+
+        assert!(managed_preview_request_matches(&modal, 7, 3));
+        assert!(!managed_preview_request_matches(&modal, 8, 3));
+        assert!(!managed_preview_request_matches(&modal, 7, 4));
+    }
+
+    #[test]
+    fn create_modal_branch_preview_matches_current_modal_instance() {
+        let modal = sample_create_modal();
+
+        assert!(create_modal_branch_preview_matches(&modal, 7, 5));
+        assert!(!create_modal_branch_preview_matches(&modal, 8, 5));
+        assert!(!create_modal_branch_preview_matches(&modal, 7, 6));
     }
 }

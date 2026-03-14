@@ -26,6 +26,7 @@ use {
             self, CreateOrAttachRequest, DaemonSessionRecord, DetachRequest, KillRequest,
             ResizeRequest, SignalRequest, TerminalSessionState, TerminalSignal, WriteRequest,
         },
+        process::{procfile_managed_process_name_from_title, procfile_managed_process_title},
         procfile, worktree,
         worktree_scripts::{WorktreeScriptContext, WorktreeScriptPhase, run_worktree_scripts},
     },
@@ -94,8 +95,6 @@ include!("github_auth_modal.rs");
 include!("github_helpers.rs");
 include!("github_oauth.rs");
 include!("app_bootstrap.rs");
-
-const MANAGED_PROCESS_TITLE_PREFIX: &str = "[Procfile] ";
 
 impl ArborWindow {
     fn load_with_daemon_store<S>(
@@ -5534,14 +5533,11 @@ fn managed_process_id(worktree_path: &Path, process_name: &str) -> String {
 }
 
 fn managed_process_title(process_name: &str) -> String {
-    format!("{MANAGED_PROCESS_TITLE_PREFIX}{process_name}")
+    procfile_managed_process_title(process_name)
 }
 
 fn managed_process_id_from_title(worktree_path: &Path, title: &str) -> Option<String> {
-    title
-        .strip_prefix(MANAGED_PROCESS_TITLE_PREFIX)
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
+    procfile_managed_process_name_from_title(title)
         .map(|name| managed_process_id(worktree_path, name))
 }
 
@@ -9551,6 +9547,17 @@ Review the current branch and summarize the highest-risk changes.
         assert_eq!(
             task.prompt,
             "Review the current branch and summarize the highest-risk changes."
+        );
+    }
+
+    #[test]
+    fn managed_process_title_round_trips_to_process_id() {
+        let worktree_path = Path::new("/tmp/repo");
+        let title = crate::managed_process_title("web");
+
+        assert_eq!(
+            crate::managed_process_id_from_title(worktree_path, &title),
+            Some("procfile:/tmp/repo:web".to_owned())
         );
     }
 }

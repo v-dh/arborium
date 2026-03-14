@@ -260,14 +260,14 @@ test.describe("Arbor Web UI", () => {
     await expect(terminalPanel.locator(".terminal-tab-label").getByText("cargo build")).toBeVisible();
   });
 
-  test("right pane shows Procfile processes in a dedicated tab", async ({ page }) => {
+  test("right pane shows processes in a dedicated tab", async ({ page }) => {
     const changesPanel = page.getByTestId("changes-panel");
 
-    await expect(changesPanel.getByRole("button", { name: "Procfile 2" })).toBeVisible();
-    await changesPanel.getByRole("button", { name: "Procfile 2" }).click();
+    await expect(changesPanel.getByRole("button", { name: "Processes 2" })).toBeVisible();
+    await changesPanel.getByRole("button", { name: "Processes 2" }).click();
 
-    await expect(changesPanel.getByRole("button", { name: "Procfile 2" })).toHaveClass(/active/);
-    await expect(changesPanel.locator(".changes-title").getByText("Procfile")).toBeVisible();
+    await expect(changesPanel.getByRole("button", { name: "Processes 2" })).toHaveClass(/active/);
+    await expect(changesPanel.locator(".changes-title").getByText("Processes")).toBeVisible();
     await expect(changesPanel.locator(".procfile-name").getByText("web")).toBeVisible();
     await expect(changesPanel.locator(".procfile-command").getByText("cargo watch -x run")).toBeVisible();
     await expect(changesPanel.locator(".process-memory").getByText("RSS 256 MiB")).toBeVisible();

@@ -21,6 +21,19 @@ pub enum ProcessSource {
     Procfile,
 }
 
+pub const PROCFILE_MANAGED_PROCESS_TITLE_PREFIX: &str = "[Procfile] ";
+
+pub fn procfile_managed_process_title(process_name: &str) -> String {
+    format!("{PROCFILE_MANAGED_PROCESS_TITLE_PREFIX}{process_name}")
+}
+
+pub fn procfile_managed_process_name_from_title(title: &str) -> Option<&str> {
+    title
+        .strip_prefix(PROCFILE_MANAGED_PROCESS_TITLE_PREFIX)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+}
+
 /// Runtime information about a managed process.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ProcessInfo {
@@ -37,4 +50,31 @@ pub struct ProcessInfo {
     pub memory_bytes: Option<u64>,
     /// Links to a terminal daemon session, if any.
     pub session_id: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::process::{
+        PROCFILE_MANAGED_PROCESS_TITLE_PREFIX, procfile_managed_process_name_from_title,
+        procfile_managed_process_title,
+    };
+
+    #[test]
+    fn procfile_title_round_trips_process_name() {
+        let title = procfile_managed_process_title("web");
+
+        assert_eq!(title, format!("{PROCFILE_MANAGED_PROCESS_TITLE_PREFIX}web"));
+        assert_eq!(
+            procfile_managed_process_name_from_title(&title),
+            Some("web")
+        );
+    }
+
+    #[test]
+    fn procfile_title_rejects_empty_process_name() {
+        assert_eq!(
+            procfile_managed_process_name_from_title(PROCFILE_MANAGED_PROCESS_TITLE_PREFIX),
+            None
+        );
+    }
 }

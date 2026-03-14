@@ -169,7 +169,7 @@ impl ArborWindow {
             .border_color(rgb(theme.border))
             .child(tab_button("Changes", RightPaneTab::Changes, None))
             .child(tab_button("Files", RightPaneTab::FileTree, None))
-            .child(tab_button("Procfile", RightPaneTab::Procfile, procfile_count))
+            .child(tab_button("Processes", RightPaneTab::Procfile, procfile_count))
             .child(tab_button("Notes", RightPaneTab::Notes, None))
     }
 
@@ -559,7 +559,7 @@ impl ArborWindow {
                     div()
                         .text_sm()
                         .text_color(rgb(theme.text_muted))
-                        .child("Procfile commands are available for local worktrees."),
+                        .child("Select a worktree to see processes."),
                 );
         };
 
@@ -574,7 +574,7 @@ impl ArborWindow {
                     div()
                         .text_sm()
                         .text_color(rgb(theme.text_muted))
-                        .child("No Procfile commands for this worktree."),
+                        .child("No processes yet. Procfile processes are listed here."),
                 );
         }
 
@@ -638,7 +638,7 @@ impl ArborWindow {
                             .text_xs()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(theme.text_primary))
-                            .child(procfile::PROCFILE_NAME),
+                            .child("Processes"),
                     )
                     .child(
                         div()

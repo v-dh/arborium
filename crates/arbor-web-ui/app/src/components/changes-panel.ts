@@ -42,7 +42,7 @@ function renderRightPaneTabs(worktree?: Worktree): HTMLElement {
   const tabs = el("div", "changes-tabs");
   tabs.append(
     renderTabButton("Changes", "changes"),
-    renderTabButton("Procfile", "procfile", worktree?.processes.length),
+    renderTabButton("Processes", "procfile", worktree?.processes.length),
   );
   return tabs;
 }
@@ -112,17 +112,14 @@ function renderChangesContent(): HTMLElement {
 function renderProcfileContent(worktree: Worktree): HTMLElement {
   const wrapper = el("div", "changes-pane-body");
   const header = el("div", "changes-header");
-  const titleText = worktree.processes.some((process) => process.source === "procfile")
-    ? "Procfile"
-    : "Processes";
   header.append(
-    el("h3", "changes-title", titleText),
+    el("h3", "changes-title", "Processes"),
     el("span", "changes-count", String(worktree.processes.length)),
   );
   wrapper.append(header);
 
   if (worktree.processes.length === 0) {
-    wrapper.append(el("div", "changes-empty", "No Procfile commands"));
+    wrapper.append(el("div", "changes-empty", "No processes yet. Procfile processes are listed here."));
     return wrapper;
   }
 

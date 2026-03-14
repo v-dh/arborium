@@ -3,7 +3,7 @@ use {
         daemon::{
             CreateOrAttachRequest, KillRequest, TerminalDaemon, TerminalSessionState, default_shell,
         },
-        process::{ProcessInfo, ProcessSource, ProcessStatus},
+        process::{ProcessInfo, ProcessSource, ProcessStatus, procfile_managed_process_title},
         procfile, repo_config, worktree,
     },
     serde::Serialize,
@@ -489,11 +489,7 @@ impl ProcessManager {
             shell: default_shell(),
             cols: 120,
             rows: 35,
-            title: Some(format!(
-                "[{}] {}",
-                process_source_label(definition.source),
-                definition.name
-            )),
+            title: Some(procfile_managed_process_title(&definition.name)),
             command: Some(definition.command.clone()),
         });
 

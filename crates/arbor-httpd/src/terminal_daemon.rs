@@ -384,6 +384,10 @@ impl LiveSession {
     }
 
     fn note_waiting_for_input(&self) {
+        if *lock_or_recover(&self.state) != TerminalSessionState::Running {
+            return;
+        }
+
         let mut state = lock_or_recover(&self.activity_state);
         if *state == Some(AgentState::Waiting) {
             return;
@@ -470,13 +474,13 @@ fn spawn_wait_thread(mut child: Box<dyn Child + Send + Sync>, session: Arc<LiveS
             } else {
                 TerminalSessionState::Failed
             };
-            session.clear_activity();
             session.set_exit_state(exit_code, state);
+            session.clear_activity();
             let _ = session.sender.send(SessionEvent::Exit { exit_code, state });
         },
         Err(error) => {
-            session.clear_activity();
             session.set_exit_state(None, TerminalSessionState::Failed);
+            session.clear_activity();
             let _ = session.sender.send(SessionEvent::Error(format!(
                 "failed waiting for session exit: {error}"
             )));
@@ -941,6 +945,53 @@ fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 mod tests {
     use super::*;
 
+    fn test_live_session() -> (
+        Arc<LiveSession>,
+        mpsc::UnboundedReceiver<TerminalActivityEvent>,
+    ) {
+        let pty_system = native_pty_system();
+        let pair = match pty_system.openpty(PtySize {
+            rows: DEFAULT_ROWS,
+            cols: DEFAULT_COLS,
+            pixel_width: 0,
+            pixel_height: 0,
+        }) {
+            Ok(pair) => pair,
+            Err(error) => panic!("failed to create PTY for test session: {error}"),
+        };
+        let (sender, _) = broadcast::channel(16);
+        let (activity_tx, activity_rx) = mpsc::unbounded_channel();
+
+        let session = Arc::new(LiveSession {
+            session_id: "daemon-test-1".into(),
+            workspace_id: "/tmp/worktree".into(),
+            cwd: PathBuf::from("/tmp/worktree"),
+            shell: "zsh".to_owned(),
+            root_pid: None,
+            cols: Arc::new(Mutex::new(DEFAULT_COLS)),
+            rows: Arc::new(Mutex::new(DEFAULT_ROWS)),
+            title: Arc::new(Mutex::new(None)),
+            last_command: Arc::new(Mutex::new(None)),
+            pending_command: Arc::new(Mutex::new(String::new())),
+            output_tail: Arc::new(Mutex::new(String::new())),
+            emulator: Arc::new(Mutex::new(TerminalEmulator::with_size(
+                DEFAULT_ROWS,
+                DEFAULT_COLS,
+            ))),
+            exit_code: Arc::new(Mutex::new(None)),
+            state: Arc::new(Mutex::new(TerminalSessionState::Running)),
+            updated_at_unix_ms: Arc::new(Mutex::new(None)),
+            writer: Arc::new(Mutex::new(Box::new(std::io::sink()))),
+            master: Arc::new(Mutex::new(pair.master)),
+            killer: Arc::new(Mutex::new(None)),
+            sender,
+            activity_state: Arc::new(Mutex::new(None)),
+            activity_tx: Some(activity_tx),
+        });
+
+        (session, activity_rx)
+    }
+
     #[test]
     fn pending_command_treats_line_feed_as_multiline_input() {
         let mut pending = String::from("hello");
@@ -990,5 +1041,36 @@ mod tests {
         let text = "a\u{1b}]133;A\u{1b}\\b";
         let trimmed = trim_output_tail_preserving_ansi(text, 64);
         assert_eq!(trimmed, text);
+    }
+
+    #[test]
+    fn note_waiting_for_input_is_ignored_after_session_exit() {
+        let (session, mut activity_rx) = test_live_session();
+
+        session.note_waiting_for_input();
+        session.set_exit_state(Some(0), TerminalSessionState::Completed);
+        session.clear_activity();
+        session.note_waiting_for_input();
+
+        assert_eq!(
+            activity_rx.try_recv().ok(),
+            Some(TerminalActivityEvent::Update {
+                session_id: "daemon-test-1".into(),
+                cwd: PathBuf::from("/tmp/worktree"),
+                state: AgentState::Waiting,
+            })
+        );
+        assert_eq!(
+            activity_rx.try_recv().ok(),
+            Some(TerminalActivityEvent::Clear {
+                session_id: "daemon-test-1".into(),
+            })
+        );
+        assert!(activity_rx.try_recv().is_err());
+        assert_eq!(*lock_or_recover(&session.activity_state), None);
+        assert_eq!(
+            *lock_or_recover(&session.state),
+            TerminalSessionState::Completed
+        );
     }
 }

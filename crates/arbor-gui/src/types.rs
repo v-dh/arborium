@@ -1476,6 +1476,10 @@ struct CreateModal {
     managed_preview_loading: bool,
     managed_preview_error: Option<String>,
     managed_preview_generation: u64,
+    branch_preview_generation: u64,
+    local_branch_preview: String,
+    review_branch_preview: String,
+    outpost_branch_preview: String,
     issue_context: Option<CreateModalIssueContext>,
     // Shared
     is_creating: bool,

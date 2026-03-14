@@ -16,6 +16,53 @@ impl ArborWindow {
         self.focus_terminal_on_next_render = true;
     }
 
+    fn refresh_create_modal_branch_previews(&mut self, cx: &mut Context<Self>) {
+        let Some(modal) = self.create_modal.as_mut() else {
+            return;
+        };
+
+        modal.branch_preview_generation = modal.branch_preview_generation.wrapping_add(1);
+        let modal_instance_id = modal.instance_id;
+        let generation = modal.branch_preview_generation;
+        let repository_path = modal.repository_path.trim().to_owned();
+        let worktree_name = modal.worktree_name.clone();
+        let pr_reference = modal.pr_reference.clone();
+        let review_name_preview =
+            review_worktree_name_preview(pr_reference.trim(), modal.worktree_name.trim());
+        let outpost_name = modal.outpost_name.clone();
+        let repo_root = self.repo_root.clone();
+        let github_login = self.branch_prefix_github_login();
+
+        self._create_modal_preview_task = Some(cx.spawn(async move |this, cx| {
+            let previews = cx
+                .background_spawn(async move {
+                    resolve_create_modal_branch_previews(
+                        &repository_path,
+                        &worktree_name,
+                        review_name_preview.as_deref(),
+                        &outpost_name,
+                        &repo_root,
+                        github_login.as_deref(),
+                    )
+                })
+                .await;
+
+            let _ = this.update(cx, |this, cx| {
+                let Some(modal) = this.create_modal.as_mut() else {
+                    return;
+                };
+                if !create_modal_branch_preview_matches(modal, modal_instance_id, generation) {
+                    return;
+                }
+
+                modal.local_branch_preview = previews.local_branch_preview;
+                modal.review_branch_preview = previews.review_branch_preview;
+                modal.outpost_branch_preview = previews.outpost_branch_preview;
+                cx.notify();
+            });
+        }));
+    }
+
     fn repository_for_issue_target(&self, target: &IssueTarget) -> Option<&RepositorySummary> {
         match target.daemon_target {
             ManagedDaemonTarget::Primary => self
@@ -68,11 +115,16 @@ impl ArborWindow {
             managed_preview_loading: false,
             managed_preview_error: None,
             managed_preview_generation: 0,
+            branch_preview_generation: 0,
+            local_branch_preview: derive_branch_name(""),
+            review_branch_preview: "Will derive from pull request".to_owned(),
+            outpost_branch_preview: derive_branch_name(""),
             issue_context: None,
             is_creating: false,
             creating_status: None,
             error: None,
         });
+        self.refresh_create_modal_branch_previews(cx);
         cx.notify();
     }
 
@@ -136,6 +188,10 @@ impl ArborWindow {
             managed_preview_loading: false,
             managed_preview_error: None,
             managed_preview_generation: 0,
+            branch_preview_generation: 0,
+            local_branch_preview: derive_branch_name(issue.suggested_worktree_name.as_str()),
+            review_branch_preview: "Will derive from pull request".to_owned(),
+            outpost_branch_preview: derive_branch_name(""),
             issue_context: Some(CreateModalIssueContext {
                 source_label,
                 display_id: issue.display_id,
@@ -146,6 +202,7 @@ impl ArborWindow {
             creating_status: None,
             error: None,
         });
+        self.refresh_create_modal_branch_previews(cx);
         self.refresh_create_modal_managed_preview(cx);
         cx.notify();
     }
@@ -232,6 +289,7 @@ impl ArborWindow {
         input: ReviewPrModalInputEvent,
         cx: &mut Context<Self>,
     ) {
+        let mut refresh_branch_previews = false;
         let Some(modal) = self.create_modal.as_mut() else {
             return;
         };
@@ -269,6 +327,7 @@ impl ArborWindow {
                         &mut modal.repository_path_cursor,
                         &action,
                     );
+                    refresh_branch_previews = true;
                 },
                 CreateReviewPrField::PullRequestReference => {
                     apply_text_edit_action(
@@ -276,6 +335,7 @@ impl ArborWindow {
                         &mut modal.pr_reference_cursor,
                         &action,
                     );
+                    refresh_branch_previews = true;
                 },
                 CreateReviewPrField::WorktreeName => {
                     apply_text_edit_action(
@@ -283,6 +343,7 @@ impl ArborWindow {
                         &mut modal.worktree_name_cursor,
                         &action,
                     );
+                    refresh_branch_previews = true;
                 },
             },
             ReviewPrModalInputEvent::ClearError => {
@@ -291,6 +352,9 @@ impl ArborWindow {
         }
 
         cx.notify();
+        if refresh_branch_previews {
+            self.refresh_create_modal_branch_previews(cx);
+        }
     }
 
     fn set_create_modal_checkout_kind(
@@ -505,6 +569,7 @@ impl ArborWindow {
         cx: &mut Context<Self>,
     ) {
         let mut refresh_managed_preview = false;
+        let mut refresh_branch_previews = false;
         let Some(modal) = self.create_modal.as_mut() else {
             return;
         };
@@ -539,6 +604,7 @@ impl ArborWindow {
                         &action,
                     );
                     refresh_managed_preview = modal.daemon_managed_target.is_some();
+                    refresh_branch_previews = true;
                 },
                 CreateWorktreeField::WorktreeName => {
                     apply_text_edit_action(
@@ -547,6 +613,7 @@ impl ArborWindow {
                         &action,
                     );
                     refresh_managed_preview = modal.daemon_managed_target.is_some();
+                    refresh_branch_previews = true;
                 },
             },
             ModalInputEvent::ClearError => {
@@ -555,6 +622,9 @@ impl ArborWindow {
         }
 
         cx.notify();
+        if refresh_branch_previews {
+            self.refresh_create_modal_branch_previews(cx);
+        }
         if refresh_managed_preview {
             self.refresh_create_modal_managed_preview(cx);
         }
@@ -854,6 +924,7 @@ impl ArborWindow {
         input: OutpostModalInputEvent,
         cx: &mut Context<Self>,
     ) {
+        let mut refresh_branch_previews = false;
         let Some(modal) = self.create_modal.as_mut() else {
             return;
         };
@@ -925,6 +996,7 @@ impl ArborWindow {
                             &mut modal.outpost_name_cursor,
                             &action,
                         );
+                        refresh_branch_previews = true;
                     },
                 }
             },
@@ -934,6 +1006,9 @@ impl ArborWindow {
         }
 
         cx.notify();
+        if refresh_branch_previews {
+            self.refresh_create_modal_branch_previews(cx);
+        }
     }
 
     fn submit_create_outpost_modal(&mut self, cx: &mut Context<Self>) {
@@ -1199,7 +1274,6 @@ impl ArborWindow {
         let is_outpost_tab = modal.tab == CreateModalTab::RemoteOutpost;
         let daemon_managed_worktree = modal.daemon_managed_target.is_some();
         let issue_context = modal.issue_context.clone();
-        let github_login = self.branch_prefix_github_login();
 
         // Worktree tab data
         let branch_name = if let Some(preview) = modal.managed_preview.as_ref() {
@@ -1207,11 +1281,7 @@ impl ArborWindow {
         } else if daemon_managed_worktree && modal.managed_preview_loading {
             "Resolving preview…".to_owned()
         } else {
-            derive_branch_name_for_repo_with_login(
-                Path::new(modal.repository_path.trim()),
-                &modal.worktree_name,
-                github_login.as_deref(),
-            )
+            modal.local_branch_preview.clone()
         };
         let target_path_preview = if let Some(preview) = modal.managed_preview.as_ref() {
             preview.path.clone()
@@ -1239,16 +1309,7 @@ impl ArborWindow {
         let review_name_active = modal.review_active_field == CreateReviewPrField::WorktreeName;
         let review_name_preview =
             review_worktree_name_preview(modal.pr_reference.trim(), modal.worktree_name.trim());
-        let review_branch_preview = review_name_preview
-            .as_deref()
-            .map(|name| {
-                derive_branch_name_for_repo_with_login(
-                    Path::new(modal.repository_path.trim()),
-                    name,
-                    github_login.as_deref(),
-                )
-            })
-            .unwrap_or_else(|| "Will derive from pull request".to_owned());
+        let review_branch_preview = modal.review_branch_preview.clone();
         let review_path_preview = review_name_preview
             .as_deref()
             .and_then(|name| preview_managed_worktree_path(modal.repository_path.trim(), name).ok())
@@ -1283,11 +1344,7 @@ impl ArborWindow {
         let selected_host_index = modal.host_index;
         let clone_url_active = modal.outpost_active_field == CreateOutpostField::CloneUrl;
         let outpost_name_active = modal.outpost_active_field == CreateOutpostField::OutpostName;
-        let outpost_branch_preview = derive_branch_name_for_repo_with_login(
-            &self.repo_root,
-            &modal.outpost_name,
-            github_login.as_deref(),
-        );
+        let outpost_branch_preview = modal.outpost_branch_preview.clone();
         let outpost_create_disabled = modal.is_creating
             || modal.clone_url.trim().is_empty()
             || modal.outpost_name.trim().is_empty()
@@ -2380,6 +2437,40 @@ fn review_worktree_name_preview(pr_reference: &str, explicit_worktree_name: &str
     github_service::parse_pull_request_number(pr_reference).map(|number| format!("pr-{number}"))
 }
 
+struct CreateModalBranchPreviews {
+    local_branch_preview: String,
+    review_branch_preview: String,
+    outpost_branch_preview: String,
+}
+
+fn resolve_create_modal_branch_previews(
+    repository_path: &str,
+    worktree_name: &str,
+    review_worktree_name: Option<&str>,
+    outpost_name: &str,
+    outpost_repo_root: &Path,
+    github_login: Option<&str>,
+) -> CreateModalBranchPreviews {
+    let repository_root = Path::new(repository_path.trim());
+    let review_branch_preview = review_worktree_name
+        .map(|name| derive_branch_name_for_repo_with_login(repository_root, name, github_login))
+        .unwrap_or_else(|| "Will derive from pull request".to_owned());
+
+    CreateModalBranchPreviews {
+        local_branch_preview: derive_branch_name_for_repo_with_login(
+            repository_root,
+            worktree_name,
+            github_login,
+        ),
+        review_branch_preview,
+        outpost_branch_preview: derive_branch_name_for_repo_with_login(
+            outpost_repo_root,
+            outpost_name,
+            github_login,
+        ),
+    }
+}
+
 fn create_managed_worktree(
     repository_path_input: String,
     worktree_name_input: String,
@@ -2763,6 +2854,14 @@ fn managed_preview_request_matches(
     modal.instance_id == modal_instance_id && modal.managed_preview_generation == generation
 }
 
+fn create_modal_branch_preview_matches(
+    modal: &CreateModal,
+    modal_instance_id: u64,
+    generation: u64,
+) -> bool {
+    modal.instance_id == modal_instance_id && modal.branch_preview_generation == generation
+}
+
 #[cfg(test)]
 mod worktree_lifecycle_tests {
     use super::*;
@@ -2792,6 +2891,10 @@ mod worktree_lifecycle_tests {
             managed_preview_loading: false,
             managed_preview_error: None,
             managed_preview_generation: 3,
+            branch_preview_generation: 5,
+            local_branch_preview: "codex/issue-42".to_owned(),
+            review_branch_preview: "codex/pr-42".to_owned(),
+            outpost_branch_preview: "codex/outpost".to_owned(),
             issue_context: None,
             is_creating: false,
             creating_status: None,
@@ -2835,5 +2938,14 @@ mod worktree_lifecycle_tests {
         assert!(managed_preview_request_matches(&modal, 7, 3));
         assert!(!managed_preview_request_matches(&modal, 8, 3));
         assert!(!managed_preview_request_matches(&modal, 7, 4));
+    }
+
+    #[test]
+    fn create_modal_branch_preview_matches_current_modal_instance() {
+        let modal = sample_create_modal();
+
+        assert!(create_modal_branch_preview_matches(&modal, 7, 5));
+        assert!(!create_modal_branch_preview_matches(&modal, 8, 5));
+        assert!(!create_modal_branch_preview_matches(&modal, 7, 6));
     }
 }

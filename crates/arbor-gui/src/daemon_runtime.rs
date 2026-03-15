@@ -605,7 +605,7 @@ fn terminal_state_from_daemon_record(record: &DaemonSessionRecord) -> TerminalSt
 fn cleanup_orphaned_daemon_session(
     daemon: terminal_daemon_http::SharedTerminalDaemonClient,
     record: DaemonSessionRecord,
-) -> Result<(), String> {
+) -> Result<(), ConnectionError> {
     let result = if orphaned_daemon_session_should_kill(&record) {
         daemon.kill(KillRequest {
             session_id: record.session_id.clone(),
@@ -617,10 +617,10 @@ fn cleanup_orphaned_daemon_session(
     };
 
     result.map_err(|error| {
-        format!(
+        ConnectionError::Io(format!(
             "failed to clean up orphaned daemon session `{}`: {error}",
             record.session_id
-        )
+        ))
     })
 }
 

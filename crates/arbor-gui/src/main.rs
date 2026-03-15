@@ -190,7 +190,7 @@ impl ArborWindow {
                 ) {
                     Ok(kind) => kind,
                     Err(err) => {
-                        notice_parts.push(err);
+                        notice_parts.push(err.to_string());
                         TerminalBackendKind::Embedded
                     },
                 };
@@ -205,7 +205,7 @@ impl ArborWindow {
                 let theme_kind = match parse_theme_kind(loaded_config.config.theme.as_deref()) {
                     Ok(kind) => kind,
                     Err(err) => {
-                        notice_parts.push(err);
+                        notice_parts.push(err.to_string());
                         ThemeKind::One
                     },
                 };
@@ -649,7 +649,7 @@ impl ArborWindow {
             match parse_terminal_backend_kind(loaded_config.config.terminal_backend.as_deref()) {
                 Ok(kind) => kind,
                 Err(error) => {
-                    notice_parts.push(error);
+                    notice_parts.push(error.to_string());
                     TerminalBackendKind::Embedded
                 },
             };
@@ -664,7 +664,7 @@ impl ArborWindow {
         let theme_kind = match parse_theme_kind(loaded_config.config.theme.as_deref()) {
             Ok(kind) => kind,
             Err(error) => {
-                notice_parts.push(error);
+                notice_parts.push(error.to_string());
                 ThemeKind::One
             },
         };
@@ -1271,7 +1271,7 @@ impl ArborWindow {
                     let next_theme_kind = match parse_theme_kind(loaded.config.theme.as_deref()) {
                         Ok(theme_kind) => Some(theme_kind),
                         Err(error) => {
-                            notices.push(error);
+                            notices.push(error.to_string());
                             None
                         },
                     };
@@ -1281,7 +1281,7 @@ impl ArborWindow {
                         {
                             Ok(backend_kind) => Some(backend_kind),
                             Err(error) => {
-                                notices.push(error);
+                                notices.push(error.to_string());
                                 None
                             },
                         };
@@ -7850,22 +7850,24 @@ fn truncate_middle_text(input: &str, max_chars: usize) -> String {
     output
 }
 
-fn run_launch_command(command: &mut Command, operation: &str) -> Result<(), String> {
+fn run_launch_command(command: &mut Command, operation: &str) -> Result<(), LaunchError> {
     let output = run_command_output(command, operation)?;
     if output.status.success() {
         Ok(())
     } else {
-        Err(command_failure_message(operation, &output))
+        Err(LaunchError::Failed(command_failure_message(
+            operation, &output,
+        )))
     }
 }
 
 fn run_command_output(
     command: &mut Command,
     operation: &str,
-) -> Result<std::process::Output, String> {
+) -> Result<std::process::Output, LaunchError> {
     command
         .output()
-        .map_err(|error| format!("failed to run {operation}: {error}"))
+        .map_err(|error| LaunchError::Failed(format!("failed to run {operation}: {error}")))
 }
 
 fn command_failure_message(operation: &str, output: &std::process::Output) -> String {
@@ -8658,10 +8660,10 @@ fn short_branch(value: &str) -> String {
     worktree::short_branch(value)
 }
 
-fn expand_home_path(path: &str) -> Result<PathBuf, String> {
+fn expand_home_path(path: &str) -> Result<PathBuf, PathError> {
     let trimmed = path.trim();
     if trimmed.is_empty() {
-        return Err("repository path cannot be empty".to_owned());
+        return Err(PathError::EmptyPath);
     }
 
     if trimmed == "~" {
@@ -8675,10 +8677,10 @@ fn expand_home_path(path: &str) -> Result<PathBuf, String> {
     Ok(PathBuf::from(trimmed))
 }
 
-fn user_home_dir() -> Result<PathBuf, String> {
+fn user_home_dir() -> Result<PathBuf, PathError> {
     env::var("HOME")
         .map(PathBuf::from)
-        .map_err(|_| "HOME environment variable is not set".to_owned())
+        .map_err(|_| PathError::NoHomeDir)
 }
 
 fn sanitize_worktree_name(value: &str) -> String {
@@ -8780,7 +8782,7 @@ fn git_branch_prefix_from_author(repo_root: &Path) -> Option<String> {
     (!sanitized.is_empty()).then_some(sanitized)
 }
 
-fn build_managed_worktree_path(repo_name: &str, worktree_name: &str) -> Result<PathBuf, String> {
+fn build_managed_worktree_path(repo_name: &str, worktree_name: &str) -> Result<PathBuf, PathError> {
     let home_dir = user_home_dir()?;
     Ok(home_dir
         .join(".arbor")
@@ -8962,7 +8964,7 @@ fn shell_quote(value: &str) -> String {
 
 fn parse_terminal_backend_kind(
     terminal_backend: Option<&str>,
-) -> Result<TerminalBackendKind, String> {
+) -> Result<TerminalBackendKind, ConfigParseError> {
     let Some(value) = terminal_backend
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -8972,16 +8974,16 @@ fn parse_terminal_backend_kind(
 
     match value.to_ascii_lowercase().as_str() {
         "embedded" => Ok(TerminalBackendKind::Embedded),
-        "alacritty" | "ghostty" => Err(format!(
+        "alacritty" | "ghostty" => Err(ConfigParseError::InvalidValue(format!(
             "terminal_backend `{value}` is no longer supported; Arbor terminals are embedded-only. Using the embedded terminal instead. Configure `embedded_terminal_engine` to choose `alacritty` or `ghostty-vt-experimental`."
-        )),
-        _ => Err(format!(
+        ))),
+        _ => Err(ConfigParseError::InvalidValue(format!(
             "invalid terminal_backend `{value}` in config, expected `embedded`"
-        )),
+        ))),
     }
 }
 
-fn parse_theme_kind(theme: Option<&str>) -> Result<ThemeKind, String> {
+fn parse_theme_kind(theme: Option<&str>) -> Result<ThemeKind, ConfigParseError> {
     let Some(value) = theme.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(ThemeKind::One);
     };
@@ -9026,9 +9028,9 @@ fn parse_theme_kind(theme: Option<&str>) -> Result<ThemeKind, String> {
         "tokyonight-day" | "tokionight-day" => Ok(ThemeKind::TokyoNightDay),
         "tokyonight-classic" | "tokionight-classic" => Ok(ThemeKind::TokyoNightClassic),
         "zellner" => Ok(ThemeKind::Zellner),
-        _ => Err(format!(
+        _ => Err(ConfigParseError::InvalidValue(format!(
             "invalid theme `{value}` in config, expected one-dark/ayu-dark/gruvbox-dark/dracula/solarized-light/everforest-dark/catppuccin/catppuccin-latte/ethereal/flexoki-light/hackerman/kanagawa/matte-black/miasma/nord/osaka-jade/ristretto/rose-pine/tokyo-night/vantablack/white/atom-one-light/github-light-default/github-light-high-contrast/github-light-colorblind/github-light/github-dark-default/github-dark-high-contrast/github-dark-colorblind/github-dark-dimmed/github-dark/retrobox-classic/tokyonight-day/tokyonight-classic/zellner"
-        )),
+        ))),
     }
 }
 

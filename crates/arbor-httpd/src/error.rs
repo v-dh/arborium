@@ -86,3 +86,62 @@ pub(crate) enum RouteError {
     #[error("{0}")]
     Internal(String),
 }
+
+/// Errors from process memory metrics collection.
+#[derive(Debug, Error)]
+pub(crate) enum ProcessMetricsError {
+    #[error("failed to list daemon sessions: {0}")]
+    DaemonListSessions(String),
+}
+
+/// Errors from git commit operations.
+#[derive(Debug, Error)]
+pub(crate) enum GitCommitError {
+    #[error("nothing to commit")]
+    NothingToCommit,
+    #[error("failed to open repository at `{path}`: {source}")]
+    OpenRepository { path: String, source: git2::Error },
+    #[error("failed to read index: {0}")]
+    ReadIndex(git2::Error),
+    #[error("failed to stage changes: {0}")]
+    StageChanges(git2::Error),
+    #[error("failed to update index: {0}")]
+    UpdateIndex(git2::Error),
+    #[error("failed to write index: {0}")]
+    WriteIndex(git2::Error),
+    #[error("failed to write tree: {0}")]
+    WriteTree(git2::Error),
+    #[error("failed to find tree: {0}")]
+    FindTree(git2::Error),
+    #[error("failed to create signature: {0}")]
+    CreateSignature(git2::Error),
+    #[error("failed to create commit: {0}")]
+    CreateCommit(git2::Error),
+}
+
+/// Errors from TLS certificate generation and loading.
+///
+/// Note: `tls.rs` is not currently compiled (`mod tls` is absent from
+/// `main.rs`), so rcgen/rustls error types are stored as `String` to avoid
+/// adding unused dependencies.
+#[allow(dead_code)]
+#[derive(Debug, Error)]
+pub(crate) enum TlsError {
+    #[error("failed to create certs directory: {0}")]
+    CreateCertDir(std::io::Error),
+    #[error("{context}: {reason}")]
+    CertGeneration { context: String, reason: String },
+    #[error("{context}: {source}")]
+    Io {
+        context: String,
+        source: std::io::Error,
+    },
+    #[error("parse certs: {0}")]
+    ParseCerts(std::io::Error),
+    #[error("parse private key: {0}")]
+    ParsePrivateKey(std::io::Error),
+    #[error("no private key found in PEM file")]
+    NoPrivateKey,
+    #[error("build rustls ServerConfig: {0}")]
+    BuildServerConfig(String),
+}

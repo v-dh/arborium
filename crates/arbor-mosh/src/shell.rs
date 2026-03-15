@@ -138,7 +138,7 @@ impl MoshShell {
         cols: u16,
         pixel_width: u16,
         pixel_height: u16,
-    ) -> Result<(), String> {
+    ) -> Result<(), MoshError> {
         let rows = rows.max(1);
         let cols = cols.max(2);
         let pixel_width = pixel_width.max(1);
@@ -148,7 +148,7 @@ impl MoshShell {
             let size = self
                 .size
                 .lock()
-                .map_err(|_| "failed to acquire mosh terminal size lock".to_owned())?;
+                .map_err(|_| MoshError::Io("failed to acquire mosh terminal size lock".to_owned()))?;
             if *size == (rows, cols, pixel_width, pixel_height) {
                 return Ok(());
             }
@@ -158,7 +158,7 @@ impl MoshShell {
             let mut emulator = self
                 .emulator
                 .lock()
-                .map_err(|_| "failed to acquire mosh emulator lock for resize".to_owned())?;
+                .map_err(|_| MoshError::Io("failed to acquire mosh emulator lock for resize".to_owned()))?;
             emulator.resize(rows, cols);
         }
 
@@ -166,7 +166,7 @@ impl MoshShell {
             let master = self
                 .master
                 .lock()
-                .map_err(|_| "failed to acquire mosh PTY master lock for resize".to_owned())?;
+                .map_err(|_| MoshError::Io("failed to acquire mosh PTY master lock for resize".to_owned()))?;
             master
                 .resize(PtySize {
                     rows,
@@ -174,14 +174,14 @@ impl MoshShell {
                     pixel_width,
                     pixel_height,
                 })
-                .map_err(|error| format!("failed to resize mosh PTY: {error}"))?;
+                .map_err(|error| MoshError::Pty(format!("failed to resize mosh PTY: {error}")))?;
         }
 
         {
             let mut size = self
                 .size
                 .lock()
-                .map_err(|_| "failed to update mosh terminal size lock".to_owned())?;
+                .map_err(|_| MoshError::Io("failed to update mosh terminal size lock".to_owned()))?;
             *size = (rows, cols, pixel_width, pixel_height);
         }
 

@@ -206,7 +206,7 @@ fn load_or_create_config_at(path: &Path) -> LoadedArborConfig {
     let mut notices = Vec::new();
 
     if let Err(error) = ensure_config_file_exists(path) {
-        notices.push(error);
+        notices.push(error.to_string());
     }
 
     let parsed = Config::builder()
@@ -232,22 +232,22 @@ pub fn config_last_modified(path: &Path) -> Option<SystemTime> {
         .and_then(|metadata| metadata.modified().ok())
 }
 
-fn ensure_config_file_exists(path: &Path) -> Result<(), String> {
+fn ensure_config_file_exists(path: &Path) -> Result<(), StoreError> {
     if path.exists() {
         return Ok(());
     }
 
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| {
-            format!(
-                "failed to create config directory `{}`: {error}",
-                parent.display()
-            )
+        fs::create_dir_all(parent).map_err(|source| StoreError::CreateDir {
+            path: parent.display().to_string(),
+            source,
         })?;
     }
 
-    fs::write(path, DEFAULT_CONFIG_CONTENT)
-        .map_err(|error| format!("failed to create config file `{}`: {error}", path.display()))
+    fs::write(path, DEFAULT_CONFIG_CONTENT).map_err(|source| StoreError::Write {
+        path: path.display().to_string(),
+        source,
+    })
 }
 
 fn default_config_path() -> PathBuf {

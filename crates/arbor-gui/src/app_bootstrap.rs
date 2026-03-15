@@ -289,7 +289,7 @@ enum LaunchMode {
     Help,
 }
 
-fn parse_launch_mode(args: impl IntoIterator<Item = String>) -> Result<LaunchMode, String> {
+fn parse_launch_mode(args: impl IntoIterator<Item = String>) -> Result<LaunchMode, CliError> {
     let mut daemon_mode = false;
     let mut bind_addr: Option<String> = None;
     let mut args = args.into_iter();
@@ -301,15 +301,21 @@ fn parse_launch_mode(args: impl IntoIterator<Item = String>) -> Result<LaunchMod
             },
             "--bind" | "--daemon-bind" => {
                 let Some(value) = args.next() else {
-                    return Err(format!("missing value for `{arg}`"));
+                    return Err(CliError::InvalidArg(format!("missing value for `{arg}`")));
                 };
                 if value.trim().is_empty() {
-                    return Err(format!("`{arg}` requires a non-empty address"));
+                    return Err(CliError::InvalidArg(format!(
+                        "`{arg}` requires a non-empty address"
+                    )));
                 }
                 bind_addr = Some(value);
             },
             "-h" | "--help" => return Ok(LaunchMode::Help),
-            unknown => return Err(format!("unknown argument `{unknown}`")),
+            unknown => {
+                return Err(CliError::InvalidArg(format!(
+                    "unknown argument `{unknown}`"
+                )));
+            },
         }
     }
 
@@ -386,9 +392,11 @@ fn logs_tab_icon_element(is_active: bool, color: u32, size_px: f32) -> Div {
         "\u{f4ed}",
     )
 }
-fn run_daemon_mode(bind_addr: Option<String>) -> Result<(), String> {
+fn run_daemon_mode(bind_addr: Option<String>) -> Result<(), DaemonLaunchError> {
     let binary = find_arbor_httpd_binary().ok_or_else(|| {
-        "could not find `arbor-httpd` in PATH or next to the current executable".to_owned()
+        DaemonLaunchError::Failed(
+            "could not find `arbor-httpd` in PATH or next to the current executable".to_owned(),
+        )
     })?;
 
     let mut command = Command::new(&binary);
@@ -399,21 +407,21 @@ fn run_daemon_mode(bind_addr: Option<String>) -> Result<(), String> {
         command.env("ARBOR_HTTPD_BIND", bind_addr);
     }
 
+    let binary_name = binary
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("arbor-httpd");
     let status = command.status().map_err(|error| {
-        format!(
-            "failed to start `{}`: {error}",
-            binary
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("arbor-httpd")
-        )
+        DaemonLaunchError::Failed(format!("failed to start `{binary_name}`: {error}"))
     })?;
 
     if status.success() {
         return Ok(());
     }
 
-    Err(format!("arbor-httpd exited with status {status}"))
+    Err(DaemonLaunchError::Failed(format!(
+        "arbor-httpd exited with status {status}"
+    )))
 }
 
 fn main() {

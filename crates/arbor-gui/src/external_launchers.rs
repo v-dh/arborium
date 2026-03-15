@@ -3,8 +3,7 @@ fn open_worktree_in_file_manager(worktree_path: &Path) -> Result<String, LaunchE
     {
         let mut command = create_command("open");
         command.arg(worktree_path);
-        run_launch_command(&mut command, "open worktree in Finder")
-            .map_err(LaunchError::Failed)?;
+        run_launch_command(&mut command, "open worktree in Finder")?;
         return Ok("opened worktree in Finder".to_owned());
     }
 
@@ -12,8 +11,7 @@ fn open_worktree_in_file_manager(worktree_path: &Path) -> Result<String, LaunchE
     {
         let mut command = create_command("xdg-open");
         command.arg(worktree_path);
-        run_launch_command(&mut command, "open worktree in file manager")
-            .map_err(LaunchError::Failed)?;
+        run_launch_command(&mut command, "open worktree in file manager")?;
         return Ok("opened worktree in file manager".to_owned());
     }
 
@@ -21,8 +19,7 @@ fn open_worktree_in_file_manager(worktree_path: &Path) -> Result<String, LaunchE
     {
         let mut command = create_command("explorer");
         command.arg(worktree_path);
-        run_launch_command(&mut command, "open worktree in File Explorer")
-            .map_err(LaunchError::Failed)?;
+        run_launch_command(&mut command, "open worktree in File Explorer")?;
         return Ok("opened worktree in File Explorer".to_owned());
     }
 
@@ -44,7 +41,7 @@ fn open_worktree_with_external_launcher(
                 &mut command,
                 &format!("open worktree with {}", launcher.label),
             )
-            .map_err(LaunchError::Failed)?;
+            ?;
         },
         ExternalLauncherKind::MacApp(app_name) => {
             let mut command = create_command("open");
@@ -53,7 +50,7 @@ fn open_worktree_with_external_launcher(
                 &mut command,
                 &format!("open worktree in {}", launcher.label),
             )
-            .map_err(LaunchError::Failed)?;
+            ?;
         },
     }
 

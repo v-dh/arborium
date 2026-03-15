@@ -85,3 +85,65 @@ pub(crate) enum LaunchError {
     #[error("{0}")]
     Failed(String),
 }
+
+/// Errors from home-directory and path resolution.
+#[derive(Debug, Error)]
+pub(crate) enum PathError {
+    #[error("repository path cannot be empty")]
+    EmptyPath,
+    #[error("HOME environment variable is not set")]
+    NoHomeDir,
+}
+
+/// Errors from config value parsing (theme, terminal backend).
+#[derive(Debug, Error, PartialEq)]
+pub(crate) enum ConfigParseError {
+    #[error("{0}")]
+    InvalidValue(String),
+}
+
+/// Errors from CLI argument parsing.
+#[derive(Debug, Error)]
+pub(crate) enum CliError {
+    #[error("{0}")]
+    InvalidArg(String),
+}
+
+/// Errors from running external daemon processes.
+#[derive(Debug, Error)]
+pub(crate) enum DaemonLaunchError {
+    #[error("{0}")]
+    Failed(String),
+}
+
+/// Errors from remote outpost provisioning over SSH.
+#[derive(Debug, Error)]
+pub(crate) enum OutpostError {
+    #[error("SSH connection failed: {0}")]
+    Connection(String),
+    #[error("{0}")]
+    Provisioning(String),
+}
+
+/// Errors from worktree creation, cloning, and lifecycle operations.
+#[derive(Debug, Error)]
+pub(crate) enum WorktreeError {
+    #[error(transparent)]
+    Path(#[from] PathError),
+    #[error("{0}")]
+    InvalidInput(String),
+    #[error("{0}")]
+    GitOperation(String),
+    #[error("{0}")]
+    Io(String),
+    #[error(transparent)]
+    Launch(#[from] LaunchError),
+    #[error("{0}")]
+    CommandFailed(String),
+    #[error("{0}")]
+    GitHub(String),
+    #[error("{0}")]
+    Script(String),
+    #[error("{message}; rollback also failed: {rollback}")]
+    ScriptWithRollbackFailure { message: String, rollback: String },
+}

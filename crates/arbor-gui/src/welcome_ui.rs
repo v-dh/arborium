@@ -50,7 +50,7 @@ impl ArborWindow {
         let clone_dir = match user_home_dir() {
             Ok(home) => home.join(".arbor").join("repos").join(&repo_name),
             Err(error) => {
-                self.welcome_clone_error = Some(error);
+                self.welcome_clone_error = Some(error.to_string());
                 cx.notify();
                 return;
             },

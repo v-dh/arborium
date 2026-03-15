@@ -1,4 +1,5 @@
 use {
+    crate::ProcessMetricsError,
     arbor_core::{
         daemon::{DaemonSessionRecord, TerminalDaemon, TerminalSessionState},
         process::ProcessInfo,
@@ -12,12 +13,16 @@ struct ProcessSnapshot {
     memory_bytes: u64,
 }
 
-pub(crate) fn collect_session_memory_bytes<D>(daemon: &D) -> Result<HashMap<String, u64>, String>
+pub(crate) fn collect_session_memory_bytes<D>(
+    daemon: &D,
+) -> Result<HashMap<String, u64>, ProcessMetricsError>
 where
     D: TerminalDaemon,
     D::Error: ToString,
 {
-    let sessions = daemon.list_sessions().map_err(|error| error.to_string())?;
+    let sessions = daemon
+        .list_sessions()
+        .map_err(|error| ProcessMetricsError::DaemonListSessions(error.to_string()))?;
     Ok(session_memory_bytes_from_sessions(
         &sessions,
         &list_process_snapshot(),

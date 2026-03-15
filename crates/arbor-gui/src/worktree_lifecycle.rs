@@ -797,12 +797,13 @@ impl ArborWindow {
                     },
                     Err(error) => {
                         tracing::error!("worktree creation failed: {error}");
+                        let message = error.to_string();
                         if let Some(modal) = this.create_modal.as_mut() {
                             modal.is_creating = false;
                             modal.creating_status = None;
-                            modal.error = Some(error);
+                            modal.error = Some(message);
                         } else {
-                            this.notice = Some(error);
+                            this.notice = Some(message);
                         }
                     },
                 }
@@ -904,12 +905,13 @@ impl ArborWindow {
                     },
                     Err(error) => {
                         tracing::error!("pull request review creation failed: {error}");
+                        let message = error.to_string();
                         if let Some(modal) = this.create_modal.as_mut() {
                             modal.is_creating = false;
                             modal.creating_status = None;
-                            modal.error = Some(error);
+                            modal.error = Some(message);
                         } else {
-                            this.notice = Some(error);
+                            this.notice = Some(message);
                         }
                     },
                 }
@@ -1061,7 +1063,7 @@ impl ArborWindow {
 
         enum ProvisionMsg {
             Progress(String),
-            Done(Result<arbor_core::remote::ProvisionResult, String>),
+            Done(Result<arbor_core::remote::ProvisionResult, OutpostError>),
         }
 
         let (msg_tx, msg_rx) = smol::channel::unbounded::<ProvisionMsg>();
@@ -1071,13 +1073,13 @@ impl ArborWindow {
                 let result = (|| {
                     let conn_slot = pool
                         .get_or_connect(&host)
-                        .map_err(|error| format!("SSH connection failed: {error}"))?;
+                        .map_err(|error| OutpostError::Connection(format!("{error}")))?;
                     let guard = conn_slot
                         .lock()
-                        .map_err(|_| "SSH connection lock poisoned".to_owned())?;
+                        .map_err(|_| OutpostError::Connection("SSH connection lock poisoned".to_owned()))?;
                     let connection = guard
                         .as_ref()
-                        .ok_or_else(|| "SSH connection not available".to_owned())?;
+                        .ok_or_else(|| OutpostError::Connection("SSH connection not available".to_owned()))?;
                     let provisioner =
                         arbor_ssh::provisioner::SshProvisioner::new(connection, &host);
                     provisioner
@@ -1090,13 +1092,13 @@ impl ArborWindow {
                                     msg_tx.send_blocking(ProvisionMsg::Progress(status.to_owned()));
                             },
                         )
-                        .map_err(|error| format!("{error}"))
+                        .map_err(|error| OutpostError::Provisioning(format!("{error}")))
                 })();
                 let _ = msg_tx.send_blocking(ProvisionMsg::Done(result));
             })
             .detach();
 
-            let mut result = Err("provisioning task was cancelled".to_owned());
+            let mut result: Result<arbor_core::remote::ProvisionResult, OutpostError> = Err(OutpostError::Provisioning("provisioning task was cancelled".to_owned()));
             while let Ok(msg) = msg_rx.recv().await {
                 match msg {
                     ProvisionMsg::Progress(status) => {
@@ -1147,12 +1149,13 @@ impl ArborWindow {
                     },
                     Err(error) => {
                         tracing::error!("outpost creation failed: {error}");
+                        let message = error.to_string();
                         if let Some(modal) = this.create_modal.as_mut() {
                             modal.is_creating = false;
                             modal.creating_status = None;
-                            modal.error = Some(error);
+                            modal.error = Some(message);
                         } else {
-                            this.notice = Some(error);
+                            this.notice = Some(message);
                         }
                     },
                 }
@@ -2413,15 +2416,15 @@ fn modal_preview_box(theme: ThemePalette, label: &'static str, value: String) ->
 fn preview_managed_worktree_path(
     repository_path: &str,
     worktree_name: &str,
-) -> Result<String, String> {
+) -> Result<String, WorktreeError> {
     let repository_path = expand_home_path(repository_path)?;
     let repository_name = repository_path
         .file_name()
         .and_then(|name| name.to_str())
-        .ok_or_else(|| "repository name cannot be determined".to_owned())?;
+        .ok_or_else(|| WorktreeError::InvalidInput("repository name cannot be determined".to_owned()))?;
     let sanitized_worktree = sanitize_worktree_name(worktree_name);
     if sanitized_worktree.is_empty() {
-        return Err("invalid worktree name".to_owned());
+        return Err(WorktreeError::InvalidInput("invalid worktree name".to_owned()));
     }
 
     let path = build_managed_worktree_path(repository_name, &sanitized_worktree)?;
@@ -2476,25 +2479,25 @@ fn create_managed_worktree(
     worktree_name_input: String,
     checkout_kind: CheckoutKind,
     github_login: Option<String>,
-) -> Result<CreatedWorktree, String> {
+) -> Result<CreatedWorktree, WorktreeError> {
     let repository_path = expand_home_path(&repository_path_input)?;
     if !repository_path.exists() {
-        return Err(format!(
+        return Err(WorktreeError::InvalidInput(format!(
             "repository path does not exist: {}",
             repository_path.display()
-        ));
+        )));
     }
 
     let repository_root = worktree::repo_root(&repository_path)
-        .map_err(|error| format!("failed to resolve repository root: {error}"))?;
+        .map_err(|error| WorktreeError::GitOperation(format!("failed to resolve repository root: {error}")))?;
     let repository_name = repository_root
         .file_name()
         .and_then(|name| name.to_str())
-        .ok_or_else(|| "repository root has no terminal directory name".to_owned())?;
+        .ok_or_else(|| WorktreeError::InvalidInput("repository root has no terminal directory name".to_owned()))?;
 
     let sanitized_worktree_name = sanitize_worktree_name(&worktree_name_input);
     if sanitized_worktree_name.is_empty() {
-        return Err("worktree name contains no usable characters".to_owned());
+        return Err(WorktreeError::InvalidInput("worktree name contains no usable characters".to_owned()));
     }
 
     let branch_name = derive_branch_name_with_repo_config(
@@ -2504,20 +2507,20 @@ fn create_managed_worktree(
     );
     let worktree_path = build_managed_worktree_path(repository_name, &sanitized_worktree_name)?;
     if worktree_path.exists() {
-        return Err(format!(
+        return Err(WorktreeError::InvalidInput(format!(
             "worktree path already exists: {}",
             worktree_path.display()
-        ));
+        )));
     }
 
     let Some(parent_directory) = worktree_path.parent() else {
-        return Err("invalid worktree path".to_owned());
+        return Err(WorktreeError::InvalidInput("invalid worktree path".to_owned()));
     };
     fs::create_dir_all(parent_directory).map_err(|error| {
-        format!(
+        WorktreeError::Io(format!(
             "failed to create worktree parent directory `{}`: {error}",
             parent_directory.display()
-        )
+        ))
     })?;
 
     match checkout_kind {
@@ -2530,7 +2533,7 @@ fn create_managed_worktree(
                 force: false,
             },
         )
-        .map_err(|error| format!("failed to create worktree: {error}"))?,
+        .map_err(|error| WorktreeError::GitOperation(format!("failed to create worktree: {error}")))?,
         CheckoutKind::DiscreteClone => {
             create_discrete_clone(&repository_root, &worktree_path, &branch_name)?
         },
@@ -2549,8 +2552,11 @@ fn create_managed_worktree(
             checkout_kind,
             &branch_name,
         )
-        .map_err(|rollback_error| format!("{error}. rollback also failed: {rollback_error}"))?;
-        return Err(error.to_string());
+        .map_err(|rollback_error| WorktreeError::ScriptWithRollbackFailure {
+            message: error.to_string(),
+            rollback: rollback_error.to_string(),
+        })?;
+        return Err(WorktreeError::Script(error.to_string()));
     }
 
     Ok(CreatedWorktree {
@@ -2570,33 +2576,33 @@ fn create_review_worktree(
     checkout_kind: CheckoutKind,
     github_token: Option<String>,
     github_login: Option<String>,
-) -> Result<CreatedWorktree, String> {
+) -> Result<CreatedWorktree, WorktreeError> {
     let repository_path = expand_home_path(&repository_path_input)?;
     if !repository_path.exists() {
-        return Err(format!(
+        return Err(WorktreeError::InvalidInput(format!(
             "repository path does not exist: {}",
             repository_path.display()
-        ));
+        )));
     }
 
     let repository_root = worktree::repo_root(&repository_path)
-        .map_err(|error| format!("failed to resolve repository root: {error}"))?;
+        .map_err(|error| WorktreeError::GitOperation(format!("failed to resolve repository root: {error}")))?;
     let repository_name = repository_root
         .file_name()
         .and_then(|name| name.to_str())
-        .ok_or_else(|| "repository root has no terminal directory name".to_owned())?;
+        .ok_or_else(|| WorktreeError::InvalidInput("repository root has no terminal directory name".to_owned()))?;
     let repo_slug = github_repo_slug_for_repo(&repository_root).ok_or_else(|| {
-        format!(
+        WorktreeError::GitHub(format!(
             "repository `{}` does not have a GitHub origin remote",
             repository_root.display()
-        )
+        ))
     })?;
     let pull_request = github_service::resolve_pull_request_for_review(
         &repo_slug,
         &pr_reference_input,
         github_token.as_deref(),
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| WorktreeError::GitHub(e.to_string()))?;
 
     let requested_name = if worktree_name_input.trim().is_empty() {
         default_review_worktree_name(&pull_request)
@@ -2605,7 +2611,7 @@ fn create_review_worktree(
     };
     let sanitized_worktree_name = sanitize_worktree_name(&requested_name);
     if sanitized_worktree_name.is_empty() {
-        return Err("worktree name contains no usable characters".to_owned());
+        return Err(WorktreeError::InvalidInput("worktree name contains no usable characters".to_owned()));
     }
 
     let branch_name = derive_branch_name_with_repo_config(
@@ -2615,20 +2621,20 @@ fn create_review_worktree(
     );
     let worktree_path = build_managed_worktree_path(repository_name, &sanitized_worktree_name)?;
     if worktree_path.exists() {
-        return Err(format!(
+        return Err(WorktreeError::InvalidInput(format!(
             "worktree path already exists: {}",
             worktree_path.display()
-        ));
+        )));
     }
 
     let Some(parent_directory) = worktree_path.parent() else {
-        return Err("invalid worktree path".to_owned());
+        return Err(WorktreeError::InvalidInput("invalid worktree path".to_owned()));
     };
     fs::create_dir_all(parent_directory).map_err(|error| {
-        format!(
+        WorktreeError::Io(format!(
             "failed to create worktree parent directory `{}`: {error}",
             parent_directory.display()
-        )
+        ))
     })?;
 
     match checkout_kind {
@@ -2643,7 +2649,7 @@ fn create_review_worktree(
                     force: false,
                 },
             )
-            .map_err(|error| format!("failed to create worktree: {error}"))?;
+            .map_err(|error| WorktreeError::GitOperation(format!("failed to create worktree: {error}")))?;
         },
         CheckoutKind::DiscreteClone => create_discrete_clone_from_pull_request(
             &repository_root,
@@ -2666,8 +2672,11 @@ fn create_review_worktree(
             checkout_kind,
             &branch_name,
         )
-        .map_err(|rollback_error| format!("{error}. rollback also failed: {rollback_error}"))?;
-        return Err(error.to_string());
+        .map_err(|rollback_error| WorktreeError::ScriptWithRollbackFailure {
+            message: error.to_string(),
+            rollback: rollback_error.to_string(),
+        })?;
+        return Err(WorktreeError::Script(error.to_string()));
     }
 
     Ok(CreatedWorktree {
@@ -2693,7 +2702,7 @@ fn fetch_pull_request_head_into_branch(
     repository_root: &Path,
     pull_request_number: u64,
     branch_name: &str,
-) -> Result<(), String> {
+) -> Result<(), WorktreeError> {
     let fetch_ref = format!("+refs/pull/{pull_request_number}/head:refs/heads/{branch_name}");
     let mut command = create_command("git");
     command
@@ -2703,7 +2712,7 @@ fn fetch_pull_request_head_into_branch(
 
     let output = run_command_output(&mut command, "fetch pull request")?;
     if !output.status.success() {
-        return Err(command_failure_message("fetch pull request", &output));
+        return Err(WorktreeError::CommandFailed(command_failure_message("fetch pull request", &output)));
     }
 
     Ok(())
@@ -2713,19 +2722,19 @@ fn create_discrete_clone(
     source_repo_root: &Path,
     checkout_path: &Path,
     branch_name: &str,
-) -> Result<(), String> {
+) -> Result<(), WorktreeError> {
     let clone_source = source_repo_root
         .to_str()
-        .ok_or_else(|| "repository path contains invalid UTF-8".to_owned())?;
+        .ok_or_else(|| WorktreeError::InvalidInput("repository path contains invalid UTF-8".to_owned()))?;
     let checkout_target = checkout_path
         .to_str()
-        .ok_or_else(|| "checkout path contains invalid UTF-8".to_owned())?;
+        .ok_or_else(|| WorktreeError::InvalidInput("checkout path contains invalid UTF-8".to_owned()))?;
 
     let source_repo = git2::Repository::open(source_repo_root).map_err(|error| {
-        format!(
+        WorktreeError::GitOperation(format!(
             "failed to open source repository `{}`: {error}",
             source_repo_root.display()
-        )
+        ))
     })?;
     let origin_url = source_repo
         .find_remote("origin")
@@ -2733,11 +2742,11 @@ fn create_discrete_clone(
         .and_then(|remote| remote.url().map(str::to_owned));
 
     let cloned_repo = git2::Repository::clone(clone_source, checkout_target).map_err(|error| {
-        format!(
+        WorktreeError::GitOperation(format!(
             "failed to clone `{}` into `{}`: {error}",
             source_repo_root.display(),
             checkout_path.display()
-        )
+        ))
     })?;
 
     if let Some(origin_url) = origin_url.as_deref() {
@@ -2747,21 +2756,21 @@ fn create_discrete_clone(
     let head_commit = cloned_repo
         .head()
         .and_then(|head| head.peel_to_commit())
-        .map_err(|error| format!("failed to resolve cloned HEAD: {error}"))?;
+        .map_err(|error| WorktreeError::GitOperation(format!("failed to resolve cloned HEAD: {error}")))?;
     cloned_repo
         .branch(branch_name, &head_commit, false)
-        .map_err(|error| format!("failed to create branch `{branch_name}`: {error}"))?;
+        .map_err(|error| WorktreeError::GitOperation(format!("failed to create branch `{branch_name}`: {error}")))?;
 
     let branch_ref = format!("refs/heads/{branch_name}");
     cloned_repo
         .set_head(&branch_ref)
-        .map_err(|error| format!("failed to set HEAD to `{branch_name}`: {error}"))?;
+        .map_err(|error| WorktreeError::GitOperation(format!("failed to set HEAD to `{branch_name}`: {error}")))?;
 
     let mut checkout = git2::build::CheckoutBuilder::new();
     checkout.force();
     cloned_repo
         .checkout_head(Some(&mut checkout))
-        .map_err(|error| format!("failed to check out `{branch_name}`: {error}"))?;
+        .map_err(|error| WorktreeError::GitOperation(format!("failed to check out `{branch_name}`: {error}")))?;
 
     Ok(())
 }
@@ -2771,19 +2780,19 @@ fn create_discrete_clone_from_pull_request(
     checkout_path: &Path,
     pull_request_number: u64,
     branch_name: &str,
-) -> Result<(), String> {
+) -> Result<(), WorktreeError> {
     let clone_source = source_repo_root
         .to_str()
-        .ok_or_else(|| "repository path contains invalid UTF-8".to_owned())?;
+        .ok_or_else(|| WorktreeError::InvalidInput("repository path contains invalid UTF-8".to_owned()))?;
     let checkout_target = checkout_path
         .to_str()
-        .ok_or_else(|| "checkout path contains invalid UTF-8".to_owned())?;
+        .ok_or_else(|| WorktreeError::InvalidInput("checkout path contains invalid UTF-8".to_owned()))?;
 
     let source_repo = git2::Repository::open(source_repo_root).map_err(|error| {
-        format!(
+        WorktreeError::GitOperation(format!(
             "failed to open source repository `{}`: {error}",
             source_repo_root.display()
-        )
+        ))
     })?;
     let origin_url = source_repo
         .find_remote("origin")
@@ -2791,11 +2800,11 @@ fn create_discrete_clone_from_pull_request(
         .and_then(|remote| remote.url().map(str::to_owned));
 
     let cloned_repo = git2::Repository::clone(clone_source, checkout_target).map_err(|error| {
-        format!(
+        WorktreeError::GitOperation(format!(
             "failed to clone `{}` into `{}`: {error}",
             source_repo_root.display(),
             checkout_path.display()
-        )
+        ))
     })?;
 
     if let Some(origin_url) = origin_url.as_deref() {
@@ -2807,13 +2816,13 @@ fn create_discrete_clone_from_pull_request(
     let branch_ref = format!("refs/heads/{branch_name}");
     cloned_repo
         .set_head(&branch_ref)
-        .map_err(|error| format!("failed to set HEAD to `{branch_name}`: {error}"))?;
+        .map_err(|error| WorktreeError::GitOperation(format!("failed to set HEAD to `{branch_name}`: {error}")))?;
 
     let mut checkout = git2::build::CheckoutBuilder::new();
     checkout.force();
     cloned_repo
         .checkout_head(Some(&mut checkout))
-        .map_err(|error| format!("failed to check out `{branch_name}`: {error}"))?;
+        .map_err(|error| WorktreeError::GitOperation(format!("failed to check out `{branch_name}`: {error}")))?;
 
     Ok(())
 }
@@ -2823,22 +2832,23 @@ fn rollback_created_checkout(
     worktree_path: &Path,
     checkout_kind: CheckoutKind,
     branch_name: &str,
-) -> Result<(), String> {
+) -> Result<(), WorktreeError> {
     match checkout_kind {
         CheckoutKind::LinkedWorktree => {
-            worktree::remove(repo_root, worktree_path, true).map_err(|error| error.to_string())?;
+            worktree::remove(repo_root, worktree_path, true)
+                .map_err(|error| WorktreeError::GitOperation(error.to_string()))?;
             if !branch_name.trim().is_empty() {
                 worktree::delete_branch(repo_root, branch_name)
-                    .map_err(|error| format!("failed to delete branch `{branch_name}`: {error}"))?;
+                    .map_err(|error| WorktreeError::GitOperation(format!("failed to delete branch `{branch_name}`: {error}")))?;
             }
         },
         CheckoutKind::DiscreteClone => {
             if worktree_path.exists() {
                 fs::remove_dir_all(worktree_path).map_err(|error| {
-                    format!(
+                    WorktreeError::Io(format!(
                         "failed to remove checkout `{}` during rollback: {error}",
                         worktree_path.display()
-                    )
+                    ))
                 })?;
             }
         },

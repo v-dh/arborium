@@ -185,7 +185,7 @@ impl ArborWindow {
                             StackedGitActionFailure::CreatePullRequest {
                                 commit_message,
                                 push_message,
-                                error,
+                                error: error.to_string(),
                             },
                         )));
                         return;
@@ -419,7 +419,7 @@ impl ArborWindow {
                         this.refresh_worktree_pull_requests(cx);
                     },
                     Err(error) => {
-                        this.notice = Some(error);
+                        this.notice = Some(error.to_string());
                     },
                 }
                 cx.notify();
@@ -870,37 +870,44 @@ fn run_create_pr_for_worktree(
     worktree_path: &Path,
     repo_slug: Option<&str>,
     github_token: Option<&str>,
-) -> Result<String, String> {
+) -> Result<String, GitHubError> {
     if !git_has_tracking_branch(worktree_path) {
-        return Err("push the branch before creating a PR".to_owned());
+        return Err(GitHubError::Api(
+            "push the branch before creating a PR".to_owned(),
+        ));
     }
 
-    let branch =
-        git_branch_name_for_worktree(worktree_path).map_err(|error| error.to_string())?;
+    let branch = git_branch_name_for_worktree(worktree_path)
+        .map_err(|error| GitHubError::Api(error.to_string()))?;
     let base_branch = git_default_base_branch(worktree_path).unwrap_or_else(|| "main".to_owned());
 
     let slug = repo_slug
         .map(str::to_owned)
         .or_else(|| github_repo_slug_for_repo(worktree_path))
-        .ok_or_else(|| "could not determine GitHub repository slug".to_owned())?;
+        .ok_or_else(|| {
+            GitHubError::Api("could not determine GitHub repository slug".to_owned())
+        })?;
 
     let title = branch.replace(['-', '_'], " ");
 
-    let token = resolve_github_access_token(github_token)
-        .ok_or_else(|| "GitHub authentication required, click GitHub Sign in first".to_owned())?;
+    let token = resolve_github_access_token(github_token).ok_or_else(|| {
+        GitHubError::Auth(
+            "GitHub authentication required, click GitHub Sign in first".to_owned(),
+        )
+    })?;
 
     if let Some(existing_pr_number) =
         github_service.open_pull_request_number(&slug, &branch, &token)
     {
-        return Err(format!(
+        return Err(GitHubError::Api(format!(
             "pull request already exists: {}",
             github_pr_url(&slug, existing_pr_number)
-        ));
+        )));
     }
 
     github_service
         .create_pull_request(&slug, &title, &branch, &base_branch, &token)
-        .map_err(|error| error.to_string())
+        .map_err(|error| GitHubError::Api(error.to_string()))
 }
 
 fn extract_first_url(text: &str) -> Option<String> {

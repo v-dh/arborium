@@ -234,18 +234,18 @@ impl SshTerminalShell {
         cols: u16,
         rows: u16,
         remote_path: &str,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, TerminalError> {
         let shell = arbor_ssh::shell::SshShell::open(
             connection.session(),
             u32::from(cols),
             u32::from(rows),
         )
-        .map_err(|e| format!("failed to open SSH shell: {e}"))?;
+        .map_err(|e| TerminalError::Pty(format!("failed to open SSH shell: {e}")))?;
 
         // Send cd command to navigate to the outpost directory
         shell
             .write_input(format!("cd {remote_path} && clear\n").as_bytes())
-            .map_err(|e| format!("failed to send cd command: {e}"))?;
+            .map_err(|e| TerminalError::Pty(format!("failed to send cd command: {e}")))?;
 
         Ok(Self {
             shell: Arc::new(Mutex::new(shell)),

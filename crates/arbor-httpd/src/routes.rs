@@ -641,7 +641,7 @@ pub(crate) async fn commit_worktree(
 
     let commit_message =
         run_git_commit_for_worktree(&worktree_path, &changed_files, request.message.as_deref())
-            .map_err(internal_error)?;
+            .map_err(|e| internal_error(e.to_string()))?;
 
     Ok(Json(GitActionResponse {
         path: worktree_path.display().to_string(),
@@ -1563,7 +1563,8 @@ fn agent_session_snapshot(sessions: &mut HashMap<String, AgentSession>) -> Vec<A
 // ── Process management handlers ──────────────────────────────────────
 
 pub(crate) async fn list_processes(State(state): State<AppState>) -> ApiResult<Vec<ProcessInfo>> {
-    let definitions = discover_process_definitions(&state).map_err(internal_error)?;
+    let definitions =
+        discover_process_definitions(&state).map_err(|e| internal_error(e.to_string()))?;
     let session_memory_bytes = collect_process_memory_bytes(&state).await;
     let mut pm = state.process_manager.lock().await;
     pm.sync_definitions(&definitions);
@@ -1575,7 +1576,8 @@ pub(crate) async fn list_processes(State(state): State<AppState>) -> ApiResult<V
 pub(crate) async fn start_all_processes(
     State(state): State<AppState>,
 ) -> ApiResult<Vec<ProcessInfo>> {
-    let definitions = discover_process_definitions(&state).map_err(internal_error)?;
+    let definitions =
+        discover_process_definitions(&state).map_err(|e| internal_error(e.to_string()))?;
     let mut pm = state.process_manager.lock().await;
     pm.sync_definitions(&definitions);
     let mut daemon = state.daemon.lock().await;
@@ -1592,7 +1594,8 @@ pub(crate) async fn start_all_processes(
 pub(crate) async fn stop_all_processes(
     State(state): State<AppState>,
 ) -> ApiResult<Vec<ProcessInfo>> {
-    let definitions = discover_process_definitions(&state).map_err(internal_error)?;
+    let definitions =
+        discover_process_definitions(&state).map_err(|e| internal_error(e.to_string()))?;
     let mut pm = state.process_manager.lock().await;
     pm.sync_definitions(&definitions);
     let mut daemon = state.daemon.lock().await;
@@ -1610,7 +1613,8 @@ pub(crate) async fn start_process(
     State(state): State<AppState>,
     AxumPath(name): AxumPath<String>,
 ) -> ApiResult<ProcessInfo> {
-    let definitions = discover_process_definitions(&state).map_err(internal_error)?;
+    let definitions =
+        discover_process_definitions(&state).map_err(|e| internal_error(e.to_string()))?;
     let mut pm = state.process_manager.lock().await;
     pm.sync_definitions(&definitions);
     let mut daemon = state.daemon.lock().await;
@@ -1626,7 +1630,8 @@ pub(crate) async fn stop_process(
     State(state): State<AppState>,
     AxumPath(name): AxumPath<String>,
 ) -> ApiResult<ProcessInfo> {
-    let definitions = discover_process_definitions(&state).map_err(internal_error)?;
+    let definitions =
+        discover_process_definitions(&state).map_err(|e| internal_error(e.to_string()))?;
     let mut pm = state.process_manager.lock().await;
     pm.sync_definitions(&definitions);
     let mut daemon = state.daemon.lock().await;
@@ -1642,7 +1647,8 @@ pub(crate) async fn restart_process(
     State(state): State<AppState>,
     AxumPath(name): AxumPath<String>,
 ) -> ApiResult<ProcessInfo> {
-    let definitions = discover_process_definitions(&state).map_err(internal_error)?;
+    let definitions =
+        discover_process_definitions(&state).map_err(|e| internal_error(e.to_string()))?;
     let mut pm = state.process_manager.lock().await;
     pm.sync_definitions(&definitions);
     let mut daemon = state.daemon.lock().await;
@@ -1706,11 +1712,8 @@ async fn process_status_snapshot_and_subscription(
 
 fn discover_process_definitions(
     state: &AppState,
-) -> Result<Vec<crate::process_manager::ProcessDefinition>, String> {
-    let roots = state
-        .repository_store
-        .load_roots()
-        .map_err(|error| format!("failed to load repository roots: {error}"))?;
+) -> Result<Vec<crate::process_manager::ProcessDefinition>, RepositoryStoreError> {
+    let roots = state.repository_store.load_roots()?;
     let resolved = repository_store::resolve_repository_roots(roots);
     Ok(crate::process_manager::discover_process_definitions_for_roots(&resolved))
 }
@@ -2140,43 +2143,34 @@ fn run_git_commit_for_worktree(
     worktree_path: &Path,
     changed_files: &[changes::ChangedFile],
     message_override: Option<&str>,
-) -> Result<String, String> {
+) -> Result<String, GitCommitError> {
     if changed_files.is_empty() {
-        return Err("nothing to commit".to_owned());
+        return Err(GitCommitError::NothingToCommit);
     }
 
-    let repo = git2::Repository::open(worktree_path).map_err(|error| {
-        format!(
-            "failed to open repository at `{}`: {error}",
-            worktree_path.display()
-        )
-    })?;
+    let repo =
+        git2::Repository::open(worktree_path).map_err(|source| GitCommitError::OpenRepository {
+            path: worktree_path.display().to_string(),
+            source,
+        })?;
 
-    let mut index = repo
-        .index()
-        .map_err(|error| format!("failed to read index: {error}"))?;
+    let mut index = repo.index().map_err(GitCommitError::ReadIndex)?;
     index
         .add_all(["."], git2::IndexAddOption::DEFAULT, None)
-        .map_err(|error| format!("failed to stage changes: {error}"))?;
+        .map_err(GitCommitError::StageChanges)?;
     index
         .update_all(["."], None)
-        .map_err(|error| format!("failed to update index: {error}"))?;
-    index
-        .write()
-        .map_err(|error| format!("failed to write index: {error}"))?;
+        .map_err(GitCommitError::UpdateIndex)?;
+    index.write().map_err(GitCommitError::WriteIndex)?;
 
-    let tree_oid = index
-        .write_tree()
-        .map_err(|error| format!("failed to write tree: {error}"))?;
-    let tree = repo
-        .find_tree(tree_oid)
-        .map_err(|error| format!("failed to find tree: {error}"))?;
+    let tree_oid = index.write_tree().map_err(GitCommitError::WriteTree)?;
+    let tree = repo.find_tree(tree_oid).map_err(GitCommitError::FindTree)?;
 
     if let Ok(head) = repo.head()
         && let Ok(head_commit) = head.peel_to_commit()
         && head_commit.tree_id() == tree_oid
     {
-        return Err("nothing to commit".to_owned());
+        return Err(GitCommitError::NothingToCommit);
     }
 
     let message = message_override
@@ -2189,9 +2183,7 @@ fn run_git_commit_for_worktree(
             format!("{subject}\n\n{body}")
         });
 
-    let signature = repo
-        .signature()
-        .map_err(|error| format!("failed to create signature: {error}"))?;
+    let signature = repo.signature().map_err(GitCommitError::CreateSignature)?;
     let parent_commits: Vec<git2::Commit<'_>> = match repo.head() {
         Ok(head) => match head.peel_to_commit() {
             Ok(commit) => vec![commit],
@@ -2209,7 +2201,7 @@ fn run_git_commit_for_worktree(
         &tree,
         &parents,
     )
-    .map_err(|error| format!("failed to create commit: {error}"))?;
+    .map_err(GitCommitError::CreateCommit)?;
 
     Ok(message)
 }

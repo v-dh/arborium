@@ -5,6 +5,7 @@
 //! connections on the same port are automatically redirected to HTTPS.
 
 use {
+    crate::TlsError,
     rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose, SanType},
     rustls::ServerConfig,
     std::{
@@ -24,15 +25,15 @@ use {
 const LOCALHOST_DOMAIN: &str = "arbor.localhost";
 
 /// Returns the certificate storage directory (`~/.config/arbor/certs/`).
-pub fn cert_dir() -> Result<PathBuf, String> {
+pub fn cert_dir() -> Result<PathBuf, TlsError> {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_owned());
     let dir = PathBuf::from(home).join(".config/arbor/certs");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("failed to create certs directory: {e}"))?;
+    std::fs::create_dir_all(&dir).map_err(TlsError::CreateCertDir)?;
     Ok(dir)
 }
 
 /// Ensure certificates exist and are fresh. Returns (ca_cert, server_cert, server_key) paths.
-pub fn ensure_certs() -> Result<(PathBuf, PathBuf, PathBuf), String> {
+pub fn ensure_certs() -> Result<(PathBuf, PathBuf, PathBuf), TlsError> {
     let dir = cert_dir()?;
     let ca_cert_path = dir.join("ca.pem");
     let ca_key_path = dir.join("ca-key.pem");
@@ -47,12 +48,22 @@ pub fn ensure_certs() -> Result<(PathBuf, PathBuf, PathBuf), String> {
     if need_regen {
         eprintln!("generating TLS certificates in {}", dir.display());
         let (ca_cert_pem, ca_key_pem, server_cert_pem, server_key_pem) = generate_all()?;
-        std::fs::write(&ca_cert_path, &ca_cert_pem).map_err(|e| format!("write ca.pem: {e}"))?;
-        std::fs::write(&ca_key_path, &ca_key_pem).map_err(|e| format!("write ca-key.pem: {e}"))?;
-        std::fs::write(&server_cert_path, &server_cert_pem)
-            .map_err(|e| format!("write server.pem: {e}"))?;
-        std::fs::write(&server_key_path, &server_key_pem)
-            .map_err(|e| format!("write server-key.pem: {e}"))?;
+        std::fs::write(&ca_cert_path, &ca_cert_pem).map_err(|source| TlsError::Io {
+            context: "write ca.pem".to_owned(),
+            source,
+        })?;
+        std::fs::write(&ca_key_path, &ca_key_pem).map_err(|source| TlsError::Io {
+            context: "write ca-key.pem".to_owned(),
+            source,
+        })?;
+        std::fs::write(&server_cert_path, &server_cert_pem).map_err(|source| TlsError::Io {
+            context: "write server.pem".to_owned(),
+            source,
+        })?;
+        std::fs::write(&server_key_path, &server_key_pem).map_err(|source| TlsError::Io {
+            context: "write server-key.pem".to_owned(),
+            source,
+        })?;
         eprintln!("TLS certificates written to {}", dir.display());
     }
 
@@ -94,13 +105,20 @@ fn required_dns_san_names() -> Vec<String> {
     names
 }
 
-fn generate_all() -> Result<(String, String, String, String), String> {
+fn generate_all() -> Result<(String, String, String, String), TlsError> {
     let now = OffsetDateTime::now_utc();
 
     // CA
-    let ca_key = KeyPair::generate().map_err(|e| format!("generate CA key: {e}"))?;
-    let mut ca_params =
-        CertificateParams::new(Vec::<String>::new()).map_err(|e| format!("CA params: {e}"))?;
+    let ca_key = KeyPair::generate().map_err(|source| TlsError::CertGeneration {
+        context: "generate CA key".to_owned(),
+        reason: source.to_string(),
+    })?;
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).map_err(|source| {
+        TlsError::CertGeneration {
+            context: "CA params".to_owned(),
+            reason: source.to_string(),
+        }
+    })?;
     ca_params
         .distinguished_name
         .push(DnType::CommonName, "Arbor Local CA");
@@ -111,14 +129,25 @@ fn generate_all() -> Result<(String, String, String, String), String> {
     ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
     ca_params.not_before = now;
     ca_params.not_after = now + time::Duration::days(365 * 10);
-    let ca_cert = ca_params
-        .self_signed(&ca_key)
-        .map_err(|e| format!("self-sign CA: {e}"))?;
+    let ca_cert =
+        ca_params
+            .self_signed(&ca_key)
+            .map_err(|source| TlsError::CertGeneration {
+                context: "self-sign CA".to_owned(),
+                reason: source.to_string(),
+            })?;
 
     // Server cert signed by CA
-    let server_key = KeyPair::generate().map_err(|e| format!("generate server key: {e}"))?;
-    let mut server_params = CertificateParams::new(vec![LOCALHOST_DOMAIN.to_string()])
-        .map_err(|e| format!("server params: {e}"))?;
+    let server_key = KeyPair::generate().map_err(|source| TlsError::CertGeneration {
+        context: "generate server key".to_owned(),
+        reason: source.to_string(),
+    })?;
+    let mut server_params = CertificateParams::new(vec![LOCALHOST_DOMAIN.to_string()]).map_err(
+        |source| TlsError::CertGeneration {
+            context: "server params".to_owned(),
+            reason: source.to_string(),
+        },
+    )?;
     server_params
         .distinguished_name
         .push(DnType::CommonName, LOCALHOST_DOMAIN);
@@ -136,9 +165,12 @@ fn generate_all() -> Result<(String, String, String, String), String> {
     server_params.subject_alt_names = subject_alt_names;
     server_params.not_before = now;
     server_params.not_after = now + time::Duration::days(365);
-    let server_cert = server_params
-        .signed_by(&server_key, &ca_cert, &ca_key)
-        .map_err(|e| format!("sign server cert: {e}"))?;
+    let server_cert = server_params.signed_by(&server_key, &ca_cert, &ca_key).map_err(
+        |source| TlsError::CertGeneration {
+            context: "sign server cert".to_owned(),
+            reason: source.to_string(),
+        },
+    )?;
 
     Ok((
         ca_cert.pem(),
@@ -149,24 +181,30 @@ fn generate_all() -> Result<(String, String, String, String), String> {
 }
 
 /// Load cert + key PEM files into a rustls ServerConfig.
-pub fn load_rustls_config(cert_path: &Path, key_path: &Path) -> Result<ServerConfig, String> {
+pub fn load_rustls_config(cert_path: &Path, key_path: &Path) -> Result<ServerConfig, TlsError> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let cert_file = std::fs::File::open(cert_path).map_err(|e| format!("open server cert: {e}"))?;
-    let key_file = std::fs::File::open(key_path).map_err(|e| format!("open server key: {e}"))?;
+    let cert_file = std::fs::File::open(cert_path).map_err(|source| TlsError::Io {
+        context: "open server cert".to_owned(),
+        source,
+    })?;
+    let key_file = std::fs::File::open(key_path).map_err(|source| TlsError::Io {
+        context: "open server key".to_owned(),
+        source,
+    })?;
 
     let certs: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(cert_file))
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("parse certs: {e}"))?;
+        .map_err(TlsError::ParseCerts)?;
 
     let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))
-        .map_err(|e| format!("parse private key: {e}"))?
-        .ok_or_else(|| "no private key found in PEM file".to_owned())?;
+        .map_err(TlsError::ParsePrivateKey)?
+        .ok_or(TlsError::NoPrivateKey)?;
 
     let mut config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
-        .map_err(|e| format!("build rustls ServerConfig: {e}"))?;
+        .map_err(|e| TlsError::BuildServerConfig(e.to_string()))?;
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(config)
 }
@@ -179,7 +217,7 @@ pub async fn serve_tls(
     app: axum::Router,
     port: u16,
     bind_host: &str,
-) -> Result<(), String> {
+) -> Result<(), TlsError> {
     let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
     let localhost_mode = is_localhost_name(bind_host);
     let bind_host = bind_host.to_string();

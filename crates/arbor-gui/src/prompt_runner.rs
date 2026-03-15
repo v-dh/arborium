@@ -131,7 +131,7 @@ fn run_prompt_capture(
     command.current_dir(worktree_path);
 
     let output = run_command_output(&mut command, operation)
-        .map_err(PromptError::Execution)?;
+        .map_err(|error| PromptError::Execution(error.to_string()))?;
     if !output.status.success() {
         return Err(PromptError::Execution(command_failure_message(
             operation, &output,

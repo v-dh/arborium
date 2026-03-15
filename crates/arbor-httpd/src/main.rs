@@ -10,104 +10,13 @@ mod process_manager;
 mod process_metrics;
 mod repository_store;
 mod routes;
+mod startup;
 pub(crate) mod task_scheduler;
 mod terminal_daemon;
 mod types;
 
-#[cfg(feature = "symphony")]
-use arbor_symphony::{ServiceOptions, SymphonyService};
-use {
-    crate::{
-        process_manager::ProcessManager, routes::*, task_scheduler::TaskScheduler,
-        terminal_daemon::LocalTerminalDaemon,
-    },
-    arbor_core::{daemon::JsonDaemonSessionStore, process::ProcessStatus},
-    axum::{
-        Router,
-        handler::HandlerWithoutStateExt,
-        routing::{delete, get, post},
-    },
-    std::{collections::HashMap, env, net::SocketAddr, path::PathBuf, sync::Arc},
-    tokio::sync::Mutex,
-    tower_http::services::ServeDir,
-};
+use std::net::SocketAddr;
 pub(crate) use {error::*, types::*};
-
-fn router(state: AppState) -> Router {
-    let api = Router::new()
-        .route("/health", get(health))
-        .route("/repositories", get(list_repositories))
-        .route("/issues", get(list_repository_issues))
-        .route("/worktrees", get(list_worktrees).post(create_worktree))
-        .route("/worktrees/managed/preview", post(preview_managed_worktree))
-        .route("/worktrees/managed", post(create_managed_worktree))
-        .route("/worktrees/delete", post(delete_worktree))
-        .route("/worktrees/changes", get(list_worktree_changes))
-        .route("/worktrees/commit", post(commit_worktree))
-        .route("/worktrees/push", post(push_worktree))
-        .route("/terminals", get(list_terminals).post(create_terminal))
-        .route(
-            "/terminals/{session_id}/snapshot",
-            get(get_terminal_snapshot),
-        )
-        .route("/terminals/{session_id}/write", post(write_terminal))
-        .route("/terminals/{session_id}/resize", post(resize_terminal))
-        .route("/terminals/{session_id}/signal", post(signal_terminal))
-        .route("/terminals/{session_id}/detach", post(detach_terminal))
-        .route("/terminals/{session_id}", delete(kill_terminal))
-        .route("/terminals/{session_id}/ws", get(terminal_ws))
-        .route("/agent/notify", post(agent_notify))
-        .route("/agent/activity", get(list_agent_activity))
-        .route("/agent/activity/ws", get(agent_activity_ws))
-        .route("/processes", get(list_processes))
-        .route("/processes/start-all", post(start_all_processes))
-        .route("/processes/stop-all", post(stop_all_processes))
-        .route("/processes/{name}/start", post(start_process))
-        .route("/processes/{name}/stop", post(stop_process))
-        .route("/processes/{name}/restart", post(restart_process))
-        .route("/processes/ws", get(process_status_ws))
-        .route("/tasks", get(list_tasks))
-        .route("/tasks/{name}/run", post(run_task))
-        .route("/tasks/{name}/history", get(task_history))
-        .route("/tasks/ws", get(task_status_ws))
-        .route("/shutdown", post(shutdown_daemon))
-        .route("/config/bind", post(set_bind_mode).get(get_bind_mode))
-        .route("/logs/ws", get(logs_ws));
-
-    #[cfg(feature = "symphony")]
-    let api = api
-        .route("/symphony/state", get(symphony_state))
-        .route("/symphony/refresh", post(symphony_refresh))
-        .route("/symphony/{issue_identifier}", get(symphony_issue));
-
-    #[cfg(not(feature = "symphony"))]
-    let api = api;
-
-    let with_state = Router::new().nest("/api/v1", api).with_state(state);
-
-    // Always set up ServeDir — check for assets dynamically per-request so
-    // that a long-running daemon picks up assets installed after startup
-    // (e.g. an app update while the detached httpd process is still running).
-    let dist_dir = arbor_web_ui::dist_dir();
-    with_state.fallback_service(
-        ServeDir::new(dist_dir).not_found_service(web_ui_spa_or_unavailable.into_service()),
-    )
-}
-
-fn configure_embedded_terminal_engine() {
-    let requested = env::var("ARBOR_TERMINAL_ENGINE")
-        .ok()
-        .or_else(load_embedded_terminal_engine_setting);
-    match arbor_terminal_emulator::parse_terminal_engine_kind(requested.as_deref()) {
-        Ok(engine) => arbor_terminal_emulator::set_default_terminal_engine(engine),
-        Err(error) => {
-            tracing::warn!(%error, "invalid embedded terminal engine configuration");
-            arbor_terminal_emulator::set_default_terminal_engine(
-                arbor_terminal_emulator::TerminalEngineKind::default(),
-            );
-        },
-    }
-}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -130,166 +39,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .init();
     }
 
-    let web_ui_result = ensure_web_ui_assets();
+    let web_ui_result = routes::ensure_web_ui_assets();
     if let Err(error) = &web_ui_result {
         eprintln!("web-ui build skipped: {error}");
     }
 
-    // Load daemon config and ensure auth token exists
-    let mut daemon_config = load_daemon_config();
-    ensure_auth_token(&mut daemon_config);
-    configure_embedded_terminal_engine();
-    let allow_remote = is_public_bind(
-        daemon_config.auth_token.as_deref(),
-        daemon_config.bind.as_deref(),
-    );
-    // Always bind to 0.0.0.0 when auth is configured so remote access can be
-    // toggled at runtime without restarting.  The auth middleware enforces
-    // localhost-only mode via the `allow_remote` flag instead.
-    let bind_addr = resolve_bind_addr(
-        daemon_config.auth_token.as_deref(),
-        daemon_config.bind.as_deref(),
-    )?;
-    let has_auth = daemon_config.auth_token.is_some();
-    let auth_state = auth::AuthState::new(daemon_config.auth_token, allow_remote);
-
-    let daemon_store = JsonDaemonSessionStore::default();
-    let (agent_broadcast, _) = tokio::sync::broadcast::channel::<AgentWsEvent>(64);
-    let (terminal_activity_tx, mut terminal_activity_rx) =
-        tokio::sync::mpsc::unbounded_channel::<terminal_daemon::TerminalActivityEvent>();
-
-    let repository_store = repository_store::default_repository_store();
-    let process_manager = ProcessManager::new();
-
-    #[cfg(feature = "symphony")]
-    let symphony = start_symphony_if_configured().await;
-    // Initialize task scheduler — load [[tasks]] from arbor.toml
-    let task_scheduler = {
-        let roots = repository_store.load_roots().unwrap_or_default();
-        let resolved = repository_store::resolve_repository_roots(roots);
-        let repo_root = resolved
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| PathBuf::from("."));
-        let mut ts = TaskScheduler::new(repo_root.clone());
-        let configs = task_scheduler::load_task_configs(&repo_root);
-        if !configs.is_empty() {
-            println!(
-                "loaded {} task config(s) from {}/arbor.toml",
-                configs.len(),
-                repo_root.display()
-            );
-        }
-        ts.load_configs(configs);
-        ts
-    };
-    let state = AppState {
-        repository_store: repository_store.clone(),
-        daemon: Arc::new(Mutex::new(LocalTerminalDaemon::new(
-            daemon_store,
-            Some(terminal_activity_tx),
-        ))),
-        process_manager: Arc::new(Mutex::new(process_manager)),
-        #[cfg(feature = "symphony")]
-        symphony,
-        task_scheduler: Arc::new(Mutex::new(task_scheduler)),
-        github_service: github_service::default_github_pr_service(),
-        issue_service: Arc::new(issue_provider::RepositoryIssueService::default()),
-        agent_sessions: Arc::new(Mutex::new(HashMap::new())),
-        agent_broadcast,
-        log_broadcast,
-        pr_cache: Arc::new(Mutex::new(HashMap::new())),
-        repo_cache: Arc::new(Mutex::new(HashMap::new())),
-        shutdown_signal: Arc::new(tokio::sync::Notify::new()),
-        auth_state: auth_state.clone(),
-    };
-
-    {
-        let state = state.clone();
-        tokio::spawn(async move {
-            while let Some(event) = terminal_activity_rx.recv().await {
-                apply_terminal_activity_event(&state, event).await;
-            }
-        });
-    }
-
-    // Spawn background task to monitor process lifecycle
-    {
-        let state = state.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
-            let mut ticks_since_reap: u32 = 0;
-            loop {
-                interval.tick().await;
-                let (restart_schedule, crashed_processes) = {
-                    let mut pm = state.process_manager.lock().await;
-                    let mut daemon = state.daemon.lock().await;
-                    let previous = pm.list_processes(&[]);
-
-                    // Periodically reap exited terminal sessions to free memory
-                    // (~23 MB per dead session from scrollback buffers).
-                    ticks_since_reap += 1;
-                    if ticks_since_reap >= 30 {
-                        // Every ~60 seconds
-                        daemon.reap_exited_sessions();
-                        ticks_since_reap = 0;
-                    }
-
-                    let restart_schedule = pm.check_and_update(&mut *daemon);
-                    let current = pm.list_processes(&[]);
-                    let crashed_processes = current
-                        .into_iter()
-                        .filter(|process| {
-                            process.status == ProcessStatus::Crashed
-                                && previous
-                                    .iter()
-                                    .find(|candidate| candidate.id == process.id)
-                                    .map(|candidate| candidate.status)
-                                    != Some(ProcessStatus::Crashed)
-                        })
-                        .collect::<Vec<_>>();
-
-                    (restart_schedule, crashed_processes)
-                };
-                for process in crashed_processes {
-                    spawn_notification_webhooks(
-                        PathBuf::from(&process.repo_root),
-                        "agent_error",
-                        serde_json::json!({
-                            "event": "agent_error",
-                            "repo_root": process.repo_root,
-                            "workspace_id": process.workspace_id,
-                            "process_name": process.name,
-                            "command": process.command,
-                            "exit_code": process.exit_code,
-                            "timestamp_unix_ms": std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_millis() as u64,
-                        }),
-                    );
-                }
-                for (name, delay) in restart_schedule {
-                    let state = state.clone();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(delay).await;
-                        let mut pm = state.process_manager.lock().await;
-                        let mut daemon = state.daemon.lock().await;
-                        let _ = pm.restart_tracked_process(&name, &mut *daemon);
-                    });
-                }
-            }
-        });
-    }
-
-    // Spawn background task to run scheduled tasks
-    {
-        let scheduler = state.task_scheduler.clone();
-        tokio::spawn(task_scheduler::run_task_loop(scheduler));
-    }
+    let (state, auth_state, has_auth, bind_addr) = startup::build_app_state(log_broadcast).await?;
 
     let shutdown_signal = state.shutdown_signal.clone();
-    let app = auth::with_auth(router(state), auth_state);
+    let app = auth::with_auth(routes::router(state), auth_state);
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     let local_addr = listener.local_addr()?;
@@ -321,52 +79,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(feature = "symphony")]
-async fn start_symphony_if_configured() -> Option<arbor_symphony::ServiceHandle> {
-    let workflow_path = env::var("ARBOR_SYMPHONY_WORKFLOW")
-        .ok()
-        .map(PathBuf::from)
-        .or_else(|| {
-            env::current_dir()
-                .ok()
-                .map(|cwd| cwd.join("WORKFLOW.md"))
-                .filter(|path| path.exists())
-        });
-
-    let Some(workflow_path) = workflow_path else {
-        tracing::info!("symphony workflow not found; service disabled");
-        return None;
-    };
-
-    match SymphonyService::start(ServiceOptions {
-        workflow_path: Some(workflow_path.clone()),
-        ..ServiceOptions::default()
-    })
-    .await
-    {
-        Ok(handle) => {
-            tracing::info!(path = %workflow_path.display(), "symphony service started");
-            Some(handle)
-        },
-        Err(error) => {
-            tracing::error!(%error, path = %workflow_path.display(), "failed to start symphony service");
-            None
-        },
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use {
         super::*,
         crate::{
+            process_manager::ProcessManager,
             repository_store::JsonRepositoryStore,
-            routes::{apply_terminal_activity_event, process_ws_client_message},
-            terminal_daemon::{SessionEvent, TerminalActivityEvent},
+            routes::{apply_terminal_activity_event, process_ws_client_message, write_terminal},
+            task_scheduler::TaskScheduler,
+            terminal_daemon::{LocalTerminalDaemon, SessionEvent, TerminalActivityEvent},
         },
         arbor_core::{
             agent::AgentState,
-            daemon::{CreateOrAttachRequest, KillRequest, TerminalDaemon},
+            daemon::{CreateOrAttachRequest, JsonDaemonSessionStore, KillRequest, TerminalDaemon},
         },
         axum::{
             Json,
@@ -374,10 +100,14 @@ mod tests {
             extract::{Path as AxumPath, State, ws::Message},
             http::StatusCode,
         },
-        std::time::Duration,
+        std::{
+            collections::HashMap, env, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration,
+        },
+        tokio::sync::Mutex,
     };
     #[cfg(feature = "symphony")]
     use {
+        crate::routes::router,
         arbor_symphony::{
             Issue, IssueRuntimeSnapshot, IssueTracker, RuntimeSnapshot, ServiceOptions,
             SymphonyService, TrackerError,
@@ -388,7 +118,7 @@ mod tests {
             body::{Body, to_bytes},
             http::Request,
         },
-        std::sync::{Arc, Mutex as StdMutex},
+        std::sync::Mutex as StdMutex,
         tower::ServiceExt,
     };
 

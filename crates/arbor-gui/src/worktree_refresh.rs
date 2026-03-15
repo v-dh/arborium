@@ -574,7 +574,7 @@ mod tests {
 
     #[allow(clippy::unwrap_used, clippy::expect_used)]
     fn sample_worktree_summary() -> WorktreeSummary {
-        crate::tests::sample_worktree_summary()
+        worktree_summary::tests::sample_worktree_summary()
     }
 
     #[test]

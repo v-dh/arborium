@@ -2,7 +2,8 @@ use {
     super::*,
     arbor_core::agent::AgentState,
     gpui::{
-        AnyElement, Div, ElementId, FontWeight, Image, ImageFormat, Stateful, div, img, px, rgb,
+        AnyElement, Bounds, Div, ElementId, FontWeight, Image, ImageFormat, Pixels, Stateful, div,
+        img, point, px, rgb, size,
     },
     std::sync::{Arc, OnceLock},
 };
@@ -628,17 +629,193 @@ pub(crate) fn worktree_activity_sparkline(worktree: &WorktreeSummary) -> String 
         .collect()
 }
 
+pub(crate) fn estimated_worktree_hover_popover_card_height(
+    worktree: &WorktreeSummary,
+    checks_expanded: bool,
+) -> Pixels {
+    let mut height = 72.;
+
+    if worktree
+        .diff_summary
+        .is_some_and(|summary| summary.additions > 0 || summary.deletions > 0)
+    {
+        height += 18.;
+    }
+
+    height += 18.;
+
+    if !worktree.recent_turns.is_empty() {
+        height += 24. + worktree.recent_turns.iter().take(3).count() as f32 * 18.;
+    }
+
+    if !worktree.detected_ports.is_empty() {
+        height += 22.;
+    }
+
+    if !worktree.recent_agent_sessions.is_empty() {
+        let visible_sessions = worktree.recent_agent_sessions.iter().take(4);
+        let provider_headers = visible_sessions
+            .clone()
+            .fold((None, 0usize), |(previous, count), session| {
+                if previous == Some(session.provider) {
+                    (previous, count)
+                } else {
+                    (Some(session.provider), count + 1)
+                }
+            })
+            .1;
+        height += 24.
+            + worktree.recent_agent_sessions.iter().take(4).count() as f32 * 18.
+            + provider_headers as f32 * 16.;
+    }
+
+    if let Some(pr) = worktree.pr_details.as_ref() {
+        height += 110.;
+        if checks_expanded
+            && !pr.checks.is_empty()
+            && matches!(
+                pr.state,
+                github_service::PrState::Open | github_service::PrState::Draft
+            )
+        {
+            height += pr.checks.len() as f32 * 18.;
+        }
+    }
+
+    px(height)
+}
+
+pub(crate) fn worktree_hover_popover_zone_bounds(
+    left_pane_width: f32,
+    popover: &WorktreeHoverPopover,
+    worktree: &WorktreeSummary,
+) -> Bounds<Pixels> {
+    let padding = px(WORKTREE_HOVER_POPOVER_ZONE_PADDING_PX);
+    Bounds::new(
+        point(
+            px(left_pane_width) + px(4.) - padding,
+            popover.mouse_y - px(8.) - padding,
+        ),
+        size(
+            px(WORKTREE_HOVER_POPOVER_CARD_WIDTH_PX) + padding * 2.,
+            estimated_worktree_hover_popover_card_height(worktree, popover.checks_expanded)
+                + padding * 2.,
+        ),
+    )
+}
+
+pub(crate) fn worktree_hover_trigger_zone_bounds(
+    left_pane_width: f32,
+    mouse_y: Pixels,
+) -> Bounds<Pixels> {
+    let height = px(WORKTREE_HOVER_TRIGGER_ZONE_HEIGHT_PX);
+    Bounds::new(
+        point(px(0.), mouse_y - height / 2.),
+        size(px(left_pane_width), height),
+    )
+}
+
+pub(crate) fn worktree_hover_safe_zone_contains(
+    left_pane_width: f32,
+    popover: &WorktreeHoverPopover,
+    worktree: &WorktreeSummary,
+    position: gpui::Point<Pixels>,
+) -> bool {
+    worktree_hover_popover_zone_bounds(left_pane_width, popover, worktree).contains(&position)
+        || worktree_hover_trigger_zone_bounds(left_pane_width, popover.mouse_y).contains(&position)
+}
+
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
-    use {super::*, arbor_core::agent::AgentState};
+    use {
+        super::*,
+        arbor_core::agent::AgentState,
+        gpui::{point, px},
+    };
 
     #[test]
     fn attention_indicator_prefers_stuck_state() {
-        let mut worktree = crate::tests::sample_worktree_summary();
+        let mut worktree = worktree_summary::tests::sample_worktree_summary();
         worktree.agent_state = Some(AgentState::Waiting);
         worktree.stuck_turn_count = 2;
 
         let attention = worktree_attention_indicator(&worktree);
         assert_eq!(attention.label, "Stuck");
+    }
+
+    #[test]
+    fn worktree_hover_safe_zone_covers_trigger_row_and_popover() {
+        let worktree = worktree_summary::tests::sample_worktree_summary();
+        let popover = WorktreeHoverPopover {
+            worktree_index: 0,
+            mouse_y: px(100.),
+            checks_expanded: false,
+        };
+
+        assert!(worktree_hover_safe_zone_contains(
+            290.,
+            &popover,
+            &worktree,
+            point(px(40.), px(100.)),
+        ));
+        assert!(worktree_hover_safe_zone_contains(
+            290.,
+            &popover,
+            &worktree,
+            point(px(320.), px(112.)),
+        ));
+        assert!(!worktree_hover_safe_zone_contains(
+            290.,
+            &popover,
+            &worktree,
+            point(px(700.), px(100.)),
+        ));
+    }
+
+    #[test]
+    fn expanded_checks_increase_worktree_hover_popover_height() {
+        let mut worktree = worktree_summary::tests::sample_worktree_summary();
+        worktree.pr_details = Some(github_service::PrDetails {
+            number: 42,
+            title: "Improve hover stability".to_owned(),
+            url: "https://example.com/pr/42".to_owned(),
+            state: github_service::PrState::Open,
+            additions: 12,
+            deletions: 4,
+            review_decision: github_service::ReviewDecision::Pending,
+            mergeable: github_service::MergeableState::Mergeable,
+            merge_state_status: github_service::MergeStateStatus::Clean,
+            passed_checks: 1,
+            checks_status: github_service::CheckStatus::Pending,
+            checks: vec![
+                ("ci".to_owned(), github_service::CheckStatus::Pending),
+                ("lint".to_owned(), github_service::CheckStatus::Success),
+            ],
+        });
+
+        let collapsed = estimated_worktree_hover_popover_card_height(&worktree, false);
+        let expanded = estimated_worktree_hover_popover_card_height(&worktree, true);
+        let collapsed_bounds = worktree_hover_popover_zone_bounds(
+            290.,
+            &WorktreeHoverPopover {
+                worktree_index: 0,
+                mouse_y: px(120.),
+                checks_expanded: false,
+            },
+            &worktree,
+        );
+        let expanded_bounds = worktree_hover_popover_zone_bounds(
+            290.,
+            &WorktreeHoverPopover {
+                worktree_index: 0,
+                mouse_y: px(120.),
+                checks_expanded: true,
+            },
+            &worktree,
+        );
+
+        assert!(expanded > collapsed);
+        assert!(expanded_bounds.size.height > collapsed_bounds.size.height);
     }
 }

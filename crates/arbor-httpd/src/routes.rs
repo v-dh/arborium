@@ -33,14 +33,16 @@ use {
         WorktreeMutationResponse,
     },
     axum::{
-        Json,
+        Json, Router,
         body::Bytes,
         extract::{
             Path as AxumPath, Query, State,
             ws::{Message, WebSocket, WebSocketUpgrade},
         },
+        handler::HandlerWithoutStateExt,
         http::{HeaderMap, StatusCode},
         response::{IntoResponse, Response},
+        routing::{delete, get, post},
     },
     futures_util::StreamExt,
     serde::Serialize,
@@ -52,7 +54,71 @@ use {
         time::{Duration, SystemTime, UNIX_EPOCH},
     },
     tokio::sync::Mutex,
+    tower_http::services::ServeDir,
 };
+
+// ── Router ──────────────────────────────────────────────────────────
+
+pub(crate) fn router(state: AppState) -> Router {
+    let api = Router::new()
+        .route("/health", get(health))
+        .route("/repositories", get(list_repositories))
+        .route("/issues", get(list_repository_issues))
+        .route("/worktrees", get(list_worktrees).post(create_worktree))
+        .route("/worktrees/managed/preview", post(preview_managed_worktree))
+        .route("/worktrees/managed", post(create_managed_worktree))
+        .route("/worktrees/delete", post(delete_worktree))
+        .route("/worktrees/changes", get(list_worktree_changes))
+        .route("/worktrees/commit", post(commit_worktree))
+        .route("/worktrees/push", post(push_worktree))
+        .route("/terminals", get(list_terminals).post(create_terminal))
+        .route(
+            "/terminals/{session_id}/snapshot",
+            get(get_terminal_snapshot),
+        )
+        .route("/terminals/{session_id}/write", post(write_terminal))
+        .route("/terminals/{session_id}/resize", post(resize_terminal))
+        .route("/terminals/{session_id}/signal", post(signal_terminal))
+        .route("/terminals/{session_id}/detach", post(detach_terminal))
+        .route("/terminals/{session_id}", delete(kill_terminal))
+        .route("/terminals/{session_id}/ws", get(terminal_ws))
+        .route("/agent/notify", post(agent_notify))
+        .route("/agent/activity", get(list_agent_activity))
+        .route("/agent/activity/ws", get(agent_activity_ws))
+        .route("/processes", get(list_processes))
+        .route("/processes/start-all", post(start_all_processes))
+        .route("/processes/stop-all", post(stop_all_processes))
+        .route("/processes/{name}/start", post(start_process))
+        .route("/processes/{name}/stop", post(stop_process))
+        .route("/processes/{name}/restart", post(restart_process))
+        .route("/processes/ws", get(process_status_ws))
+        .route("/tasks", get(list_tasks))
+        .route("/tasks/{name}/run", post(run_task))
+        .route("/tasks/{name}/history", get(task_history))
+        .route("/tasks/ws", get(task_status_ws))
+        .route("/shutdown", post(shutdown_daemon))
+        .route("/config/bind", post(set_bind_mode).get(get_bind_mode))
+        .route("/logs/ws", get(logs_ws));
+
+    #[cfg(feature = "symphony")]
+    let api = api
+        .route("/symphony/state", get(symphony_state))
+        .route("/symphony/refresh", post(symphony_refresh))
+        .route("/symphony/{issue_identifier}", get(symphony_issue));
+
+    #[cfg(not(feature = "symphony"))]
+    let api = api;
+
+    let with_state = Router::new().nest("/api/v1", api).with_state(state);
+
+    // Always set up ServeDir — check for assets dynamically per-request so
+    // that a long-running daemon picks up assets installed after startup
+    // (e.g. an app update while the detached httpd process is still running).
+    let dist_dir = arbor_web_ui::dist_dir();
+    with_state.fallback_service(
+        ServeDir::new(dist_dir).not_found_service(web_ui_spa_or_unavailable.into_service()),
+    )
+}
 
 // ── Health / shutdown / bind-mode ────────────────────────────────────
 

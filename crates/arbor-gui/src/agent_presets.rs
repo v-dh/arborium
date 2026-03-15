@@ -1,4 +1,7 @@
-use super::*;
+use {
+    super::*,
+    std::{collections::HashSet, sync::OnceLock},
+};
 
 impl ArborWindow {
     pub(crate) fn preset_command_for_kind(&self, kind: AgentPresetKind) -> String {
@@ -395,4 +398,56 @@ impl ArborWindow {
                     ),
             )
     }
+}
+
+pub(crate) fn is_command_in_path(command: &str) -> bool {
+    use std::env;
+    let path_var = env::var_os("PATH").unwrap_or_default();
+    env::split_paths(&path_var).any(|dir| dir.join(command).is_file())
+}
+
+/// Return the set of `AgentPresetKind` variants whose CLI is found in PATH.
+/// Cached for the lifetime of the process (the set of installed tools is
+/// unlikely to change while the app is running).
+pub(crate) fn installed_preset_kinds() -> &'static HashSet<AgentPresetKind> {
+    static INSTALLED: OnceLock<HashSet<AgentPresetKind>> = OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        AgentPresetKind::ORDER
+            .iter()
+            .copied()
+            .filter(|kind| kind.is_installed())
+            .collect()
+    })
+}
+
+pub(crate) fn default_agent_presets() -> Vec<AgentPreset> {
+    AgentPresetKind::ORDER
+        .iter()
+        .copied()
+        .map(|kind| AgentPreset {
+            kind,
+            command: kind.default_command().to_owned(),
+        })
+        .collect()
+}
+
+pub(crate) fn normalize_agent_presets(
+    configured: &[app_config::AgentPresetConfig],
+) -> Vec<AgentPreset> {
+    let mut presets = default_agent_presets();
+
+    for configured_preset in configured {
+        let Some(kind) = AgentPresetKind::from_key(&configured_preset.key) else {
+            continue;
+        };
+        let command = configured_preset.command.trim();
+        if command.is_empty() {
+            continue;
+        }
+        if let Some(preset) = presets.iter_mut().find(|preset| preset.kind == kind) {
+            preset.command = command.to_owned();
+        }
+    }
+
+    presets
 }

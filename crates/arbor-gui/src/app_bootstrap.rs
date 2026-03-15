@@ -233,7 +233,7 @@ fn augment_path_from_login_shell() {
 /// Create a [`Command`] with the augmented PATH applied.  Use this instead of
 /// [`Command::new`] so that Homebrew-installed tools are found when running as
 /// a macOS `.app` bundle.
-fn create_command(program: &str) -> Command {
+pub(crate) fn create_command(program: &str) -> Command {
     let mut cmd = Command::new(program);
     if let Some(path) = AUGMENTED_PATH.get() {
         cmd.env("PATH", path);

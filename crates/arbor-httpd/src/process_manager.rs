@@ -1,4 +1,5 @@
 use {
+    crate::ProcessError,
     arbor_core::{
         daemon::{
             CreateOrAttachRequest, KillRequest, TerminalDaemon, TerminalSessionState, default_shell,
@@ -189,7 +190,7 @@ impl ProcessManager {
         identifier: &str,
         definitions: &[ProcessDefinition],
         daemon: &mut D,
-    ) -> Result<ProcessInfo, String>
+    ) -> Result<ProcessInfo, ProcessError>
     where
         D: TerminalDaemon,
         D::Error: ToString,
@@ -199,7 +200,7 @@ impl ProcessManager {
             .iter()
             .find(|definition| definition.id == process_id)
             .cloned()
-            .ok_or_else(|| format!("process `{identifier}` is not defined"))?;
+            .ok_or_else(|| ProcessError::NotDefined(identifier.to_owned()))?;
 
         self.start_definition(definition, daemon, StartMode::Manual)
     }
@@ -209,7 +210,7 @@ impl ProcessManager {
         identifier: &str,
         definitions: &[ProcessDefinition],
         daemon: &mut D,
-    ) -> Result<ProcessInfo, String>
+    ) -> Result<ProcessInfo, ProcessError>
     where
         D: TerminalDaemon,
         D::Error: ToString,
@@ -222,7 +223,7 @@ impl ProcessManager {
         let definition = definitions
             .iter()
             .find(|definition| definition.id == process_id)
-            .ok_or_else(|| format!("process `{identifier}` is not defined"))?;
+            .ok_or_else(|| ProcessError::NotDefined(identifier.to_owned()))?;
         Ok(definition.to_process_info(ProcessStatus::Stopped, None, 0, None))
     }
 
@@ -231,7 +232,7 @@ impl ProcessManager {
         identifier: &str,
         definitions: &[ProcessDefinition],
         daemon: &mut D,
-    ) -> Result<ProcessInfo, String>
+    ) -> Result<ProcessInfo, ProcessError>
     where
         D: TerminalDaemon,
         D::Error: ToString,
@@ -242,7 +243,7 @@ impl ProcessManager {
             .iter()
             .find(|definition| definition.id == process_id)
             .cloned()
-            .ok_or_else(|| format!("process `{identifier}` is not defined"))?;
+            .ok_or_else(|| ProcessError::NotDefined(identifier.to_owned()))?;
 
         self.start_definition(definition, daemon, StartMode::Manual)
     }
@@ -251,7 +252,7 @@ impl ProcessManager {
         &mut self,
         process_id: &str,
         daemon: &mut D,
-    ) -> Result<ProcessInfo, String>
+    ) -> Result<ProcessInfo, ProcessError>
     where
         D: TerminalDaemon,
         D::Error: ToString,
@@ -259,7 +260,7 @@ impl ProcessManager {
         let process = self
             .processes
             .get(process_id)
-            .ok_or_else(|| format!("process `{process_id}` is not tracked"))?;
+            .ok_or_else(|| ProcessError::NotTracked(process_id.to_owned()))?;
         if process.status != ProcessStatus::Restarting || !process.definition.auto_restart {
             return Ok(process.info());
         }
@@ -272,7 +273,7 @@ impl ProcessManager {
         &mut self,
         definitions: &[ProcessDefinition],
         daemon: &mut D,
-    ) -> Vec<(String, Result<ProcessInfo, String>)>
+    ) -> Vec<(String, Result<ProcessInfo, ProcessError>)>
     where
         D: TerminalDaemon,
         D::Error: ToString,
@@ -293,7 +294,10 @@ impl ProcessManager {
         results
     }
 
-    pub fn stop_all<D>(&mut self, daemon: &mut D) -> Vec<(String, Result<ProcessInfo, String>)>
+    pub fn stop_all<D>(
+        &mut self,
+        daemon: &mut D,
+    ) -> Vec<(String, Result<ProcessInfo, ProcessError>)>
     where
         D: TerminalDaemon,
         D::Error: ToString,
@@ -302,21 +306,23 @@ impl ProcessManager {
 
         let mut results = Vec::new();
         for process_id in process_ids {
-            let result = self.stop_process_by_id(&process_id, daemon).map(|info| {
-                info.unwrap_or_else(|| ProcessInfo {
-                    id: process_id.clone(),
-                    name: process_id.clone(),
-                    command: String::new(),
-                    repo_root: String::new(),
-                    workspace_id: String::new(),
-                    source: ProcessSource::Procfile,
-                    status: ProcessStatus::Stopped,
-                    exit_code: None,
-                    restart_count: 0,
-                    memory_bytes: None,
-                    session_id: None,
-                })
-            });
+            let result =
+                self.stop_process_by_id(&process_id, daemon)
+                    .map(|info: Option<ProcessInfo>| {
+                        info.unwrap_or_else(|| ProcessInfo {
+                            id: process_id.clone(),
+                            name: process_id.clone(),
+                            command: String::new(),
+                            repo_root: String::new(),
+                            workspace_id: String::new(),
+                            source: ProcessSource::Procfile,
+                            status: ProcessStatus::Stopped,
+                            exit_code: None,
+                            restart_count: 0,
+                            memory_bytes: None,
+                            session_id: None,
+                        })
+                    });
             results.push((process_id, result));
         }
         results
@@ -445,7 +451,7 @@ impl ProcessManager {
         &self,
         identifier: &str,
         definitions: &[ProcessDefinition],
-    ) -> Result<String, String> {
+    ) -> Result<String, ProcessError> {
         if self.processes.contains_key(identifier)
             || definitions
                 .iter()
@@ -472,11 +478,9 @@ impl ProcessManager {
         }
 
         match matches.len() {
-            0 => Err(format!("process `{identifier}` not found")),
+            0 => Err(ProcessError::NotFound(identifier.to_owned())),
             1 => Ok(matches.remove(0)),
-            _ => Err(format!(
-                "process name `{identifier}` is ambiguous, use a process id instead"
-            )),
+            _ => Err(ProcessError::AmbiguousName(identifier.to_owned())),
         }
     }
 
@@ -485,7 +489,7 @@ impl ProcessManager {
         definition: ProcessDefinition,
         daemon: &mut D,
         start_mode: StartMode,
-    ) -> Result<ProcessInfo, String>
+    ) -> Result<ProcessInfo, ProcessError>
     where
         D: TerminalDaemon,
         D::Error: ToString,
@@ -499,7 +503,7 @@ impl ProcessManager {
                 .processes
                 .get(&definition.id)
                 .map(ManagedProcess::info)
-                .ok_or_else(|| format!("process `{}` not found", definition.id));
+                .ok_or_else(|| ProcessError::NotFound(definition.id.clone()));
         }
 
         if let Err(error) = self.clear_stale_session(&definition.id, daemon) {
@@ -545,7 +549,7 @@ impl ProcessManager {
             },
             Err(error) => {
                 self.record_start_failure(&definition, true);
-                Err(error.to_string())
+                Err(ProcessError::Daemon(error.to_string()))
             },
         }
     }
@@ -565,7 +569,11 @@ impl ProcessManager {
         });
     }
 
-    fn clear_stale_session<D>(&mut self, process_id: &str, daemon: &mut D) -> Result<(), String>
+    fn clear_stale_session<D>(
+        &mut self,
+        process_id: &str,
+        daemon: &mut D,
+    ) -> Result<(), ProcessError>
     where
         D: TerminalDaemon,
         D::Error: ToString,
@@ -583,7 +591,7 @@ impl ProcessManager {
 
         let session_exists = daemon
             .list_sessions()
-            .map_err(|error| error.to_string())?
+            .map_err(|error| ProcessError::Daemon(error.to_string()))?
             .iter()
             .any(|session| session.session_id.as_str() == session_id);
 
@@ -592,7 +600,7 @@ impl ProcessManager {
                 .kill(KillRequest {
                     session_id: session_id.clone().into(),
                 })
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| ProcessError::Daemon(error.to_string()))?;
         }
 
         if let Some(process) = self.processes.get_mut(process_id)
@@ -608,7 +616,7 @@ impl ProcessManager {
         &mut self,
         process_id: &str,
         daemon: &mut D,
-    ) -> Result<Option<ProcessInfo>, String>
+    ) -> Result<Option<ProcessInfo>, ProcessError>
     where
         D: TerminalDaemon,
         D::Error: ToString,
@@ -622,7 +630,7 @@ impl ProcessManager {
                 .kill(KillRequest {
                     session_id: session_id.into(),
                 })
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| ProcessError::Daemon(error.to_string()))?;
         }
 
         process.status = ProcessStatus::Stopped;
@@ -1270,7 +1278,7 @@ mod tests {
             Ok(process) => panic!("restart should fail, got {}", process.name),
             Err(error) => error,
         };
-        assert!(error.contains("list failed"));
+        assert!(error.to_string().contains("list failed"));
 
         let process = match manager.processes.get(&definition.id) {
             Some(process) => process,

@@ -4,6 +4,7 @@ mod assets;
 mod checkout;
 mod connection_history;
 mod constants;
+mod error;
 mod github_auth_store;
 mod github_service;
 mod graphql;
@@ -19,7 +20,7 @@ mod terminal_keys;
 mod theme;
 mod ui_state_store;
 
-pub(crate) use {actions::*, assets::*, constants::*};
+pub(crate) use {actions::*, assets::*, constants::*, error::*};
 use {
     arbor_core::{
         agent::AgentState,
@@ -127,8 +128,8 @@ impl ArborWindow {
         let github_auth_store = github_auth_store::default_github_auth_store();
         let github_service = github_service::default_github_service();
         let notification_service = notifications::default_notification_service();
-        let loaded_github_auth_state = github_auth_store.load();
-        let loaded_issue_cache = issue_cache_store.load();
+        let loaded_github_auth_state = github_auth_store.load().map_err(|e| e.to_string());
+        let loaded_issue_cache = issue_cache_store.load().map_err(|e| e.to_string());
         let config_path = app_config_store.config_path();
         let cwd = match env::current_dir() {
             Ok(path) => path,

@@ -1,4 +1,5 @@
 use {
+    crate::TaskError,
     arbor_core::task::{AgentKind, TaskExecution, TaskInfo, TaskStatus},
     chrono::{DateTime, Timelike, Utc},
     cron::Schedule,
@@ -182,11 +183,11 @@ impl TaskScheduler {
     }
 
     /// Get execution history for a specific task.
-    pub fn task_history(&self, name: &str) -> Result<Vec<TaskExecution>, String> {
+    pub fn task_history(&self, name: &str) -> Result<Vec<TaskExecution>, TaskError> {
         let task = self
             .tasks
             .get(name)
-            .ok_or_else(|| format!("task `{name}` not found"))?;
+            .ok_or_else(|| TaskError::NotFound(name.to_owned()))?;
         Ok(task.history.clone())
     }
 
@@ -262,14 +263,14 @@ impl TaskScheduler {
     }
 
     /// Manually trigger a task by name (ignoring schedule).
-    pub fn mark_running(&mut self, name: &str) -> Result<TaskRunRequest, String> {
+    pub fn mark_running(&mut self, name: &str) -> Result<TaskRunRequest, TaskError> {
         let task = self
             .tasks
             .get_mut(name)
-            .ok_or_else(|| format!("task `{name}` not found"))?;
+            .ok_or_else(|| TaskError::NotFound(name.to_owned()))?;
 
         if task.status == TaskStatus::Running {
-            return Err(format!("task `{name}` is already running"));
+            return Err(TaskError::AlreadyRunning(name.to_owned()));
         }
 
         task.status = TaskStatus::Running;
@@ -362,7 +363,11 @@ pub fn build_agent_command(
 }
 
 /// Spawn an AI agent as a background process.
-pub async fn spawn_agent(program: &str, args: &[String], working_dir: &Path) -> Result<(), String> {
+pub async fn spawn_agent(
+    program: &str,
+    args: &[String],
+    working_dir: &Path,
+) -> Result<(), TaskError> {
     tracing::info!(
         program,
         working_dir = %working_dir.display(),
@@ -383,9 +388,11 @@ pub async fn spawn_agent(program: &str, args: &[String], working_dir: &Path) -> 
             Ok(())
         },
         Err(error) => {
-            let msg = format!("failed to spawn agent `{program}`: {error}");
-            tracing::error!("{msg}");
-            Err(msg)
+            tracing::error!(program, %error, "failed to spawn agent");
+            Err(TaskError::SpawnFailed {
+                name: program.to_owned(),
+                reason: error.to_string(),
+            })
         },
     }
 }

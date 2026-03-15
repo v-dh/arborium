@@ -1,5 +1,6 @@
 use {
     crate::{
+        error::*,
         github_service::GitHubPrService,
         issue_linking::{self, LinkedIssueWorktree},
         managed_worktree::preview_managed_worktree as build_managed_worktree_preview,
@@ -168,7 +169,7 @@ pub(crate) async fn list_repositories(
     let roots = state
         .repository_store
         .load_roots()
-        .map_err(internal_error)?;
+        .map_err(|e| internal_error(e.to_string()))?;
     let resolved = repository_store::resolve_repository_roots(roots);
 
     let mut cache = state.repo_cache.lock().await;
@@ -202,7 +203,7 @@ pub(crate) async fn list_repository_issues(
     })
     .await
     .map_err(|error| internal_error(format!("failed to join issue fetch task: {error}")))?
-    .map_err(internal_error)?;
+    .map_err(|e| internal_error(e.to_string()))?;
     if let Err(error) = enrich_issue_list_with_local_links(&state, &repo_root, &mut issues).await {
         tracing::warn!(
             repo_root = %repo_root.display(),
@@ -226,7 +227,7 @@ async fn enrich_issue_list_with_local_links(
     state: &AppState,
     repo_root: &Path,
     issues_response: &mut IssueListResponse,
-) -> Result<(), String> {
+) -> Result<(), RouteError> {
     let linked_worktrees = collect_linked_issue_worktrees(state, repo_root).await?;
     issue_linking::enrich_issues_with_worktree_links(
         repo_root,
@@ -239,12 +240,12 @@ async fn enrich_issue_list_with_local_links(
 async fn collect_linked_issue_worktrees(
     state: &AppState,
     repo_root: &Path,
-) -> Result<Vec<LinkedIssueWorktree>, String> {
+) -> Result<Vec<LinkedIssueWorktree>, RouteError> {
     let entries = worktree::list(repo_root).map_err(|error| {
-        format!(
+        RouteError::Internal(format!(
             "failed to list worktrees for `{}`: {error}",
             repo_root.display()
-        )
+        ))
     })?;
 
     let repo_slug = {
@@ -312,7 +313,7 @@ pub(crate) async fn list_worktrees(
     let roots = state
         .repository_store
         .load_roots()
-        .map_err(internal_error)?;
+        .map_err(|e| internal_error(e.to_string()))?;
     let resolved = repository_store::resolve_repository_roots(roots);
     let filter = query.repo_root.as_deref().map(PathBuf::from);
 
@@ -463,7 +464,7 @@ pub(crate) async fn preview_managed_worktree(
     let repo_root = worktree::repo_root(&repo_root)
         .map_err(|error| internal_error(format!("failed to resolve repository root: {error}")))?;
     let preview = build_managed_worktree_preview(&repo_root, &request.worktree_name)
-        .map_err(internal_error)?;
+        .map_err(|e| internal_error(e.to_string()))?;
 
     Ok(Json(ManagedWorktreePreviewResponse {
         sanitized_worktree_name: preview.sanitized_worktree_name,
@@ -479,7 +480,7 @@ pub(crate) async fn create_managed_worktree(
     let repo_root = worktree::repo_root(&repo_root)
         .map_err(|error| internal_error(format!("failed to resolve repository root: {error}")))?;
     let preview = build_managed_worktree_preview(&repo_root, &request.worktree_name)
-        .map_err(internal_error)?;
+        .map_err(|e| internal_error(e.to_string()))?;
 
     create_worktree_at(
         repo_root,
@@ -592,11 +593,13 @@ fn rollback_created_worktree_http(
     repo_root: &Path,
     worktree_path: &Path,
     created_branch: Option<&str>,
-) -> Result<(), String> {
-    worktree::remove(repo_root, worktree_path, true).map_err(|error| error.to_string())?;
+) -> Result<(), RouteError> {
+    worktree::remove(repo_root, worktree_path, true)
+        .map_err(|error| RouteError::Internal(error.to_string()))?;
     if let Some(branch_name) = created_branch.filter(|value| !value.trim().is_empty()) {
-        worktree::delete_branch(repo_root, branch_name)
-            .map_err(|error| format!("failed to delete branch `{branch_name}`: {error}"))?;
+        worktree::delete_branch(repo_root, branch_name).map_err(|error| {
+            RouteError::Internal(format!("failed to delete branch `{branch_name}`: {error}"))
+        })?;
     }
     Ok(())
 }
@@ -652,7 +655,8 @@ pub(crate) async fn push_worktree(
     Json(request): Json<PushWorktreeRequest>,
 ) -> ApiResult<GitActionResponse> {
     let worktree_path = PathBuf::from(&request.path);
-    let push_message = run_git_push_for_worktree(&worktree_path).map_err(internal_error)?;
+    let push_message =
+        run_git_push_for_worktree(&worktree_path).map_err(|e| internal_error(e.to_string()))?;
 
     Ok(Json(GitActionResponse {
         path: worktree_path.display().to_string(),
@@ -932,7 +936,7 @@ async fn handle_terminal_ws(
                                 break;
                             },
                             Err(error) => {
-                                let _ = send_ws_event(&mut socket, WsServerEvent::Error { message: error }).await;
+                                let _ = send_ws_event(&mut socket, WsServerEvent::Error { message: error.to_string() }).await;
                             },
                         }
                     },
@@ -985,11 +989,11 @@ pub(crate) async fn process_ws_client_message(
     state: &AppState,
     session_id: &str,
     message: Message,
-) -> Result<bool, String> {
+) -> Result<bool, WsClientError> {
     match message {
         Message::Text(text) => {
             let parsed = serde_json::from_str::<WsClientEvent>(&text)
-                .map_err(|error| format!("invalid websocket payload: {error}"))?;
+                .map_err(|error| WsClientError::InvalidPayload(error.to_string()))?;
 
             match parsed {
                 WsClientEvent::Resize { cols, rows } => {
@@ -1000,11 +1004,11 @@ pub(crate) async fn process_ws_client_message(
                             cols,
                             rows,
                         })
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|error| WsClientError::Daemon(error.to_string()))?;
                 },
                 WsClientEvent::Signal { signal } => {
                     let Some(signal) = parse_terminal_signal(&signal) else {
-                        return Err("invalid signal, expected interrupt|terminate|kill".to_owned());
+                        return Err(WsClientError::InvalidSignal);
                     };
 
                     let mut daemon = state.daemon.lock().await;
@@ -1013,7 +1017,7 @@ pub(crate) async fn process_ws_client_message(
                             session_id: session_id.into(),
                             signal,
                         })
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|error| WsClientError::Daemon(error.to_string()))?;
                 },
                 WsClientEvent::Detach => {
                     let mut daemon = state.daemon.lock().await;
@@ -1021,7 +1025,7 @@ pub(crate) async fn process_ws_client_message(
                         .detach(DetachRequest {
                             session_id: session_id.into(),
                         })
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|error| WsClientError::Daemon(error.to_string()))?;
                     return Ok(false);
                 },
             }
@@ -1033,7 +1037,7 @@ pub(crate) async fn process_ws_client_message(
                     session_id: session_id.into(),
                     bytes: bytes.to_vec(),
                 })
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| WsClientError::Daemon(error.to_string()))?;
         },
         Message::Ping(_) => {},
         Message::Pong(_) => {},
@@ -1612,7 +1616,7 @@ pub(crate) async fn start_process(
     let mut daemon = state.daemon.lock().await;
     let mut info = pm
         .start_process(&name, &definitions, &mut *daemon)
-        .map_err(internal_error)?;
+        .map_err(|e| internal_error(e.to_string()))?;
     let session_memory_bytes = process_memory_bytes(&*daemon);
     apply_process_memory(std::slice::from_mut(&mut info), &session_memory_bytes);
     Ok(Json(info))
@@ -1628,7 +1632,7 @@ pub(crate) async fn stop_process(
     let mut daemon = state.daemon.lock().await;
     let mut info = pm
         .stop_process(&name, &definitions, &mut *daemon)
-        .map_err(internal_error)?;
+        .map_err(|e| internal_error(e.to_string()))?;
     let session_memory_bytes = process_memory_bytes(&*daemon);
     apply_process_memory(std::slice::from_mut(&mut info), &session_memory_bytes);
     Ok(Json(info))
@@ -1644,7 +1648,7 @@ pub(crate) async fn restart_process(
     let mut daemon = state.daemon.lock().await;
     let mut info = pm
         .restart_process(&name, &definitions, &mut *daemon)
-        .map_err(internal_error)?;
+        .map_err(|e| internal_error(e.to_string()))?;
     let session_memory_bytes = process_memory_bytes(&*daemon);
     apply_process_memory(std::slice::from_mut(&mut info), &session_memory_bytes);
     Ok(Json(info))
@@ -1824,7 +1828,7 @@ fn web_ui_unavailable_response() -> Response {
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
-pub(crate) fn ensure_web_ui_assets() -> Result<(), String> {
+pub(crate) fn ensure_web_ui_assets() -> Result<(), RouteError> {
     if arbor_web_ui::dist_is_built() {
         return Ok(());
     }
@@ -1834,11 +1838,16 @@ pub(crate) fn ensure_web_ui_assets() -> Result<(), String> {
     // be bundled alongside the binary.
     let app_dir = arbor_web_ui::app_dir();
     if !app_dir.join("package.json").is_file() {
-        return Err("web-ui assets not found (packaged build without bundled assets?)".to_owned());
+        return Err(RouteError::Internal(
+            "web-ui assets not found (packaged build without bundled assets?)".to_owned(),
+        ));
     }
 
-    let package_manager = detect_npm_binary()
-        .ok_or_else(|| "`npm` is not installed or not in PATH; skipping web-ui build".to_owned())?;
+    let package_manager = detect_npm_binary().ok_or_else(|| {
+        RouteError::Internal(
+            "`npm` is not installed or not in PATH; skipping web-ui build".to_owned(),
+        )
+    })?;
 
     let install_args = if app_dir.join("package-lock.json").exists() {
         vec!["ci", "--no-audit", "--no-fund"]
@@ -1853,10 +1862,10 @@ pub(crate) fn ensure_web_ui_assets() -> Result<(), String> {
         return Ok(());
     }
 
-    Err(format!(
+    Err(RouteError::Internal(format!(
         "web-ui build completed but `{}` is missing",
         arbor_web_ui::dist_index_path().display()
-    ))
+    )))
 }
 
 // ── Helper functions ─────────────────────────────────────────────────
@@ -1874,7 +1883,8 @@ pub(crate) async fn run_task(
 ) -> ApiResult<TaskInfo> {
     let task_request = {
         let mut ts = state.task_scheduler.lock().await;
-        ts.mark_running(&name).map_err(internal_error)?
+        ts.mark_running(&name)
+            .map_err(|e| internal_error(e.to_string()))?
     };
 
     let scheduler = state.task_scheduler.clone();
@@ -1930,7 +1940,9 @@ pub(crate) async fn task_history(
     AxumPath(name): AxumPath<String>,
 ) -> ApiResult<Vec<TaskExecution>> {
     let ts = state.task_scheduler.lock().await;
-    let history = ts.task_history(&name).map_err(not_found_error)?;
+    let history = ts
+        .task_history(&name)
+        .map_err(|e| not_found_error(e.to_string()))?;
     Ok(Json(history))
 }
 
@@ -2003,27 +2015,27 @@ pub(crate) fn map_daemon_error(error: LocalTerminalDaemonError) -> (StatusCode, 
     }
 }
 
-fn run_command(program: &str, args: &[&str], cwd: &Path) -> Result<(), String> {
+fn run_command(program: &str, args: &[&str], cwd: &Path) -> Result<(), RouteError> {
     let status = Command::new(program)
         .args(args)
         .current_dir(cwd)
         .status()
         .map_err(|error| {
-            format!(
+            RouteError::Internal(format!(
                 "failed to run `{program} {}` in `{}`: {error}",
                 args.join(" "),
                 cwd.display()
-            )
+            ))
         })?;
 
     if status.success() {
         return Ok(());
     }
 
-    Err(format!(
+    Err(RouteError::Internal(format!(
         "command `{program} {}` failed with status {status}",
         args.join(" "),
-    ))
+    )))
 }
 
 fn detect_npm_binary() -> Option<&'static str> {
@@ -2202,26 +2214,26 @@ fn run_git_commit_for_worktree(
     Ok(message)
 }
 
-fn run_git_push_for_worktree(worktree_path: &Path) -> Result<String, String> {
+fn run_git_push_for_worktree(worktree_path: &Path) -> Result<String, RouteError> {
     let repo = git2::Repository::open(worktree_path).map_err(|error| {
-        format!(
+        RouteError::Internal(format!(
             "failed to open repository at `{}`: {error}",
             worktree_path.display()
-        )
+        ))
     })?;
 
     let head_ref = repo
         .head()
-        .map_err(|error| format!("failed to read HEAD: {error}"))?;
+        .map_err(|error| RouteError::Internal(format!("failed to read HEAD: {error}")))?;
     let branch_name = head_ref
         .shorthand()
-        .ok_or_else(|| "cannot push detached HEAD".to_owned())?
+        .ok_or_else(|| RouteError::Internal("cannot push detached HEAD".to_owned()))?
         .to_owned();
     let refspec = format!("refs/heads/{branch_name}:refs/heads/{branch_name}");
 
-    let mut remote = repo
-        .find_remote("origin")
-        .map_err(|error| format!("failed to find remote `origin`: {error}"))?;
+    let mut remote = repo.find_remote("origin").map_err(|error| {
+        RouteError::Internal(format!("failed to find remote `origin`: {error}"))
+    })?;
 
     let mut callbacks = git2::RemoteCallbacks::new();
     callbacks.credentials(|_url, username_from_url, allowed_types| {
@@ -2242,11 +2254,11 @@ fn run_git_push_for_worktree(worktree_path: &Path) -> Result<String, String> {
 
     remote
         .push(&[&refspec], Some(&mut push_options))
-        .map_err(|error| format!("push failed: {error}"))?;
+        .map_err(|error| RouteError::Internal(format!("push failed: {error}")))?;
 
     let mut config = repo
         .config()
-        .map_err(|error| format!("failed to read config: {error}"))?;
+        .map_err(|error| RouteError::Internal(format!("failed to read config: {error}")))?;
     let _ = config.set_str(&format!("branch.{branch_name}.remote"), "origin");
     let _ = config.set_str(
         &format!("branch.{branch_name}.merge"),
@@ -2258,22 +2270,22 @@ fn run_git_push_for_worktree(worktree_path: &Path) -> Result<String, String> {
     ))
 }
 
-fn git_branch_name_for_worktree(worktree_path: &Path) -> Result<String, String> {
+fn git_branch_name_for_worktree(worktree_path: &Path) -> Result<String, RouteError> {
     let repo = git2::Repository::open(worktree_path).map_err(|error| {
-        format!(
+        RouteError::Internal(format!(
             "failed to open repository at `{}`: {error}",
             worktree_path.display()
-        )
+        ))
     })?;
 
     let head_ref = repo
         .head()
-        .map_err(|error| format!("failed to read HEAD: {error}"))?;
+        .map_err(|error| RouteError::Internal(format!("failed to read HEAD: {error}")))?;
 
     head_ref
         .shorthand()
         .map(str::to_owned)
-        .ok_or_else(|| "worktree has detached HEAD".to_owned())
+        .ok_or_else(|| RouteError::Internal("worktree has detached HEAD".to_owned()))
 }
 
 fn short_branch(value: &str) -> String {

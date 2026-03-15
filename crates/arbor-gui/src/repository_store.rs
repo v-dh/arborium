@@ -1,5 +1,5 @@
 use {
-    crate::checkout::CheckoutKind,
+    crate::{StoreError, checkout::CheckoutKind},
     arbor_core::worktree,
     serde::{Deserialize, Serialize},
     std::{
@@ -13,8 +13,8 @@ use {
 const REPOSITORY_STORE_RELATIVE_PATH: &str = ".arbor/repositories.json";
 
 pub trait RepositoryStore: Send + Sync {
-    fn load_entries(&self) -> Result<Vec<StoredRepositoryEntry>, String>;
-    fn save_entries(&self, entries: &[StoredRepositoryEntry]) -> Result<(), String>;
+    fn load_entries(&self) -> Result<Vec<StoredRepositoryEntry>, StoreError>;
+    fn save_entries(&self, entries: &[StoredRepositoryEntry]) -> Result<(), StoreError>;
     fn has_store_file(&self) -> bool;
 }
 
@@ -51,27 +51,24 @@ impl JsonRepositoryStore {
 }
 
 impl RepositoryStore for JsonRepositoryStore {
-    fn load_entries(&self) -> Result<Vec<StoredRepositoryEntry>, String> {
+    fn load_entries(&self) -> Result<Vec<StoredRepositoryEntry>, StoreError> {
         if !self.path.exists() {
             return Ok(Vec::new());
         }
 
-        let raw = fs::read_to_string(&self.path).map_err(|error| {
-            format!(
-                "failed to read repository store `{}`: {error}",
-                self.path.display()
-            )
+        let raw = fs::read_to_string(&self.path).map_err(|source| StoreError::Read {
+            path: self.path.display().to_string(),
+            source,
         })?;
         if raw.trim().is_empty() {
             return Ok(Vec::new());
         }
 
-        let payload: RepositoryStorePayload = serde_json::from_str(&raw).map_err(|error| {
-            format!(
-                "failed to parse repository store `{}`: {error}",
-                self.path.display()
-            )
-        })?;
+        let payload: RepositoryStorePayload =
+            serde_json::from_str(&raw).map_err(|source| StoreError::JsonParse {
+                path: self.path.display().to_string(),
+                source,
+            })?;
 
         Ok(match payload {
             RepositoryStorePayload::Legacy(roots) => roots
@@ -90,28 +87,23 @@ impl RepositoryStore for JsonRepositoryStore {
         })
     }
 
-    fn save_entries(&self, entries: &[StoredRepositoryEntry]) -> Result<(), String> {
+    fn save_entries(&self, entries: &[StoredRepositoryEntry]) -> Result<(), StoreError> {
         if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).map_err(|error| {
-                format!(
-                    "failed to create repository store directory `{}`: {error}",
-                    parent.display()
-                )
+            fs::create_dir_all(parent).map_err(|source| StoreError::CreateDir {
+                path: parent.display().to_string(),
+                source,
             })?;
         }
 
-        let content = serde_json::to_string_pretty(entries).map_err(|error| {
-            format!(
-                "failed to serialize repository store `{}`: {error}",
-                self.path.display()
-            )
-        })?;
+        let content =
+            serde_json::to_string_pretty(entries).map_err(|source| StoreError::JsonSerialize {
+                path: self.path.display().to_string(),
+                source,
+            })?;
 
-        fs::write(&self.path, format!("{content}\n")).map_err(|error| {
-            format!(
-                "failed to write repository store `{}`: {error}",
-                self.path.display()
-            )
+        fs::write(&self.path, format!("{content}\n")).map_err(|source| StoreError::Write {
+            path: self.path.display().to_string(),
+            source,
         })
     }
 

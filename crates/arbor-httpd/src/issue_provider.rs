@@ -1,5 +1,5 @@
 use {
-    crate::managed_worktree,
+    crate::{IssueProviderError, managed_worktree},
     arbor_daemon_client::{
         IssueDto, IssueLabelDto, IssueListResponse, IssueSourceDto, IssueTypeDto,
     },
@@ -53,7 +53,7 @@ pub(crate) trait RepositoryIssueProvider: Send + Sync {
         &self,
         source: &ResolvedIssueSource,
         github_token: Option<&SecretString>,
-    ) -> Result<Vec<IssueDto>, String>;
+    ) -> Result<Vec<IssueDto>, IssueProviderError>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,7 +111,7 @@ impl RepositoryIssueService {
         &self,
         repo_root: &Path,
         github_token: Option<String>,
-    ) -> Result<IssueListResponse, String> {
+    ) -> Result<IssueListResponse, IssueProviderError> {
         let Some(origin_remote_url) = origin_remote_url(repo_root)? else {
             return Ok(IssueListResponse {
                 source: None,
@@ -177,11 +177,11 @@ impl RepositoryIssueProvider for GitHubIssueProvider {
         &self,
         source: &ResolvedIssueSource,
         github_token: Option<&SecretString>,
-    ) -> Result<Vec<IssueDto>, String> {
+    ) -> Result<Vec<IssueDto>, IssueProviderError> {
         let (owner, repository) = source
             .repository
             .split_once('/')
-            .ok_or_else(|| format!("invalid GitHub repository slug `{}`", source.repository))?;
+            .ok_or_else(|| IssueProviderError::InvalidSlug(source.repository.clone()))?;
         let token = github_token.cloned().or_else(github_access_token_from_env);
         if token.is_none() {
             return list_github_issues_via_rest(source, owner, repository, None);
@@ -198,8 +198,12 @@ impl RepositoryIssueProvider for GitHubIssueProvider {
                     "after": after,
                 },
             });
-            let request_body_json = serde_json::to_string(&request_body)
-                .map_err(|error| format!("failed to serialize GitHub GraphQL request: {error}"))?;
+            let request_body_json = serde_json::to_string(&request_body).map_err(|error| {
+                IssueProviderError::ApiRequest {
+                    context: "failed to serialize GitHub GraphQL request".to_owned(),
+                    reason: error.to_string(),
+                }
+            })?;
             let mut request = ureq::post(GITHUB_GRAPHQL_API_URL)
                 .header("Accept", "application/json")
                 .header("Content-Type", "application/json")
@@ -221,22 +225,35 @@ impl RepositoryIssueProvider for GitHubIssueProvider {
                 Err(error) if is_github_graphql_forbidden(&error) => {
                     return list_github_issues_via_rest(source, owner, repository, token.as_ref());
                 },
-                Err(error) => return Err(format!("GitHub request failed: {error}")),
+                Err(error) => {
+                    return Err(IssueProviderError::ApiRequest {
+                        context: "GitHub request failed".to_owned(),
+                        reason: error.to_string(),
+                    });
+                },
             };
 
             if !response.status().is_success() {
-                let status = response.status();
+                let status = response.status().as_u16();
                 let body = response.body_mut().read_to_string().unwrap_or_default();
-                return Err(format!("GitHub returned {status}: {body}"));
+                return Err(IssueProviderError::ApiStatus {
+                    provider: "GitHub".to_owned(),
+                    status,
+                    body,
+                });
             }
 
-            let body = response
-                .body_mut()
-                .read_to_string()
-                .map_err(|error| format!("failed to read GitHub response: {error}"))?;
+            let body = response.body_mut().read_to_string().map_err(|error| {
+                IssueProviderError::ApiRequest {
+                    context: "failed to read GitHub response".to_owned(),
+                    reason: error.to_string(),
+                }
+            })?;
             let response: GitHubGraphqlResponse<GitHubIssuesGraphqlData> =
-                serde_json::from_str(&body)
-                    .map_err(|error| format!("failed to decode GitHub GraphQL issues: {error}"))?;
+                serde_json::from_str(&body).map_err(|error| IssueProviderError::ApiRequest {
+                    context: "failed to decode GitHub GraphQL issues".to_owned(),
+                    reason: error.to_string(),
+                })?;
             if !response.errors.is_empty() {
                 let messages = response
                     .errors
@@ -244,14 +261,19 @@ impl RepositoryIssueProvider for GitHubIssueProvider {
                     .map(|error| error.message)
                     .collect::<Vec<_>>()
                     .join("; ");
-                return Err(format!("GitHub GraphQL returned errors: {messages}"));
+                return Err(IssueProviderError::ApiRequest {
+                    context: "GitHub GraphQL returned errors".to_owned(),
+                    reason: messages,
+                });
             }
             let connection = response
                 .data
                 .and_then(|data| data.repository)
                 .map(|repository| repository.issues)
                 .ok_or_else(|| {
-                    "GitHub GraphQL response was missing repository issues".to_owned()
+                    IssueProviderError::Other(
+                        "GitHub GraphQL response was missing repository issues".to_owned(),
+                    )
                 })?;
 
             issues.extend(connection.nodes.into_iter().flatten().map(|issue| {
@@ -301,7 +323,7 @@ fn list_github_issues_via_rest(
     owner: &str,
     repository: &str,
     token: Option<&SecretString>,
-) -> Result<Vec<IssueDto>, String> {
+) -> Result<Vec<IssueDto>, IssueProviderError> {
     let mut issues = Vec::new();
     let mut page = 1usize;
 
@@ -328,20 +350,32 @@ fn list_github_issues_via_rest(
             .timeout_global(Some(ISSUE_REQUEST_TIMEOUT))
             .build()
             .call()
-            .map_err(|error| format!("GitHub request failed: {error}"))?;
+            .map_err(|error| IssueProviderError::ApiRequest {
+                context: "GitHub request failed".to_owned(),
+                reason: error.to_string(),
+            })?;
 
         if !response.status().is_success() {
-            let status = response.status();
+            let status = response.status().as_u16();
             let body = response.body_mut().read_to_string().unwrap_or_default();
-            return Err(format!("GitHub returned {status}: {body}"));
+            return Err(IssueProviderError::ApiStatus {
+                provider: "GitHub".to_owned(),
+                status,
+                body,
+            });
         }
 
-        let body = response
-            .body_mut()
-            .read_to_string()
-            .map_err(|error| format!("failed to read GitHub response: {error}"))?;
-        let page_items: Vec<GitHubIssueRestPayload> = serde_json::from_str(&body)
-            .map_err(|error| format!("failed to decode GitHub issues: {error}"))?;
+        let body = response.body_mut().read_to_string().map_err(|error| {
+            IssueProviderError::ApiRequest {
+                context: "failed to read GitHub response".to_owned(),
+                reason: error.to_string(),
+            }
+        })?;
+        let page_items: Vec<GitHubIssueRestPayload> =
+            serde_json::from_str(&body).map_err(|error| IssueProviderError::ApiRequest {
+                context: "failed to decode GitHub issues".to_owned(),
+                reason: error.to_string(),
+            })?;
         let page_len = page_items.len();
 
         issues.extend(
@@ -407,7 +441,7 @@ impl RepositoryIssueProvider for GitLabIssueProvider {
         &self,
         source: &ResolvedIssueSource,
         _github_token: Option<&SecretString>,
-    ) -> Result<Vec<IssueDto>, String> {
+    ) -> Result<Vec<IssueDto>, IssueProviderError> {
         let token = gitlab_access_token_for_source(source);
         let mut issues = Vec::new();
         let mut page = 1usize;
@@ -431,20 +465,32 @@ impl RepositoryIssueProvider for GitLabIssueProvider {
                 .timeout_global(Some(ISSUE_REQUEST_TIMEOUT))
                 .build()
                 .call()
-                .map_err(|error| format!("GitLab request failed: {error}"))?;
+                .map_err(|error| IssueProviderError::ApiRequest {
+                    context: "GitLab request failed".to_owned(),
+                    reason: error.to_string(),
+                })?;
 
             if !response.status().is_success() {
-                let status = response.status();
+                let status = response.status().as_u16();
                 let body = response.body_mut().read_to_string().unwrap_or_default();
-                return Err(format!("GitLab returned {status}: {body}"));
+                return Err(IssueProviderError::ApiStatus {
+                    provider: "GitLab".to_owned(),
+                    status,
+                    body,
+                });
             }
 
-            let body = response
-                .body_mut()
-                .read_to_string()
-                .map_err(|error| format!("failed to read GitLab response: {error}"))?;
-            let page_items: Vec<GitLabIssuePayload> = serde_json::from_str(&body)
-                .map_err(|error| format!("failed to decode GitLab issues: {error}"))?;
+            let body = response.body_mut().read_to_string().map_err(|error| {
+                IssueProviderError::ApiRequest {
+                    context: "failed to read GitLab response".to_owned(),
+                    reason: error.to_string(),
+                }
+            })?;
+            let page_items: Vec<GitLabIssuePayload> =
+                serde_json::from_str(&body).map_err(|error| IssueProviderError::ApiRequest {
+                    context: "failed to decode GitLab issues".to_owned(),
+                    reason: error.to_string(),
+                })?;
             let page_len = page_items.len();
 
             issues.extend(page_items.into_iter().map(|issue| {
@@ -642,12 +688,12 @@ impl RemoteSpec {
     }
 }
 
-fn origin_remote_url(repo_root: &Path) -> Result<Option<String>, String> {
+fn origin_remote_url(repo_root: &Path) -> Result<Option<String>, IssueProviderError> {
     let repo = gix::open(repo_root).map_err(|error| {
-        format!(
+        IssueProviderError::Other(format!(
             "failed to open repository `{}`: {error}",
             repo_root.display()
-        )
+        ))
     })?;
     let remote = match repo.find_remote("origin") {
         Ok(remote) => remote,

@@ -1,4 +1,5 @@
 use {
+    crate::ManagedWorktreeError,
     arbor_core::repo_config::{self, RepoBranchPrefixMode},
     std::{
         env,
@@ -22,11 +23,11 @@ pub(crate) struct ManagedWorktreeNaming {
 pub(crate) fn preview_managed_worktree(
     repo_root: &Path,
     worktree_name: &str,
-) -> Result<ManagedWorktreePreview, String> {
+) -> Result<ManagedWorktreePreview, ManagedWorktreeError> {
     let repository_name = repo_root
         .file_name()
         .and_then(|value| value.to_str())
-        .ok_or_else(|| "repository root has no terminal directory name".to_owned())?;
+        .ok_or(ManagedWorktreeError::NoTerminalDir)?;
     let naming = derive_managed_worktree_naming(repo_root, worktree_name)?;
     let worktree_path =
         build_managed_worktree_path(repository_name, &naming.sanitized_worktree_name)?;
@@ -45,10 +46,10 @@ pub(crate) fn sanitize_worktree_name(value: &str) -> String {
 pub(crate) fn derive_managed_worktree_naming(
     repo_root: &Path,
     worktree_name: &str,
-) -> Result<ManagedWorktreeNaming, String> {
+) -> Result<ManagedWorktreeNaming, ManagedWorktreeError> {
     let sanitized_worktree_name = sanitize_worktree_name(worktree_name);
     if sanitized_worktree_name.is_empty() {
-        return Err("worktree name contains no usable characters".to_owned());
+        return Err(ManagedWorktreeError::EmptyName);
     }
 
     let github_login = branch_prefix_github_login_from_env();
@@ -114,7 +115,10 @@ fn git_branch_prefix_from_author(repo_root: &Path) -> Option<String> {
     (!sanitized.is_empty()).then_some(sanitized)
 }
 
-fn build_managed_worktree_path(repo_name: &str, worktree_name: &str) -> Result<PathBuf, String> {
+fn build_managed_worktree_path(
+    repo_name: &str,
+    worktree_name: &str,
+) -> Result<PathBuf, ManagedWorktreeError> {
     let home_dir = user_home_dir()?;
     Ok(home_dir
         .join(".arbor")
@@ -139,7 +143,7 @@ fn non_empty_trimmed_str(value: &str) -> Option<&str> {
     }
 }
 
-fn user_home_dir() -> Result<PathBuf, String> {
+fn user_home_dir() -> Result<PathBuf, ManagedWorktreeError> {
     if let Some(home) = env::var_os("HOME") {
         return Ok(PathBuf::from(home));
     }
@@ -154,7 +158,7 @@ fn user_home_dir() -> Result<PathBuf, String> {
             home.push(path);
             home
         },
-        _ => return Err("user home directory environment variables are not set".to_owned()),
+        _ => return Err(ManagedWorktreeError::NoHomeDir),
     };
 
     Ok(home)

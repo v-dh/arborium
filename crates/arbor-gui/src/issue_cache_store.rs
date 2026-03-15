@@ -1,6 +1,7 @@
 use {
     crate::{
-        IssueListState, IssueTarget, ManagedDaemonTarget, RepositorySummary, terminal_daemon_http,
+        IssueListState, IssueTarget, ManagedDaemonTarget, RepositorySummary, StoreError,
+        terminal_daemon_http,
     },
     serde::{Deserialize, Serialize},
     std::{
@@ -29,8 +30,8 @@ pub struct CachedIssueList {
 }
 
 pub trait IssueCacheStore: Send + Sync {
-    fn load(&self) -> Result<IssueCache, String>;
-    fn save(&self, cache: &IssueCache) -> Result<(), String>;
+    fn load(&self) -> Result<IssueCache, StoreError>;
+    fn save(&self, cache: &IssueCache) -> Result<(), StoreError>;
 }
 
 #[derive(Debug, Clone)]
@@ -51,48 +52,39 @@ impl Default for JsonIssueCacheStore {
 }
 
 impl IssueCacheStore for JsonIssueCacheStore {
-    fn load(&self) -> Result<IssueCache, String> {
+    fn load(&self) -> Result<IssueCache, StoreError> {
         if !self.path.exists() {
             return Ok(IssueCache::default());
         }
 
-        let raw = fs::read_to_string(&self.path).map_err(|error| {
-            format!(
-                "failed to read issue cache file `{}`: {error}",
-                self.path.display()
-            )
+        let raw = fs::read_to_string(&self.path).map_err(|source| StoreError::Read {
+            path: self.path.display().to_string(),
+            source,
         })?;
 
-        serde_json::from_str(&raw).map_err(|error| {
-            format!(
-                "failed to parse issue cache file `{}`: {error}",
-                self.path.display()
-            )
+        serde_json::from_str(&raw).map_err(|source| StoreError::JsonParse {
+            path: self.path.display().to_string(),
+            source,
         })
     }
 
-    fn save(&self, cache: &IssueCache) -> Result<(), String> {
+    fn save(&self, cache: &IssueCache) -> Result<(), StoreError> {
         if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).map_err(|error| {
-                format!(
-                    "failed to create issue cache directory `{}`: {error}",
-                    parent.display()
-                )
+            fs::create_dir_all(parent).map_err(|source| StoreError::CreateDir {
+                path: parent.display().to_string(),
+                source,
             })?;
         }
 
-        let payload = serde_json::to_string_pretty(cache).map_err(|error| {
-            format!(
-                "failed to serialize issue cache for `{}`: {error}",
-                self.path.display()
-            )
-        })?;
+        let payload =
+            serde_json::to_string_pretty(cache).map_err(|source| StoreError::JsonSerialize {
+                path: self.path.display().to_string(),
+                source,
+            })?;
 
-        fs::write(&self.path, payload).map_err(|error| {
-            format!(
-                "failed to write issue cache file `{}`: {error}",
-                self.path.display()
-            )
+        fs::write(&self.path, payload).map_err(|source| StoreError::Write {
+            path: self.path.display().to_string(),
+            source,
         })
     }
 }

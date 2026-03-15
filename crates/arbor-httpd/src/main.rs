@@ -1,4 +1,5 @@
 mod auth;
+mod error;
 mod github_service;
 mod issue_linking;
 mod issue_provider;
@@ -15,7 +16,6 @@ mod types;
 
 #[cfg(feature = "symphony")]
 use arbor_symphony::{ServiceOptions, SymphonyService};
-pub(crate) use types::*;
 use {
     crate::{
         process_manager::ProcessManager, routes::*, task_scheduler::TaskScheduler,
@@ -31,6 +31,7 @@ use {
     tokio::sync::Mutex,
     tower_http::services::ServeDir,
 };
+pub(crate) use {error::*, types::*};
 
 fn router(state: AppState) -> Router {
     let api = Router::new()

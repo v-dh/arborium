@@ -1,4 +1,5 @@
 use {
+    crate::StoreError,
     serde::{Deserialize, Serialize},
     std::{
         env, fs,
@@ -20,8 +21,8 @@ pub struct GithubAuthState {
 }
 
 pub trait GithubAuthStore: Send + Sync {
-    fn load(&self) -> Result<GithubAuthState, String>;
-    fn save(&self, state: &GithubAuthState) -> Result<(), String>;
+    fn load(&self) -> Result<GithubAuthState, StoreError>;
+    fn save(&self, state: &GithubAuthState) -> Result<(), StoreError>;
 }
 
 #[derive(Debug, Clone)]
@@ -42,59 +43,48 @@ impl Default for JsonGithubAuthStore {
 }
 
 impl GithubAuthStore for JsonGithubAuthStore {
-    fn load(&self) -> Result<GithubAuthState, String> {
+    fn load(&self) -> Result<GithubAuthState, StoreError> {
         if !self.path.exists() {
             return Ok(GithubAuthState::default());
         }
 
-        let raw = fs::read_to_string(&self.path).map_err(|error| {
-            format!(
-                "failed to read GitHub auth state `{}`: {error}",
-                self.path.display()
-            )
+        let raw = fs::read_to_string(&self.path).map_err(|source| StoreError::Read {
+            path: self.path.display().to_string(),
+            source,
         })?;
 
-        serde_json::from_str(&raw).map_err(|error| {
-            format!(
-                "failed to parse GitHub auth state `{}`: {error}",
-                self.path.display()
-            )
+        serde_json::from_str(&raw).map_err(|source| StoreError::JsonParse {
+            path: self.path.display().to_string(),
+            source,
         })
     }
 
-    fn save(&self, state: &GithubAuthState) -> Result<(), String> {
+    fn save(&self, state: &GithubAuthState) -> Result<(), StoreError> {
         if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).map_err(|error| {
-                format!(
-                    "failed to create GitHub auth directory `{}`: {error}",
-                    parent.display()
-                )
+            fs::create_dir_all(parent).map_err(|source| StoreError::CreateDir {
+                path: parent.display().to_string(),
+                source,
             })?;
         }
 
-        let payload = serde_json::to_string_pretty(state).map_err(|error| {
-            format!(
-                "failed to serialize GitHub auth state for `{}`: {error}",
-                self.path.display()
-            )
-        })?;
+        let payload =
+            serde_json::to_string_pretty(state).map_err(|source| StoreError::JsonSerialize {
+                path: self.path.display().to_string(),
+                source,
+            })?;
 
-        fs::write(&self.path, payload).map_err(|error| {
-            format!(
-                "failed to write GitHub auth state `{}`: {error}",
-                self.path.display()
-            )
+        fs::write(&self.path, payload).map_err(|source| StoreError::Write {
+            path: self.path.display().to_string(),
+            source,
         })?;
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let permissions = fs::Permissions::from_mode(0o600);
-            fs::set_permissions(&self.path, permissions).map_err(|error| {
-                format!(
-                    "failed to secure GitHub auth state permissions for `{}`: {error}",
-                    self.path.display()
-                )
+            fs::set_permissions(&self.path, permissions).map_err(|source| StoreError::Write {
+                path: self.path.display().to_string(),
+                source,
             })?;
         }
 

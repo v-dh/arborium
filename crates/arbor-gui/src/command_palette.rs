@@ -773,7 +773,7 @@ pub(crate) fn command_palette_icon(
             command_palette_glyph_icon("\u{f013}", 0xd19a66, theme)
         },
         CommandPaletteAction::OpenThemePicker => {
-            command_palette_glyph_icon("\u{f53f}", 0xc678dd, theme)
+            command_palette_glyph_icon("\u{f1fc}", 0xc678dd, theme)
         },
         CommandPaletteAction::SetExecutionMode(mode) => match mode {
             ExecutionMode::Plan => command_palette_glyph_icon("\u{f19c}", 0xe5c07b, theme),

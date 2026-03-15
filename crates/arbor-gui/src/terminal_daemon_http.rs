@@ -180,6 +180,85 @@ struct SetBindModeRequest {
     allow_remote: bool,
 }
 
+// ── Agent chat DTOs ──────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+struct AgentChatCreateRequest {
+    workspace_path: String,
+    agent_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    initial_prompt: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AgentChatCreateResponse {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentChatSessionSummary {
+    pub id: String,
+    pub agent_kind: String,
+    pub workspace_path: String,
+    pub status: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentChatSendRequest {
+    message: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentChatMessageDto {
+    pub role: String,
+    pub content: String,
+    #[serde(default)]
+    pub tool_calls: Vec<String>,
+}
+
+/// Events received over the agent chat WebSocket from the daemon.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[allow(dead_code)]
+pub enum AgentChatWsEvent {
+    MessageChunk {
+        content: String,
+    },
+    ThoughtChunk {
+        content: String,
+    },
+    ToolCall {
+        name: String,
+        status: String,
+    },
+    TurnStarted,
+    TurnCompleted,
+    UsageUpdate {
+        input_tokens: u64,
+        output_tokens: u64,
+    },
+    Error {
+        message: String,
+    },
+    SessionExited {
+        exit_code: Option<i32>,
+    },
+    Snapshot {
+        messages: Vec<AgentChatMessageDto>,
+        status: String,
+        input_tokens: u64,
+        output_tokens: u64,
+    },
+    UserMessage {
+        content: String,
+    },
+    StatusUpdate {
+        message: String,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebsocketConnectConfig {
     pub url: String,
@@ -264,6 +343,17 @@ impl HttpTerminalDaemon {
         let path = format!(
             "{API_PATH_PREFIX}/terminals/{}/ws",
             encode_path_segment(session_id)
+        );
+        self.websocket_connect_config(&path)
+    }
+
+    pub fn agent_chat_websocket_config(
+        &self,
+        session_id: &str,
+    ) -> Result<WebsocketConnectConfig, HttpTerminalDaemonError> {
+        let path = format!(
+            "{API_PATH_PREFIX}/agent/chat/{}/ws",
+            percent_encode_path(session_id)
         );
         self.websocket_connect_config(&path)
     }
@@ -447,6 +537,75 @@ impl HttpTerminalDaemon {
         self.expect_status(response, &[200])
     }
 
+    pub fn create_agent_chat(
+        &self,
+        workspace_path: &str,
+        agent_kind: &str,
+        initial_prompt: Option<&str>,
+    ) -> Result<AgentChatCreateResponse, HttpTerminalDaemonError> {
+        let payload = AgentChatCreateRequest {
+            workspace_path: workspace_path.to_owned(),
+            agent_kind: agent_kind.to_owned(),
+            initial_prompt: initial_prompt.map(str::to_owned),
+        };
+        let response =
+            self.send_json("POST", &format!("{API_PATH_PREFIX}/agent/chat"), &payload)?;
+        self.decode_json_response(response, &[200])
+    }
+
+    pub fn list_agent_chats(
+        &self,
+    ) -> Result<Vec<AgentChatSessionSummary>, HttpTerminalDaemonError> {
+        let response = self.send_empty("GET", &format!("{API_PATH_PREFIX}/agent/chat"))?;
+        self.decode_json_response(response, &[200])
+    }
+
+    pub fn kill_agent_chat(&self, session_id: &str) -> Result<(), HttpTerminalDaemonError> {
+        let encoded = percent_encode_path(session_id);
+        let response =
+            self.send_empty("DELETE", &format!("{API_PATH_PREFIX}/agent/chat/{encoded}"))?;
+        self.expect_status(response, &[200])
+    }
+
+    pub fn send_agent_message(
+        &self,
+        session_id: &str,
+        message: &str,
+    ) -> Result<(), HttpTerminalDaemonError> {
+        let encoded = percent_encode_path(session_id);
+        let payload = AgentChatSendRequest {
+            message: message.to_owned(),
+        };
+        let response = self.send_json(
+            "POST",
+            &format!("{API_PATH_PREFIX}/agent/chat/{encoded}/send"),
+            &payload,
+        )?;
+        self.expect_status(response, &[200])
+    }
+
+    pub fn cancel_agent_chat(&self, session_id: &str) -> Result<(), HttpTerminalDaemonError> {
+        let encoded = percent_encode_path(session_id);
+        let response = self.send_empty(
+            "POST",
+            &format!("{API_PATH_PREFIX}/agent/chat/{encoded}/cancel"),
+        )?;
+        self.expect_status(response, &[200])
+    }
+
+    #[allow(dead_code)]
+    pub fn agent_chat_history(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<AgentChatMessageDto>, HttpTerminalDaemonError> {
+        let encoded = percent_encode_path(session_id);
+        let response = self.send_empty(
+            "GET",
+            &format!("{API_PATH_PREFIX}/agent/chat/{encoded}/history"),
+        )?;
+        self.decode_json_response(response, &[200])
+    }
+
     fn send_empty(
         &self,
         method: &str,
@@ -618,6 +777,10 @@ pub trait TerminalDaemonClient: Send + Sync + fmt::Debug {
         &self,
         session_id: &str,
     ) -> Result<WebsocketConnectConfig, HttpTerminalDaemonError>;
+    fn agent_chat_websocket_config(
+        &self,
+        session_id: &str,
+    ) -> Result<WebsocketConnectConfig, HttpTerminalDaemonError>;
     fn create_or_attach(
         &self,
         request: CreateOrAttachRequest,
@@ -652,6 +815,20 @@ pub trait TerminalDaemonClient: Send + Sync + fmt::Debug {
     ) -> Result<WorktreeMutationResponseDto, HttpTerminalDaemonError>;
     fn shutdown(&self) -> Result<(), HttpTerminalDaemonError>;
     fn set_bind_mode(&self, allow_remote: bool) -> Result<(), HttpTerminalDaemonError>;
+    fn create_agent_chat(
+        &self,
+        workspace_path: &str,
+        agent_kind: &str,
+        initial_prompt: Option<&str>,
+    ) -> Result<AgentChatCreateResponse, HttpTerminalDaemonError>;
+    fn list_agent_chats(&self) -> Result<Vec<AgentChatSessionSummary>, HttpTerminalDaemonError>;
+    fn kill_agent_chat(&self, session_id: &str) -> Result<(), HttpTerminalDaemonError>;
+    fn send_agent_message(
+        &self,
+        session_id: &str,
+        message: &str,
+    ) -> Result<(), HttpTerminalDaemonError>;
+    fn cancel_agent_chat(&self, session_id: &str) -> Result<(), HttpTerminalDaemonError>;
 }
 
 impl TerminalDaemonClient for HttpTerminalDaemon {
@@ -675,6 +852,13 @@ impl TerminalDaemonClient for HttpTerminalDaemon {
         session_id: &str,
     ) -> Result<WebsocketConnectConfig, HttpTerminalDaemonError> {
         HttpTerminalDaemon::terminal_websocket_config(self, session_id)
+    }
+
+    fn agent_chat_websocket_config(
+        &self,
+        session_id: &str,
+    ) -> Result<WebsocketConnectConfig, HttpTerminalDaemonError> {
+        HttpTerminalDaemon::agent_chat_websocket_config(self, session_id)
     }
 
     fn create_or_attach(
@@ -757,6 +941,35 @@ impl TerminalDaemonClient for HttpTerminalDaemon {
 
     fn set_bind_mode(&self, allow_remote: bool) -> Result<(), HttpTerminalDaemonError> {
         HttpTerminalDaemon::set_bind_mode(self, allow_remote)
+    }
+
+    fn create_agent_chat(
+        &self,
+        workspace_path: &str,
+        agent_kind: &str,
+        initial_prompt: Option<&str>,
+    ) -> Result<AgentChatCreateResponse, HttpTerminalDaemonError> {
+        HttpTerminalDaemon::create_agent_chat(self, workspace_path, agent_kind, initial_prompt)
+    }
+
+    fn list_agent_chats(&self) -> Result<Vec<AgentChatSessionSummary>, HttpTerminalDaemonError> {
+        HttpTerminalDaemon::list_agent_chats(self)
+    }
+
+    fn kill_agent_chat(&self, session_id: &str) -> Result<(), HttpTerminalDaemonError> {
+        HttpTerminalDaemon::kill_agent_chat(self, session_id)
+    }
+
+    fn send_agent_message(
+        &self,
+        session_id: &str,
+        message: &str,
+    ) -> Result<(), HttpTerminalDaemonError> {
+        HttpTerminalDaemon::send_agent_message(self, session_id, message)
+    }
+
+    fn cancel_agent_chat(&self, session_id: &str) -> Result<(), HttpTerminalDaemonError> {
+        HttpTerminalDaemon::cancel_agent_chat(self, session_id)
     }
 }
 
@@ -977,6 +1190,22 @@ fn normalize_base_path(raw: &str) -> String {
     }
 
     format!("/{}", trimmed)
+}
+
+fn percent_encode_path(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                result.push(byte as char);
+            },
+            _ => {
+                result.push('%');
+                result.push_str(&format!("{byte:02X}"));
+            },
+        }
+    }
+    result
 }
 
 fn parse_http_response(raw: Vec<u8>) -> Result<HttpResponse, HttpTerminalDaemonError> {

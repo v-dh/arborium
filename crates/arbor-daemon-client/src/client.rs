@@ -2,12 +2,13 @@ use {
     crate::{
         error::DaemonClientError,
         types::{
-            AgentSessionDto, ApiError, ChangedFileDto, CommitWorktreeRequest,
-            CreateManagedWorktreeRequest, CreateTerminalRequest, CreateTerminalResponse,
-            CreateWorktreeRequest, DeleteWorktreeRequest, GitActionResponse, HealthResponse,
-            IssueListResponse, ManagedWorktreePreviewRequest, ManagedWorktreePreviewResponse,
-            PushWorktreeRequest, RepositoryDto, TerminalResizeRequest, TerminalSignalRequest,
-            WorktreeDto, WorktreeMutationResponse,
+            AgentChatSessionDto, AgentSessionDto, ApiError, ChangedFileDto, CommitWorktreeRequest,
+            CreateAgentChatRequest, CreateAgentChatResponse, CreateManagedWorktreeRequest,
+            CreateTerminalRequest, CreateTerminalResponse, CreateWorktreeRequest,
+            DeleteWorktreeRequest, GitActionResponse, HealthResponse, IssueListResponse,
+            ManagedWorktreePreviewRequest, ManagedWorktreePreviewResponse, PushWorktreeRequest,
+            RepositoryDto, TerminalResizeRequest, TerminalSignalRequest, WorktreeDto,
+            WorktreeMutationResponse,
         },
     },
     arbor_core::{
@@ -238,6 +239,26 @@ impl DaemonClient {
 
     pub fn list_agent_activity(&self) -> Result<Vec<AgentSessionDto>, DaemonClientError> {
         self.get_json("/api/v1/agent/activity")
+    }
+
+    pub fn list_agent_chats(&self) -> Result<Vec<AgentChatSessionDto>, DaemonClientError> {
+        self.get_json("/api/v1/agent/chat")
+    }
+
+    pub fn create_agent_chat(
+        &self,
+        request: &CreateAgentChatRequest,
+    ) -> Result<CreateAgentChatResponse, DaemonClientError> {
+        self.post_json("/api/v1/agent/chat", request)
+    }
+
+    pub fn kill_agent_chat(&self, session_id: &str) -> Result<(), DaemonClientError> {
+        self.request_no_content(
+            "DELETE",
+            &format!("/api/v1/agent/chat/{}", encode_path_segment(session_id)),
+            None,
+            &[],
+        )
     }
 
     pub fn list_processes(&self) -> Result<Vec<ProcessInfo>, DaemonClientError> {

@@ -530,6 +530,10 @@ impl ArborWindow {
         }
         self.active_diff_session_id = Some(session_id);
         self.active_file_view_session_id = None;
+        // Clear agent chat selection so diff tab takes priority
+        if let Some(wt_path) = self.selected_worktree_path().map(Path::to_path_buf) {
+            self.active_agent_chat_by_worktree.remove(&wt_path);
+        }
         self.logs_tab_active = false;
         if let Some(selected_path) = self.selected_changed_file.clone()
             && !self.scroll_diff_to_file(selected_path.as_path())

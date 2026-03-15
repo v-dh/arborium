@@ -1,5 +1,6 @@
 mod actions;
 mod agent_activity;
+mod agent_chat;
 mod agent_presets;
 mod app_bootstrap;
 mod app_config;

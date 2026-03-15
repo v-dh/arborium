@@ -1,3 +1,4 @@
+pub(crate) mod agent_chat;
 mod auth;
 mod error;
 mod github_service;
@@ -489,6 +490,7 @@ mod tests {
             issue_service: Arc::new(issue_provider::RepositoryIssueService::default()),
             agent_sessions: Arc::new(Mutex::new(HashMap::new())),
             agent_broadcast,
+            agent_chat: Arc::new(Mutex::new(agent_chat::AgentChatManager::new())),
             log_broadcast,
             pr_cache: Arc::new(Mutex::new(HashMap::new())),
             repo_cache: Arc::new(Mutex::new(HashMap::new())),

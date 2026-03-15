@@ -240,6 +240,42 @@ pub(crate) fn agent_preset_button_content(kind: AgentPresetKind, text_color: u32
         )
 }
 
+/// Render an agent chat icon element for use in tab bars and menus.
+///
+/// Uses the agent's SVG/PNG icon from presets, with a Nerd Font chat bubble fallback.
+pub(crate) fn agent_chat_tab_icon_element(
+    kind: AgentPresetKind,
+    text_color: u32,
+    icon_size_px: f32,
+) -> Div {
+    let icon = preset_icon_image(kind);
+    let fallback_color = match kind {
+        AgentPresetKind::Claude => 0xD97757,
+        _ => text_color,
+    };
+    let fallback_glyph = match kind {
+        AgentPresetKind::Claude => "C",
+        _ => kind.fallback_icon(),
+    };
+    div()
+        .w(px(icon_size_px))
+        .h(px(icon_size_px))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(img(icon).size(px(icon_size_px)).with_fallback(move || {
+            log_preset_icon_fallback_once(kind, fallback_glyph);
+            div()
+                .font_family(FONT_MONO)
+                .text_size(px(icon_size_px * 0.7))
+                .line_height(px(icon_size_px))
+                .text_color(rgb(fallback_color))
+                .child(fallback_glyph)
+                .into_any_element()
+        }))
+}
+
 pub(crate) fn git_action_button(
     theme: ThemePalette,
     id: impl Into<ElementId>,

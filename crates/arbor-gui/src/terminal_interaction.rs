@@ -331,6 +331,15 @@ impl ArborWindow {
             return;
         }
 
+        if self.new_tab_menu_position.is_some() {
+            if event.keystroke.key.as_str() == "escape" {
+                self.new_tab_menu_position = None;
+                cx.stop_propagation();
+                cx.notify();
+            }
+            return;
+        }
+
         if self.command_palette_modal.is_some() {
             if event.keystroke.key.as_str() == "escape" {
                 self.close_command_palette(cx);
@@ -364,6 +373,17 @@ impl ArborWindow {
         // Handle file view editing before terminal input
         if matches!(active_tab, Some(CenterTab::FileView(_))) {
             if self.handle_file_view_key_down(event, cx) {
+                cx.stop_propagation();
+            }
+            return;
+        }
+
+        // Handle agent chat input — only stop propagation for keys that were
+        // actually consumed (Enter, Backspace, arrows, etc.).  Regular character
+        // keys must flow through to the IME pipeline so that
+        // `replace_text_in_range` inserts the typed text into the chat input.
+        if let Some(CenterTab::AgentChat(local_id)) = active_tab {
+            if self.handle_agent_chat_key_down(local_id, event, cx) {
                 cx.stop_propagation();
             }
             return;

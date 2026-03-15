@@ -314,6 +314,13 @@ impl ArborWindow {
                     selected_file_tree_entry: None,
                     left_pane_visible: true,
                     collapsed_repositories,
+                    agent_chat_sessions: Vec::new(),
+                    active_agent_chat_by_worktree: HashMap::new(),
+                    next_agent_chat_id: 1,
+                    agent_chat_scroll_handle: ScrollHandle::new(),
+                    agent_selector_open_for: None,
+                    center_tab_order: Vec::new(),
+                    new_tab_menu_position: None,
                     repository_context_menu: None,
                     worktree_context_menu: None,
                     worktree_hover_popover: None,
@@ -709,6 +716,13 @@ impl ArborWindow {
             ide_launchers: Vec::new(),
             left_pane_visible: startup_ui_state.left_pane_visible.unwrap_or(true),
             collapsed_repositories,
+            agent_chat_sessions: Vec::new(),
+            active_agent_chat_by_worktree: HashMap::new(),
+            next_agent_chat_id: 1,
+            agent_chat_scroll_handle: ScrollHandle::new(),
+            agent_selector_open_for: None,
+            center_tab_order: Vec::new(),
+            new_tab_menu_position: None,
             repository_context_menu: None,
             worktree_context_menu: None,
             worktree_hover_popover: None,
@@ -801,6 +815,7 @@ impl ArborWindow {
         app.refresh_repo_config_if_changed(cx);
         app.refresh_github_auth_identity(cx);
         app.restore_terminal_sessions_from_records(initial_daemon_records, attach_daemon_runtime);
+        app.restore_agent_chat_sessions(cx);
         if app.active_outpost_index.is_some() {
             app.refresh_remote_changed_files(cx);
         } else {

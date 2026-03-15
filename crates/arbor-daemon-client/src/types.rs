@@ -230,6 +230,32 @@ pub struct GitActionResponse {
     pub commit_message: Option<String>,
 }
 
+/// DTO for agent chat sessions returned by the daemon.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct AgentChatSessionDto {
+    pub id: String,
+    pub agent_kind: String,
+    pub workspace_path: String,
+    pub status: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+/// Request to create a new agent chat session.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct CreateAgentChatRequest {
+    pub workspace_path: String,
+    pub agent_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initial_prompt: Option<String>,
+}
+
+/// Response from creating an agent chat session.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct CreateAgentChatResponse {
+    pub session_id: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct ApiError {
     pub(crate) error: String,

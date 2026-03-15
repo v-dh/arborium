@@ -9,7 +9,8 @@ pub use {
     },
     error::DaemonClientError,
     types::{
-        AgentSessionDto, ChangedFileDto, CommitWorktreeRequest, CreateManagedWorktreeRequest,
+        AgentChatSessionDto, AgentSessionDto, ChangedFileDto, CommitWorktreeRequest,
+        CreateAgentChatRequest, CreateAgentChatResponse, CreateManagedWorktreeRequest,
         CreateTerminalRequest, CreateTerminalResponse, CreateWorktreeRequest,
         DeleteWorktreeRequest, GitActionResponse, HealthResponse, IssueDto, IssueLabelDto,
         IssueListResponse, IssueReviewDto, IssueReviewKind, IssueSourceDto, IssueTypeDto,

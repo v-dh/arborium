@@ -100,6 +100,21 @@ impl EntityInputHandler for ArborWindow {
             cx.notify();
             return;
         }
+        // Route text input to agent chat when an agent chat tab is active
+        if let Some(CenterTab::AgentChat(local_id)) = self.active_center_tab_for_selected_worktree()
+        {
+            if let Some(session) = self
+                .agent_chat_sessions
+                .iter_mut()
+                .find(|s| s.local_id == local_id)
+            {
+                let cursor = session.input_cursor;
+                session.input_text.insert_str(cursor, text);
+                session.input_cursor += text.len();
+            }
+            cx.notify();
+            return;
+        }
         let Some(session_id) = self.active_terminal_id_for_selected_worktree() else {
             return;
         };
@@ -231,6 +246,7 @@ impl Render for ArborWindow {
             .child(self.render_issue_details_modal(cx))
             .child(self.render_create_modal(cx))
             .child(self.render_github_auth_modal(cx))
+            .child(self.render_new_tab_menu(cx))
             .child(self.render_repository_context_menu(cx))
             .child(self.render_worktree_context_menu(cx))
             .child(self.render_worktree_hover_popover(cx))

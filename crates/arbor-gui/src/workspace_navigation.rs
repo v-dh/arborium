@@ -707,6 +707,17 @@ impl ArborWindow {
             }
         }
 
+        // Check for active agent chat tab
+        if let Some(worktree_path) = self.selected_worktree_path()
+            && let Some(&local_id) = self.active_agent_chat_by_worktree.get(worktree_path)
+            && self
+                .agent_chat_sessions
+                .iter()
+                .any(|s| s.local_id == local_id && s.workspace_path.as_path() == worktree_path)
+        {
+            return Some(CenterTab::AgentChat(local_id));
+        }
+
         self.active_terminal_id_for_selected_worktree()
             .map(CenterTab::Terminal)
     }
@@ -940,6 +951,10 @@ impl ArborWindow {
         }
         self.active_file_view_session_id = Some(session_id);
         self.active_diff_session_id = None;
+        // Clear agent chat selection so file view tab takes priority
+        if let Some(wt_path) = self.selected_worktree_path().map(Path::to_path_buf) {
+            self.active_agent_chat_by_worktree.remove(&wt_path);
+        }
         self.logs_tab_active = false;
         self.sync_navigation_ui_state_store(cx);
         cx.notify();
@@ -983,6 +998,9 @@ impl ArborWindow {
                     cx.notify();
                 }
             },
+            Some(CenterTab::AgentChat(local_id)) => {
+                self.close_agent_chat_by_local_id(local_id, cx);
+            },
             Some(CenterTab::Logs) => {
                 self.logs_tab_open = false;
                 self.logs_tab_active = false;
@@ -991,6 +1009,47 @@ impl ArborWindow {
             },
             None => {},
         }
+    }
+
+    pub(crate) fn close_agent_chat_by_local_id(&mut self, local_id: u64, cx: &mut Context<Self>) {
+        if let Some(index) = self
+            .agent_chat_sessions
+            .iter()
+            .position(|s| s.local_id == local_id)
+        {
+            let session = self.agent_chat_sessions.remove(index);
+            // Remove from active tracking
+            self.active_agent_chat_by_worktree
+                .retain(|_, id| *id != local_id);
+
+            // Kill the session on the daemon in background
+            if let Some(daemon) = self.terminal_daemon.as_ref() {
+                let client = daemon.clone();
+                let session_id = session.session_id.clone();
+                cx.spawn(async move |_, _| {
+                    let _ = client.kill_agent_chat(&session_id);
+                })
+                .detach();
+            }
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn select_agent_chat_tab(&mut self, local_id: u64, cx: &mut Context<Self>) {
+        let Some(worktree_path) = self.selected_worktree_path().map(Path::to_path_buf) else {
+            return;
+        };
+        self.logs_tab_active = false;
+        self.active_diff_session_id = None;
+        self.active_file_view_session_id = None;
+        self.active_agent_chat_by_worktree
+            .insert(worktree_path, local_id);
+        // Clear terminal selection for this worktree so agent chat takes priority
+        if let Some(wt_path) = self.selected_worktree_path().map(Path::to_path_buf) {
+            self.active_terminal_by_worktree.remove(&wt_path);
+        }
+        self.sync_navigation_ui_state_store(cx);
+        cx.notify();
     }
 
     pub(crate) fn theme(&self) -> ThemePalette {

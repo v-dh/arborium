@@ -1027,7 +1027,41 @@ pub(crate) enum CenterTab {
     Terminal(u64),
     Diff(u64),
     FileView(u64),
+    AgentChat(u64),
     Logs,
+}
+
+/// A chat message in the native agent chat UI.
+#[derive(Debug, Clone)]
+pub(crate) struct AgentChatMessage {
+    pub(crate) role: String,
+    pub(crate) content: String,
+    pub(crate) tool_calls: Vec<String>,
+}
+
+/// Local state for an agent chat session displayed in the native GUI.
+#[derive(Debug, Clone)]
+pub(crate) struct NativeAgentChatSession {
+    /// Local numeric ID for use in `CenterTab::AgentChat`.
+    pub(crate) local_id: u64,
+    /// Daemon-managed session ID (string).
+    pub(crate) session_id: String,
+    /// Agent kind (e.g. "claude", "codex").
+    pub(crate) agent_kind: String,
+    /// Workspace path this chat is associated with.
+    pub(crate) workspace_path: PathBuf,
+    /// Current status from the daemon.
+    pub(crate) status: String,
+    /// Conversation messages.
+    pub(crate) messages: Vec<AgentChatMessage>,
+    /// User input text being composed.
+    pub(crate) input_text: String,
+    /// Cursor position in input text.
+    pub(crate) input_cursor: usize,
+    /// Cumulative input token usage.
+    pub(crate) input_tokens: u64,
+    /// Cumulative output token usage.
+    pub(crate) output_tokens: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1977,6 +2011,15 @@ pub(crate) struct ArborWindow {
     pub(crate) selected_file_tree_entry: Option<PathBuf>,
     pub(crate) left_pane_visible: bool,
     pub(crate) collapsed_repositories: HashSet<usize>,
+    pub(crate) agent_chat_sessions: Vec<NativeAgentChatSession>,
+    pub(crate) active_agent_chat_by_worktree: HashMap<PathBuf, u64>,
+    pub(crate) next_agent_chat_id: u64,
+    pub(crate) agent_chat_scroll_handle: ScrollHandle,
+    /// When `Some(local_id)`, the agent selector popup is open for this chat session.
+    pub(crate) agent_selector_open_for: Option<u64>,
+    /// Tracks creation order of center tabs for stable tab bar ordering.
+    pub(crate) center_tab_order: Vec<CenterTab>,
+    pub(crate) new_tab_menu_position: Option<gpui::Point<Pixels>>,
     pub(crate) repository_context_menu: Option<RepositoryContextMenu>,
     pub(crate) worktree_context_menu: Option<WorktreeContextMenu>,
     pub(crate) worktree_hover_popover: Option<WorktreeHoverPopover>,

@@ -632,6 +632,11 @@ impl ArborWindow {
         self.active_file_view_session_id = None;
         self.file_view_editing = false;
         self.logs_tab_active = false;
+        // Clear agent chat selection so the new terminal tab becomes active
+        if let Some(worktree_path) = self.selected_worktree_path() {
+            self.active_agent_chat_by_worktree
+                .remove(&worktree_path.to_path_buf());
+        }
         self.terminal_scroll_handle.scroll_to_bottom();
         window.focus(&self.terminal_focus);
         self.focus_terminal_on_next_render = false;
@@ -668,6 +673,7 @@ impl ArborWindow {
         self.next_terminal_id += 1;
         self.active_terminal_by_worktree
             .insert(worktree_path.clone(), session_id);
+        self.active_agent_chat_by_worktree.remove(&worktree_path);
 
         let title = format!("ssh-{}", outpost.label);
         let session = TerminalSession {
@@ -699,6 +705,9 @@ impl ArborWindow {
         };
         self.terminals.push(session);
         self.active_diff_session_id = None;
+        self.active_file_view_session_id = None;
+        self.file_view_editing = false;
+        self.logs_tab_active = false;
         self.terminal_scroll_handle.scroll_to_bottom();
         window.focus(&self.terminal_focus);
         self.focus_terminal_on_next_render = false;
@@ -846,6 +855,10 @@ impl ArborWindow {
         }
         self.active_diff_session_id = None;
         self.active_file_view_session_id = None;
+        // Clear agent chat selection so terminal tab takes priority
+        if let Some(wt_path) = self.selected_worktree_path().map(Path::to_path_buf) {
+            self.active_agent_chat_by_worktree.remove(&wt_path);
+        }
         self.logs_tab_active = false;
         self.sync_navigation_ui_state_store(cx);
         self.terminal_scroll_handle.scroll_to_bottom();

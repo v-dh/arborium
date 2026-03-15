@@ -126,6 +126,117 @@ impl ArborWindow {
         cx.notify();
     }
 
+    /// Run an agent preset command in the currently active terminal tab
+    /// (instead of spawning a new terminal).
+    pub(crate) fn run_preset_in_active_terminal(
+        &mut self,
+        preset: AgentPresetKind,
+        cx: &mut Context<Self>,
+    ) {
+        let command = match command_for_execution_mode(
+            preset,
+            &self.preset_command_for_kind(preset),
+            self.execution_mode,
+        ) {
+            Ok(command) => command,
+            Err(error) => {
+                self.notice = Some(error.to_string());
+                cx.notify();
+                return;
+            },
+        };
+        self.active_preset_tab = Some(preset);
+        if command.is_empty() {
+            self.notice = Some(format!("{} preset command is empty", preset.label()));
+            cx.notify();
+            return;
+        }
+
+        let Some(session_id) = self
+            .active_center_tab_for_selected_worktree()
+            .and_then(|tab| match tab {
+                CenterTab::Terminal(id) => Some(id),
+                _ => None,
+            })
+        else {
+            self.notice = Some("No active terminal tab".to_owned());
+            cx.notify();
+            return;
+        };
+
+        let input = format!("{command}\n");
+        if let Err(error) = self.write_input_to_terminal(session_id, input.as_bytes()) {
+            self.notice = Some(format!("failed to run {} preset: {error}", preset.label()));
+            cx.notify();
+            return;
+        }
+
+        if let Some(session) = self
+            .terminals
+            .iter_mut()
+            .find(|session| session.id == session_id)
+        {
+            session.agent_preset = Some(preset);
+            session.execution_mode = Some(self.execution_mode);
+            session.last_command = Some(command);
+            session.pending_command.clear();
+            session.updated_at_unix_ms = current_unix_timestamp_millis();
+        }
+
+        self.sync_daemon_session_store(cx);
+        cx.notify();
+    }
+
+    /// Run a repo preset command in the currently active terminal tab.
+    pub(crate) fn run_repo_preset_in_active_terminal(
+        &mut self,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(preset) = self.repo_presets.get(index) else {
+            return;
+        };
+        let command = preset.command.trim().to_owned();
+        let name = preset.name.clone();
+        if command.is_empty() {
+            self.notice = Some(format!("{name} preset command is empty"));
+            cx.notify();
+            return;
+        }
+
+        let Some(session_id) = self
+            .active_center_tab_for_selected_worktree()
+            .and_then(|tab| match tab {
+                CenterTab::Terminal(id) => Some(id),
+                _ => None,
+            })
+        else {
+            self.notice = Some("No active terminal tab".to_owned());
+            cx.notify();
+            return;
+        };
+
+        let input = format!("{command}\n");
+        if let Err(error) = self.write_input_to_terminal(session_id, input.as_bytes()) {
+            self.notice = Some(format!("failed to run {name} preset: {error}"));
+            cx.notify();
+            return;
+        }
+
+        if let Some(session) = self
+            .terminals
+            .iter_mut()
+            .find(|session| session.id == session_id)
+        {
+            session.last_command = Some(command);
+            session.pending_command.clear();
+            session.updated_at_unix_ms = current_unix_timestamp_millis();
+        }
+
+        self.sync_daemon_session_store(cx);
+        cx.notify();
+    }
+
     pub(crate) fn launch_agent_preset(
         &mut self,
         preset: AgentPresetKind,

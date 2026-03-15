@@ -2,7 +2,7 @@
 use arbor_symphony::{ServiceOptions, SymphonyService};
 use {
     crate::{
-        auth, github_service, issue_provider,
+        agent_chat, auth, github_service, issue_provider,
         process_manager::ProcessManager,
         repository_store,
         routes::spawn_notification_webhooks,
@@ -132,6 +132,11 @@ pub(crate) async fn build_app_state(
         issue_service: Arc::new(issue_provider::RepositoryIssueService::default()),
         agent_sessions: Arc::new(Mutex::new(HashMap::new())),
         agent_broadcast,
+        agent_chat: {
+            let mut mgr = agent_chat::AgentChatManager::new();
+            mgr.load_persisted_sessions();
+            Arc::new(Mutex::new(mgr))
+        },
         log_broadcast,
         pr_cache: Arc::new(Mutex::new(HashMap::new())),
         repo_cache: Arc::new(Mutex::new(HashMap::new())),

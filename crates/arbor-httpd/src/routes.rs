@@ -53,7 +53,7 @@ use {
         sync::Arc,
         time::{Duration, SystemTime, UNIX_EPOCH},
     },
-    tokio::sync::Mutex,
+    tokio::sync::{Mutex, broadcast},
     tower_http::services::ServeDir,
 };
 
@@ -85,6 +85,12 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/agent/notify", post(agent_notify))
         .route("/agent/activity", get(list_agent_activity))
         .route("/agent/activity/ws", get(agent_activity_ws))
+        .route("/agent/chat", get(list_agent_chats).post(create_agent_chat))
+        .route("/agent/chat/{session_id}", delete(kill_agent_chat))
+        .route("/agent/chat/{session_id}/send", post(send_agent_message))
+        .route("/agent/chat/{session_id}/cancel", post(cancel_agent_chat))
+        .route("/agent/chat/{session_id}/history", get(agent_chat_history))
+        .route("/agent/chat/{session_id}/ws", get(agent_chat_ws))
         .route("/processes", get(list_processes))
         .route("/processes/start-all", post(start_all_processes))
         .route("/processes/stop-all", post(stop_all_processes))
@@ -1057,12 +1063,12 @@ async fn handle_terminal_ws(
                             break;
                         }
                     },
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         if send_ws_event(&mut socket, WsServerEvent::Error { message: format!("dropped {skipped} terminal events") }).await.is_err() {
                             break;
                         }
                     },
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    Err(broadcast::error::RecvError::Closed) => {
                         break;
                     },
                 }
@@ -1337,21 +1343,21 @@ async fn handle_agent_activity_ws(state: AppState, mut socket: WebSocket) {
                     break;
                 }
             },
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+            Err(broadcast::error::RecvError::Lagged(_)) => {
                 let (snapshot, next_rx) = agent_activity_snapshot_and_subscription(&state).await;
                 if send_ws_json(&mut socket, &snapshot).await.is_err() {
                     break;
                 }
                 rx = next_rx;
             },
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            Err(broadcast::error::RecvError::Closed) => break,
         }
     }
 }
 
 async fn agent_activity_snapshot_and_subscription(
     state: &AppState,
-) -> (AgentWsEvent, tokio::sync::broadcast::Receiver<AgentWsEvent>) {
+) -> (AgentWsEvent, broadcast::Receiver<AgentWsEvent>) {
     let snapshot = {
         let mut sessions = state.agent_sessions.lock().await;
         let dtos = agent_session_snapshot(&mut sessions);
@@ -1774,21 +1780,21 @@ async fn handle_process_status_ws(state: AppState, mut socket: WebSocket) {
                     break;
                 }
             },
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+            Err(broadcast::error::RecvError::Lagged(_)) => {
                 let (snapshot, next_rx) = process_status_snapshot_and_subscription(&state).await;
                 if send_ws_json(&mut socket, &snapshot).await.is_err() {
                     break;
                 }
                 rx = next_rx;
             },
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            Err(broadcast::error::RecvError::Closed) => break,
         }
     }
 }
 
 async fn process_status_snapshot_and_subscription(
     state: &AppState,
-) -> (ProcessEvent, tokio::sync::broadcast::Receiver<ProcessEvent>) {
+) -> (ProcessEvent, broadcast::Receiver<ProcessEvent>) {
     let definitions = discover_process_definitions(state).unwrap_or_else(|error| {
         tracing::warn!(%error, "failed to discover process definitions for process WebSocket");
         Vec::new()
@@ -1870,7 +1876,7 @@ async fn handle_logs_ws(state: AppState, mut socket: WebSocket) {
                     break;
                 }
             },
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+            Err(broadcast::error::RecvError::Lagged(n)) => {
                 // Tell the client entries were skipped, then continue.
                 let msg = serde_json::json!({
                     "ts": current_unix_timestamp_millis(),
@@ -1888,7 +1894,7 @@ async fn handle_logs_ws(state: AppState, mut socket: WebSocket) {
                 }
                 rx = state.log_broadcast.subscribe();
             },
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            Err(broadcast::error::RecvError::Closed) => break,
         }
     }
 }
@@ -2065,7 +2071,7 @@ async fn handle_task_status_ws(state: AppState, mut socket: WebSocket) {
                     break;
                 }
             },
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+            Err(broadcast::error::RecvError::Lagged(_)) => {
                 let (snapshot, next_rx) = {
                     let ts = state.task_scheduler.lock().await;
                     (ts.snapshot_event(), ts.subscribe())
@@ -2075,7 +2081,7 @@ async fn handle_task_status_ws(state: AppState, mut socket: WebSocket) {
                 }
                 rx = next_rx;
             },
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            Err(broadcast::error::RecvError::Closed) => break,
         }
     }
 }
@@ -2491,6 +2497,150 @@ fn pr_cache_key(slug: &str, branch: &str, is_primary: bool) -> String {
             "linked"
         }
     )
+}
+
+// ── Agent Chat routes ────────────────────────────────────────────────
+
+async fn create_agent_chat(
+    State(state): State<AppState>,
+    Json(request): Json<crate::agent_chat::CreateAgentChatRequest>,
+) -> ApiResult<crate::agent_chat::CreateAgentChatResponse> {
+    let workspace_path = PathBuf::from(&request.workspace_path);
+    let mut manager = state.agent_chat.lock().await;
+    let (session_id, event_rx) =
+        manager.create_session(request.agent_kind, workspace_path, request.initial_prompt);
+    manager.persist();
+
+    // Spawn a background listener to track conversation state
+    crate::agent_chat::spawn_session_listener(
+        state.agent_chat.clone(),
+        session_id.clone(),
+        event_rx,
+    );
+
+    Ok(Json(crate::agent_chat::CreateAgentChatResponse {
+        session_id,
+    }))
+}
+
+async fn list_agent_chats(
+    State(state): State<AppState>,
+) -> ApiResult<Vec<crate::agent_chat::AgentChatSessionDto>> {
+    let manager = state.agent_chat.lock().await;
+    Ok(Json(manager.list()))
+}
+
+async fn send_agent_message(
+    State(state): State<AppState>,
+    AxumPath(session_id): AxumPath<String>,
+    Json(request): Json<crate::agent_chat::SendAgentMessageRequest>,
+) -> ApiResult<serde_json::Value> {
+    let mut manager = state.agent_chat.lock().await;
+    manager
+        .send_message(&session_id, request.message)
+        .map_err(bad_request_error)?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn cancel_agent_chat(
+    State(state): State<AppState>,
+    AxumPath(session_id): AxumPath<String>,
+) -> ApiResult<serde_json::Value> {
+    let mut manager = state.agent_chat.lock().await;
+    manager.cancel(&session_id).map_err(not_found_error)?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn kill_agent_chat(
+    State(state): State<AppState>,
+    AxumPath(session_id): AxumPath<String>,
+) -> ApiResult<serde_json::Value> {
+    let mut manager = state.agent_chat.lock().await;
+    manager.kill(&session_id).map_err(not_found_error)?;
+    manager.remove(&session_id);
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn agent_chat_history(
+    State(state): State<AppState>,
+    AxumPath(session_id): AxumPath<String>,
+) -> ApiResult<Vec<crate::agent_chat::ChatMessage>> {
+    let manager = state.agent_chat.lock().await;
+    let messages = manager.history(&session_id).map_err(not_found_error)?;
+    Ok(Json(messages))
+}
+
+async fn agent_chat_ws(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    AxumPath(session_id): AxumPath<String>,
+) -> Response {
+    ws.on_upgrade(move |socket| handle_agent_chat_ws(socket, state, session_id))
+}
+
+async fn handle_agent_chat_ws(mut socket: WebSocket, state: AppState, session_id: String) {
+    // Subscribe to session events
+    let (mut event_rx, session_dto, messages) = {
+        let manager = state.agent_chat.lock().await;
+        match manager.subscribe(&session_id) {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = socket
+                    .send(Message::Text(
+                        serde_json::to_string(&crate::agent_chat::AgentChatEvent::Error {
+                            message: error,
+                        })
+                        .unwrap_or_default()
+                        .into(),
+                    ))
+                    .await;
+                return;
+            },
+        }
+    };
+
+    // Send initial snapshot with conversation history
+    let snapshot = crate::agent_chat::AgentChatEvent::Snapshot {
+        messages,
+        status: session_dto.status,
+        input_tokens: session_dto.input_tokens,
+        output_tokens: session_dto.output_tokens,
+    };
+    if let Ok(json) = serde_json::to_string(&snapshot) {
+        let _ = socket.send(Message::Text(json.into())).await;
+    }
+
+    // Stream events to client, handle client messages
+    loop {
+        tokio::select! {
+            event = event_rx.recv() => {
+                match event {
+                    Ok(chat_event) => {
+                        if let Ok(json) = serde_json::to_string(&chat_event)
+                            && socket.send(Message::Text(json.into())).await.is_err()
+                        {
+                            break;
+                        }
+                    },
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            },
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        // Client can send messages over WebSocket too
+                        if let Ok(request) = serde_json::from_str::<crate::agent_chat::SendAgentMessageRequest>(&text) {
+                            let mut manager = state.agent_chat.lock().await;
+                            let _ = manager.send_message(&session_id, request.message);
+                        }
+                    },
+                    Some(Ok(Message::Close(_))) | None => break,
+                    _ => {},
+                }
+            },
+        }
+    }
 }
 
 #[cfg(test)]

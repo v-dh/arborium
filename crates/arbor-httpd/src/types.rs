@@ -226,6 +226,7 @@ pub(crate) struct AppState {
     pub(crate) issue_service: Arc<crate::issue_provider::RepositoryIssueService>,
     pub(crate) agent_sessions: Arc<Mutex<HashMap<String, AgentSession>>>,
     pub(crate) agent_broadcast: tokio::sync::broadcast::Sender<AgentWsEvent>,
+    pub(crate) agent_chat: Arc<Mutex<crate::agent_chat::AgentChatManager>>,
     pub(crate) log_broadcast: tokio::sync::broadcast::Sender<String>,
     pub(crate) pr_cache: Arc<Mutex<HashMap<String, PrCacheEntry>>>,
     pub(crate) repo_cache: Arc<Mutex<HashMap<String, RepoCacheEntry>>>,

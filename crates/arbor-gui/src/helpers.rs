@@ -312,6 +312,13 @@ pub(crate) fn persisted_sidebar_selection_repository_root(
     }
 }
 
+pub(crate) fn preferred_startup_repository_root(
+    persisted_repository_root: Option<PathBuf>,
+    cwd_repository_root: Option<PathBuf>,
+) -> Option<PathBuf> {
+    persisted_repository_root.or(cwd_repository_root)
+}
+
 pub(crate) fn persisted_sidebar_selection_worktree_path(
     selection: Option<&ui_state_store::PersistedSidebarSelection>,
 ) -> Option<PathBuf> {
@@ -1352,6 +1359,25 @@ mod tests {
                 Some(&persisted),
             ),
             Some(PathBuf::from("/tmp/repo/new"))
+        );
+    }
+
+    #[test]
+    fn preferred_startup_repository_root_prefers_persisted_selection() {
+        assert_eq!(
+            crate::preferred_startup_repository_root(
+                Some(PathBuf::from("/tmp/saved-repo")),
+                Some(PathBuf::from("/tmp/cwd-repo")),
+            ),
+            Some(PathBuf::from("/tmp/saved-repo"))
+        );
+    }
+
+    #[test]
+    fn preferred_startup_repository_root_falls_back_to_cwd() {
+        assert_eq!(
+            crate::preferred_startup_repository_root(None, Some(PathBuf::from("/tmp/cwd-repo")),),
+            Some(PathBuf::from("/tmp/cwd-repo"))
         );
     }
 

@@ -503,9 +503,8 @@ impl ArborWindow {
         let startup_repository_root = persisted_sidebar_selection_repository_root(
             startup_ui_state.selected_sidebar_selection.as_ref(),
         );
-        let preferred_repo_root = repo_root
-            .clone()
-            .or_else(|| startup_repository_root.clone());
+        let preferred_repo_root =
+            preferred_startup_repository_root(startup_repository_root.clone(), repo_root.clone());
         let active_repository_index = if let Some(ref root) = preferred_repo_root {
             repositories
                 .iter()

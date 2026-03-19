@@ -93,8 +93,10 @@ pub(crate) struct WorktreeSummary {
     pub(crate) recent_turns: Vec<AgentTurnSnapshot>,
     pub(crate) stuck_turn_count: usize,
     pub(crate) recent_agent_sessions: Vec<arbor_core::session::AgentSessionSummary>,
+    pub(crate) recent_agent_sessions_loaded: bool,
     pub(crate) agent_state: Option<AgentState>,
     pub(crate) agent_task: Option<String>,
+    pub(crate) agent_task_loaded: bool,
     pub(crate) last_activity_unix_ms: Option<u64>,
 }
 
@@ -2429,6 +2431,7 @@ pub(crate) struct ArborWindow {
     pub(crate) _create_modal_preview_task: Option<gpui::Task<()>>,
     pub(crate) _file_tree_refresh_task: Option<gpui::Task<()>>,
     pub(crate) worktree_refresh_epoch: u64,
+    pub(crate) changed_files_refresh_epoch: u64,
     pub(crate) config_refresh_epoch: u64,
     pub(crate) repo_metadata_refresh_epoch: u64,
     pub(crate) launcher_refresh_epoch: u64,

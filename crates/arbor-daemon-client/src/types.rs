@@ -355,7 +355,10 @@ mod tests {
             metadata: None,
         };
         let json = serde_json::to_value(&dto).expect("should serialize");
-        assert!(json.get("metadata").is_none(), "metadata should be omitted when None");
+        assert!(
+            json.get("metadata").is_none(),
+            "metadata should be omitted when None"
+        );
     }
 
     #[test]

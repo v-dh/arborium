@@ -6,6 +6,7 @@ impl WorktreeSummary {
         repo_root: &Path,
         group_key: &str,
         checkout_kind: CheckoutKind,
+        include_metadata: bool,
     ) -> Self {
         let label = entry
             .path
@@ -19,9 +20,15 @@ impl WorktreeSummary {
             .map(short_branch)
             .unwrap_or_else(|| "-".to_owned());
         let is_primary_checkout = entry.path.as_path() == repo_root;
-
-        let last_activity_unix_ms = worktree::last_git_activity_ms(&entry.path);
-        let managed_processes = managed_processes_for_worktree(repo_root, &entry.path);
+        let (branch_divergence, managed_processes, last_activity_unix_ms) = if include_metadata {
+            (
+                branch_divergence_summary(&entry.path),
+                managed_processes_for_worktree(repo_root, &entry.path),
+                worktree::last_git_activity_ms(&entry.path),
+            )
+        } else {
+            (None, Vec::new(), None)
+        };
 
         Self {
             group_key: group_key.to_owned(),
@@ -36,15 +43,17 @@ impl WorktreeSummary {
             pr_number: None,
             pr_url: None,
             pr_details: None,
-            branch_divergence: branch_divergence_summary(&entry.path),
+            branch_divergence,
             diff_summary: None,
             detected_ports: Vec::new(),
             managed_processes,
             recent_turns: Vec::new(),
             stuck_turn_count: 0,
             recent_agent_sessions: Vec::new(),
+            recent_agent_sessions_loaded: false,
             agent_state: None,
             agent_task: None,
+            agent_task_loaded: false,
             last_activity_unix_ms,
         }
     }
@@ -133,8 +142,10 @@ pub(crate) mod tests {
             recent_turns: vec![],
             stuck_turn_count: 0,
             recent_agent_sessions: vec![],
+            recent_agent_sessions_loaded: true,
             agent_state: Some(AgentState::Working),
             agent_task: Some("Investigating hover".to_owned()),
+            agent_task_loaded: true,
             last_activity_unix_ms: None,
         }
     }

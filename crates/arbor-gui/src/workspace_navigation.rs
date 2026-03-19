@@ -1780,7 +1780,9 @@ impl ArborWindow {
         self.active_diff_session_id = None;
         self.sync_active_repository_from_selected_worktree();
         self.refresh_repo_config_if_changed(cx);
-        let _ = self.reload_changed_files();
+        self.changed_files.clear();
+        self.selected_changed_file = None;
+        self.refresh_changed_files(cx);
         self.sync_selected_worktree_notes(cx);
         self.expanded_dirs.clear();
         self.selected_file_tree_entry = None;
@@ -1923,40 +1925,104 @@ impl ArborWindow {
         cx.notify();
     }
 
-    pub(crate) fn reload_changed_files(&mut self) -> bool {
+    fn apply_changed_files_refresh(
+        &mut self,
+        worktree_path: &Path,
+        files: Vec<ChangedFile>,
+        notice: Option<String>,
+    ) -> bool {
         let previous_files = self.changed_files.clone();
         let previous_notice = self.notice.clone();
-        // Remote outposts don't have a local working tree to diff against.
-        if self.active_outpost_index.is_some() {
-            self.changed_files.clear();
-            self.selected_changed_file = None;
-            return self.changed_files != previous_files;
-        }
-        let Some(path) = self.selected_worktree_path() else {
-            self.changed_files.clear();
-            self.selected_changed_file = None;
-            return self.changed_files != previous_files || self.notice != previous_notice;
+        let previous_selected = self.selected_changed_file.clone();
+        let previous_summary = self
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.path == worktree_path)
+            .and_then(|worktree| worktree.diff_summary);
+        let next_summary = changes::DiffLineSummary {
+            additions: files.iter().map(|file| file.additions).sum(),
+            deletions: files.iter().map(|file| file.deletions).sum(),
         };
 
-        match changes::changed_files(path) {
-            Ok(files) => {
-                self.changed_files = files;
-                self.notice = None;
-            },
-            Err(error) => {
-                self.changed_files.clear();
-                self.notice = Some(format!("failed to load changed files with gix: {error}"));
-            },
-        }
+        self.changed_files = files;
+        self.notice = notice;
 
         self.sync_selected_changed_file();
-        self.changed_files != previous_files || self.notice != previous_notice
+        let selected_changed = self.selected_changed_file != previous_selected;
+
+        if let Some(worktree) = self
+            .worktrees
+            .iter_mut()
+            .find(|worktree| worktree.path == worktree_path)
+        {
+            let next_summary = Some(next_summary);
+            if worktree.diff_summary != next_summary {
+                worktree.diff_summary = next_summary;
+            }
+        }
+
+        self.changed_files != previous_files
+            || self.notice != previous_notice
+            || selected_changed
+            || previous_summary != Some(next_summary)
     }
 
     pub(crate) fn refresh_changed_files(&mut self, cx: &mut Context<Self>) {
-        if self.reload_changed_files() {
-            cx.notify();
+        if self.active_outpost_index.is_some() {
+            let changed = !self.changed_files.is_empty() || self.selected_changed_file.is_some();
+            self.changed_files.clear();
+            self.selected_changed_file = None;
+            if changed {
+                cx.notify();
+            }
+            return;
         }
+
+        let Some(worktree_path) = self.selected_worktree_path().map(Path::to_path_buf) else {
+            let changed = !self.changed_files.is_empty() || self.selected_changed_file.is_some();
+            self.changed_files.clear();
+            self.selected_changed_file = None;
+            if changed {
+                cx.notify();
+            }
+            return;
+        };
+
+        let next_epoch = self.changed_files_refresh_epoch.wrapping_add(1);
+        self.changed_files_refresh_epoch = next_epoch;
+        self._changed_files_refresh_task = Some(cx.spawn(async move |this, cx| {
+            let refresh_path = worktree_path.clone();
+            let result = cx
+                .background_spawn(async move {
+                    changes::changed_files(&refresh_path)
+                        .map_err(|error| format!("failed to load changed files with gix: {error}"))
+                })
+                .await;
+
+            let _ = this.update(cx, |this, cx| {
+                if this.changed_files_refresh_epoch != next_epoch {
+                    return;
+                }
+                if this.active_outpost_index.is_some()
+                    || this
+                        .selected_worktree_path()
+                        .is_none_or(|path| path != worktree_path.as_path())
+                {
+                    return;
+                }
+
+                let changed = match result {
+                    Ok(files) => this.apply_changed_files_refresh(&worktree_path, files, None),
+                    Err(error) => {
+                        this.apply_changed_files_refresh(&worktree_path, Vec::new(), Some(error))
+                    },
+                };
+
+                if changed {
+                    cx.notify();
+                }
+            });
+        }));
     }
 
     pub(crate) fn refresh_remote_changed_files(&mut self, cx: &mut Context<Self>) {

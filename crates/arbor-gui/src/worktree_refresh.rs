@@ -89,6 +89,13 @@ pub(crate) fn next_active_worktree_index(
         .or_else(|| (!worktrees.is_empty()).then_some(0))
 }
 
+fn should_refresh_full_worktree_metadata(
+    mode: WorktreeInventoryRefreshMode,
+    rows_changed: bool,
+) -> bool {
+    matches!(mode, WorktreeInventoryRefreshMode::EnsureSelectedTerminal) || rows_changed
+}
+
 impl ArborWindow {
     pub(crate) fn refresh_worktree_inventory(
         &mut self,
@@ -180,6 +187,11 @@ impl ArborWindow {
                     .map(|task| (worktree.path.clone(), task.clone()))
             })
             .collect();
+        let previous_agent_task_loaded: HashMap<PathBuf, bool> = self
+            .worktrees
+            .iter()
+            .map(|worktree| (worktree.path.clone(), worktree.agent_task_loaded))
+            .collect();
         let previous_recent_turns: HashMap<PathBuf, Vec<AgentTurnSnapshot>> = self
             .worktrees
             .iter()
@@ -203,6 +215,11 @@ impl ArborWindow {
                 )
             })
             .collect();
+        let previous_recent_agent_sessions_loaded: HashMap<PathBuf, bool> = self
+            .worktrees
+            .iter()
+            .map(|worktree| (worktree.path.clone(), worktree.recent_agent_sessions_loaded))
+            .collect();
         let previous_stuck_turn_counts: HashMap<PathBuf, usize> = self
             .worktrees
             .iter()
@@ -216,6 +233,16 @@ impl ArborWindow {
                     .last_activity_unix_ms
                     .map(|ts| (worktree.path.clone(), ts))
             })
+            .collect();
+        let previous_branch_divergence: HashMap<PathBuf, Option<BranchDivergenceSummary>> = self
+            .worktrees
+            .iter()
+            .map(|worktree| (worktree.path.clone(), worktree.branch_divergence))
+            .collect();
+        let previous_managed_processes: HashMap<PathBuf, Vec<ManagedWorktreeProcess>> = self
+            .worktrees
+            .iter()
+            .map(|worktree| (worktree.path.clone(), worktree.managed_processes.clone()))
             .collect();
         let persisted_pr_cache = self.last_persisted_ui_state.pull_request_cache.clone();
         let next_epoch = self.worktree_refresh_epoch.wrapping_add(1);
@@ -238,13 +265,14 @@ impl ArborWindow {
                                             &entry,
                                             &checkout_root.path,
                                             &repository.group_key,
-                                            if checkout_root.kind == CheckoutKind::DiscreteClone
+                                        if checkout_root.kind == CheckoutKind::DiscreteClone
                                                 && entry.path == checkout_root.path
                                             {
                                                 CheckoutKind::DiscreteClone
                                             } else {
                                                 CheckoutKind::LinkedWorktree
                                             },
+                                            mode == WorktreeInventoryRefreshMode::EnsureSelectedTerminal,
                                         ));
                                     }
                                 },
@@ -286,6 +314,10 @@ impl ArborWindow {
                 }
                 worktree.agent_state = previous_agent_states.get(&worktree.path).copied();
                 worktree.agent_task = previous_agent_tasks.get(&worktree.path).cloned();
+                worktree.agent_task_loaded = previous_agent_task_loaded
+                    .get(&worktree.path)
+                    .copied()
+                    .unwrap_or(false);
                 worktree.detected_ports = previous_detected_ports
                     .get(&worktree.path)
                     .cloned()
@@ -298,10 +330,24 @@ impl ArborWindow {
                     .get(&worktree.path)
                     .cloned()
                     .unwrap_or_default();
+                worktree.recent_agent_sessions_loaded = previous_recent_agent_sessions_loaded
+                    .get(&worktree.path)
+                    .copied()
+                    .unwrap_or(false);
                 worktree.stuck_turn_count = previous_stuck_turn_counts
                     .get(&worktree.path)
                     .copied()
                     .unwrap_or_default();
+                if mode == WorktreeInventoryRefreshMode::PreserveTerminalState && branch_unchanged {
+                    worktree.branch_divergence = previous_branch_divergence
+                        .get(&worktree.path)
+                        .copied()
+                        .unwrap_or(None);
+                    worktree.managed_processes = previous_managed_processes
+                        .get(&worktree.path)
+                        .cloned()
+                        .unwrap_or_default();
+                }
                 let previous = previous_activity.get(&worktree.path).copied();
                 worktree.last_activity_unix_ms = match (worktree.last_activity_unix_ms, previous) {
                     (Some(left), Some(right)) => Some(left.max(right)),
@@ -321,6 +367,8 @@ impl ArborWindow {
                             &next_worktrees,
                         );
                     let rows_changed = worktree_rows_changed(&this.worktrees, &next_worktrees);
+                    let refresh_full_metadata =
+                        should_refresh_full_worktree_metadata(mode, rows_changed);
                     this.worktrees = next_worktrees;
                     reconcile_worktree_agent_activity(this, false, cx);
                     this.worktree_stats_loading = this
@@ -395,8 +443,12 @@ impl ArborWindow {
                         ));
                     }
 
-                    this.refresh_worktree_diff_summaries(cx);
-                    this.refresh_worktree_ports(cx);
+                    if refresh_full_metadata || this.worktree_stats_loading {
+                        this.refresh_worktree_diff_summaries(cx);
+                    }
+                    if refresh_full_metadata {
+                        this.refresh_worktree_ports(cx);
+                    }
                     this.refresh_agent_tasks(cx);
                     this.refresh_agent_sessions(cx);
                     if should_refresh_pull_requests {
@@ -484,7 +536,7 @@ impl ArborWindow {
         let worktree_paths: Vec<PathBuf> = self
             .worktrees
             .iter()
-            .filter(|wt| wt.agent_task.is_none())
+            .filter(|wt| !wt.agent_task_loaded)
             .map(|wt| wt.path.clone())
             .collect();
         if worktree_paths.is_empty() {
@@ -507,11 +559,15 @@ impl ArborWindow {
             let _ = this.update(cx, |this, cx| {
                 let mut changed = false;
                 for (path, task) in results {
-                    if let Some(task) = task
-                        && let Some(wt) = this.worktrees.iter_mut().find(|wt| wt.path == path)
-                    {
-                        wt.agent_task = Some(task);
-                        changed = true;
+                    if let Some(wt) = this.worktrees.iter_mut().find(|wt| wt.path == path) {
+                        if wt.agent_task != task {
+                            wt.agent_task = task;
+                            changed = true;
+                        }
+                        if !wt.agent_task_loaded {
+                            wt.agent_task_loaded = true;
+                            changed = true;
+                        }
                     }
                 }
                 if changed {
@@ -526,7 +582,7 @@ impl ArborWindow {
         let worktree_paths: Vec<PathBuf> = self
             .worktrees
             .iter()
-            .filter(|worktree| worktree.recent_agent_sessions.is_empty())
+            .filter(|worktree| !worktree.recent_agent_sessions_loaded)
             .map(|worktree| worktree.path.clone())
             .collect();
         if worktree_paths.is_empty() {
@@ -553,10 +609,15 @@ impl ArborWindow {
                         .worktrees
                         .iter_mut()
                         .find(|worktree| worktree.path == path)
-                        && worktree.recent_agent_sessions != sessions
                     {
-                        worktree.recent_agent_sessions = sessions;
-                        changed = true;
+                        if worktree.recent_agent_sessions != sessions {
+                            worktree.recent_agent_sessions = sessions;
+                            changed = true;
+                        }
+                        if !worktree.recent_agent_sessions_loaded {
+                            worktree.recent_agent_sessions_loaded = true;
+                            changed = true;
+                        }
                     }
                 }
                 if changed {
@@ -657,5 +718,21 @@ mod tests {
             ),
             Some(1)
         );
+    }
+
+    #[test]
+    fn auto_refresh_only_runs_full_metadata_when_rows_change() {
+        assert!(!should_refresh_full_worktree_metadata(
+            WorktreeInventoryRefreshMode::PreserveTerminalState,
+            false,
+        ));
+        assert!(should_refresh_full_worktree_metadata(
+            WorktreeInventoryRefreshMode::PreserveTerminalState,
+            true,
+        ));
+        assert!(should_refresh_full_worktree_metadata(
+            WorktreeInventoryRefreshMode::EnsureSelectedTerminal,
+            false,
+        ));
     }
 }

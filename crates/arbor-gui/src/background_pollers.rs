@@ -133,11 +133,6 @@ impl ArborWindow {
                         cx,
                         WorktreeInventoryRefreshMode::PreserveTerminalState,
                     );
-                    if this.active_outpost_index.is_some() {
-                        this.refresh_remote_changed_files(cx);
-                    } else {
-                        this.refresh_changed_files(cx);
-                    }
                     if refresh.visible_change() {
                         cx.notify();
                     }

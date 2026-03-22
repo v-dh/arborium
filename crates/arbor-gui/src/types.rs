@@ -80,6 +80,12 @@ pub(crate) struct TerminalFontMetrics {
     pub(crate) diff_cell_width: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminalTextInputFollowup {
+    ConvertControlByte(u8),
+    SuppressControlByte(u8),
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct WorktreeSummary {
     pub(crate) group_key: String,
@@ -532,6 +538,7 @@ impl Default for DaemonTerminalCachedSnapshot {
 pub(crate) struct DaemonTerminalWsState {
     pub(crate) event_generation: AtomicU64,
     pub(crate) snapshot_generation: AtomicU64,
+    pub(crate) emulator_generation: AtomicU64,
     pub(crate) snapshot_refresh_requested: AtomicBool,
     pub(crate) snapshot_build_in_flight: AtomicBool,
     pub(crate) snapshot_build_pending: AtomicBool,
@@ -568,6 +575,7 @@ impl DaemonTerminalWsState {
         Self {
             event_generation: AtomicU64::new(0),
             snapshot_generation: AtomicU64::new(0),
+            emulator_generation: AtomicU64::new(0),
             snapshot_refresh_requested: AtomicBool::new(false),
             snapshot_build_in_flight: AtomicBool::new(false),
             snapshot_build_pending: AtomicBool::new(false),
@@ -602,6 +610,14 @@ impl DaemonTerminalWsState {
 
     pub(crate) fn event_generation(&self) -> u64 {
         self.event_generation.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn note_emulator_mutation(&self) -> u64 {
+        self.emulator_generation.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    pub(crate) fn emulator_generation(&self) -> u64 {
+        self.emulator_generation.load(Ordering::Acquire)
     }
 
     pub(crate) fn request_snapshot_refresh(&self) {
@@ -697,6 +713,7 @@ impl DaemonTerminalWsState {
             };
             *emulator = arbor_terminal_emulator::TerminalEmulator::with_size(rows, cols);
             emulator.process(ansi_output.as_bytes());
+            self.note_emulator_mutation();
             let mut snapshot = emulator.snapshot_tail(daemon_terminal_ws_max_lines());
             snapshot.exit_code = exit_code;
             snapshot
@@ -727,6 +744,7 @@ impl DaemonTerminalWsState {
                 Err(poisoned) => poisoned.into_inner(),
             };
             emulator.process(bytes);
+            self.note_emulator_mutation();
 
             self.should_inline_output_snapshot(bytes.len())
                 .then(|| emulator.snapshot_tail(daemon_terminal_ws_max_lines()))
@@ -784,6 +802,7 @@ impl DaemonTerminalWsState {
                 Err(poisoned) => poisoned.into_inner(),
             };
             emulator.resize(rows, cols);
+            self.note_emulator_mutation();
             emulator.snapshot_tail(daemon_terminal_ws_max_lines())
         };
 
@@ -2734,7 +2753,7 @@ pub(crate) struct ArborWindow {
     pub(crate) quit_overlay_until: Option<Instant>,
     pub(crate) quit_after_persistence_flush: bool,
     pub(crate) ime_marked_text: Option<String>,
-    pub(crate) pending_terminal_text_input_fallback: Option<Vec<u8>>,
+    pub(crate) pending_terminal_text_input_fallback: Option<TerminalTextInputFollowup>,
     pub(crate) welcome_clone_url: String,
     pub(crate) welcome_clone_url_cursor: usize,
     pub(crate) welcome_clone_url_active: bool,

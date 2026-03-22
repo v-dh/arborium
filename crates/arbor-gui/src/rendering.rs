@@ -118,13 +118,20 @@ impl EntityInputHandler for ArborWindow {
         let Some(session_id) = self.active_terminal_id_for_selected_worktree() else {
             return;
         };
-        if let Some(input) = self.take_terminal_text_input_fallback(text) {
-            if let Err(error) = self.write_input_to_terminal(session_id, &input) {
-                self.notice = Some(format!("failed to write to terminal: {error}"));
-                cx.notify();
-                return;
+        if let Some(followup) = self.resolve_terminal_text_input_followup(text) {
+            match followup {
+                terminal_interaction::TerminalTextInputFollowupResult::Convert(control_byte) => {
+                    if let Err(error) = self.write_input_to_terminal(session_id, &[control_byte]) {
+                        self.notice = Some(format!("failed to write to terminal: {error}"));
+                        cx.notify();
+                        return;
+                    }
+                    self.notify_after_terminal_input(session_id, cx);
+                },
+                terminal_interaction::TerminalTextInputFollowupResult::Suppress => {
+                    self.notify_after_terminal_input(session_id, cx);
+                },
             }
-            self.notify_after_terminal_input(session_id, cx);
             return;
         }
         self.append_text_to_pending_input_buffers(session_id, text);

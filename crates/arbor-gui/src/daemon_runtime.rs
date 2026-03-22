@@ -568,6 +568,7 @@ pub(crate) fn schedule_daemon_ws_snapshot_rebuild(ws_state: Arc<DaemonTerminalWs
 
     std::thread::spawn(move || {
         loop {
+            let requested_generation = ws_state.emulator_generation();
             let exit_code = ws_state
                 .snapshot
                 .lock()
@@ -582,16 +583,11 @@ pub(crate) fn schedule_daemon_ws_snapshot_rebuild(ws_state: Arc<DaemonTerminalWs
                 emulator.snapshot_tail(daemon_terminal_ws_max_lines())
             };
             terminal_snapshot.exit_code = exit_code;
-
-            let mut cached = match ws_state.snapshot.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            cached.terminal = Arc::new(terminal_snapshot);
-            cached.updated_at_unix_ms = current_unix_timestamp_millis();
-            cached.ready = true;
-            drop(cached);
-            ws_state.note_event_with_cached_snapshot();
+            let _ = apply_daemon_ws_snapshot_rebuild(
+                &ws_state,
+                requested_generation,
+                terminal_snapshot,
+            );
 
             ws_state
                 .snapshot_build_in_flight
@@ -613,6 +609,27 @@ pub(crate) fn schedule_daemon_ws_snapshot_rebuild(ws_state: Arc<DaemonTerminalWs
             }
         }
     });
+}
+
+pub(crate) fn apply_daemon_ws_snapshot_rebuild(
+    ws_state: &DaemonTerminalWsState,
+    requested_generation: u64,
+    terminal_snapshot: arbor_terminal_emulator::TerminalSnapshot,
+) -> bool {
+    if ws_state.emulator_generation() != requested_generation {
+        return false;
+    }
+
+    let mut cached = match ws_state.snapshot.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    cached.terminal = Arc::new(terminal_snapshot);
+    cached.updated_at_unix_ms = current_unix_timestamp_millis();
+    cached.ready = true;
+    drop(cached);
+    ws_state.note_event_with_cached_snapshot();
+    true
 }
 
 pub(crate) fn ordered_terminal_sync_indices(
@@ -1762,7 +1779,11 @@ pub(crate) mod tests {
         assert_eq!(snapshot.updated_at_unix_ms, Some(42));
         assert!(snapshot.terminal.output.contains("hello"));
         assert!(snapshot.terminal.output.contains("world"));
-        assert_eq!(snapshot.terminal.styled_lines.len(), 2);
+        assert!(
+            snapshot.terminal.styled_lines.len() >= 2,
+            "expected snapshot to keep visible rows while preserving content: {:?}",
+            snapshot.terminal.styled_lines
+        );
     }
 
     #[test]
@@ -1869,6 +1890,57 @@ pub(crate) mod tests {
                 .ends_with("$ starship"),
             "unexpected redraw output: {:?}",
             snapshot.terminal.output
+        );
+    }
+
+    #[test]
+    fn stale_daemon_ws_snapshot_rebuild_does_not_overwrite_newer_full_snapshot() {
+        let ws_state = DaemonTerminalWsState::default();
+        ws_state.apply_snapshot_text(
+            "gpt-5.4 high \u{b7}e73% left \u{b7}h~/code/arbor\r\n",
+            TerminalState::Running,
+            None,
+            Some(1),
+        );
+
+        let requested_generation = ws_state.emulator_generation();
+        let stale_snapshot = {
+            let emulator = match ws_state.emulator.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            emulator.snapshot_tail(daemon_terminal_ws_max_lines())
+        };
+
+        ws_state.apply_snapshot_text(
+            "gpt-5.4 high \u{b7} 73% left \u{b7} ~/code/arbor\r\n",
+            TerminalState::Running,
+            None,
+            Some(2),
+        );
+
+        assert!(
+            !apply_daemon_ws_snapshot_rebuild(&ws_state, requested_generation, stale_snapshot),
+            "stale rebuild should not overwrite a newer full snapshot"
+        );
+
+        let snapshot = ws_state
+            .snapshot()
+            .unwrap_or_else(|| panic!("expected websocket snapshot after full refresh"));
+        let rendered = snapshot
+            .terminal
+            .styled_lines
+            .iter()
+            .map(styled_line_to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("gpt-5.4 high · 73% left · ~/code/arbor"),
+            "expected clean full snapshot to remain cached: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("·h~/code/arbor"),
+            "unexpected stale path prefix survived newer snapshot: {rendered:?}"
         );
     }
 

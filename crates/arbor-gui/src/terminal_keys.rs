@@ -88,27 +88,26 @@ pub fn terminal_bytes_from_keystroke(
     to_esc_str(keystroke, modes).map(|value| value.into_owned().into_bytes())
 }
 
-pub fn terminal_text_input_fallback_bytes(keystroke: &Keystroke) -> Option<Vec<u8>> {
+pub fn terminal_text_input_fallback_control_byte(keystroke: &Keystroke) -> Option<u8> {
     if keystroke.modifiers.platform || keystroke.modifiers.alt || keystroke.modifiers.function {
         return None;
     }
 
     let key = normalized_key(keystroke);
-    if !keystroke.modifiers.control && control_byte_for_key(key).is_none() {
+    if !keystroke.modifiers.control && !looks_like_control_text(key) {
         return None;
     }
 
-    control_byte_for_key(key).map(|byte| vec![byte])
+    control_byte_for_key(key)
 }
 
-pub fn text_matches_terminal_input_fallback(text: &str, input: &[u8]) -> bool {
-    if text.is_empty() || input.len() != 1 {
+pub fn text_matches_terminal_input_fallback(text: &str, control_byte: u8) -> bool {
+    if text.is_empty() {
         return false;
     }
 
-    let byte = input[0];
-    text.as_bytes() == input
-        || control_caret_notation(byte).is_some_and(|candidate| candidate == text)
+    text.as_bytes() == [control_byte]
+        || control_caret_notation(control_byte).is_some_and(|candidate| candidate == text)
 }
 
 fn to_esc_str(keystroke: &Keystroke, modes: TerminalModes) -> Option<Cow<'static, str>> {
@@ -285,6 +284,10 @@ fn normalized_key(keystroke: &Keystroke) -> &str {
     }
 }
 
+fn looks_like_control_text(key: &str) -> bool {
+    key.starts_with('^') || key.chars().next().is_some_and(|ch| ch.is_control())
+}
+
 fn control_byte_for_key(key: &str) -> Option<u8> {
     match key {
         "a" | "A" | "^A" | "\u{1}" => Some(0x01),
@@ -384,7 +387,7 @@ mod tests {
             terminal_backend::TerminalModes,
             terminal_keys::{
                 TerminalPlatformCommand, modifier_code, platform_command_for_keystroke,
-                terminal_bytes_from_keystroke, terminal_text_input_fallback_bytes,
+                terminal_bytes_from_keystroke, terminal_text_input_fallback_control_byte,
                 text_matches_terminal_input_fallback,
             },
         },
@@ -566,17 +569,23 @@ mod tests {
     fn ctrl_a_can_queue_text_input_fallback_bytes() {
         let ctrl_a = parse_keystroke("ctrl-a");
         assert_eq!(
-            terminal_text_input_fallback_bytes(&ctrl_a),
-            Some(vec![0x01])
+            terminal_text_input_fallback_control_byte(&ctrl_a),
+            Some(0x01)
         );
     }
 
     #[test]
     fn text_input_fallback_matches_caret_notation_and_raw_control_text() {
-        assert!(text_matches_terminal_input_fallback("^A", &[0x01]));
-        assert!(text_matches_terminal_input_fallback("\u{1}", &[0x01]));
-        assert!(text_matches_terminal_input_fallback("^K", &[0x0b]));
-        assert!(!text_matches_terminal_input_fallback("^A", &[0x05]));
-        assert!(!text_matches_terminal_input_fallback("a", &[0x01]));
+        assert!(text_matches_terminal_input_fallback("^A", 0x01));
+        assert!(text_matches_terminal_input_fallback("\u{1}", 0x01));
+        assert!(text_matches_terminal_input_fallback("^K", 0x0b));
+        assert!(!text_matches_terminal_input_fallback("^A", 0x05));
+        assert!(!text_matches_terminal_input_fallback("a", 0x01));
+    }
+
+    #[test]
+    fn plain_text_does_not_queue_control_input_fallback() {
+        let plain_a = parse_keystroke("a");
+        assert_eq!(terminal_text_input_fallback_control_byte(&plain_a), None);
     }
 }

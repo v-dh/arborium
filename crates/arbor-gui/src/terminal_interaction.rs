@@ -4,20 +4,55 @@ pub(crate) fn should_queue_terminal_input(session: &TerminalSession) -> bool {
     session.runtime.is_none() && session.is_initializing
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminalTextInputFollowupResult {
+    Convert(u8),
+    Suppress,
+}
+
 pub(crate) fn terminal_input_unavailable_error(session: &TerminalSession) -> TerminalError {
     TerminalError::Pty(format!("terminal `{}` is not available", session.title))
 }
 
+fn resolve_terminal_text_input_followup(
+    pending: TerminalTextInputFollowup,
+    text: &str,
+) -> Option<TerminalTextInputFollowupResult> {
+    match pending {
+        TerminalTextInputFollowup::ConvertControlByte(control_byte) => {
+            terminal_keys::text_matches_terminal_input_fallback(text, control_byte)
+                .then_some(TerminalTextInputFollowupResult::Convert(control_byte))
+        },
+        TerminalTextInputFollowup::SuppressControlByte(control_byte) => {
+            terminal_keys::text_matches_terminal_input_fallback(text, control_byte)
+                .then_some(TerminalTextInputFollowupResult::Suppress)
+        },
+    }
+}
+
 impl ArborWindow {
+    fn set_terminal_text_input_followup(&mut self, followup: Option<TerminalTextInputFollowup>) {
+        self.pending_terminal_text_input_fallback = followup;
+    }
+
+    fn suppress_terminal_text_input_for_control_byte(&mut self, control_byte: u8) {
+        self.set_terminal_text_input_followup(Some(
+            TerminalTextInputFollowup::SuppressControlByte(control_byte),
+        ));
+    }
+
+    pub(crate) fn resolve_terminal_text_input_followup(
+        &mut self,
+        text: &str,
+    ) -> Option<TerminalTextInputFollowupResult> {
+        let pending = self.pending_terminal_text_input_fallback.take()?;
+        resolve_terminal_text_input_followup(pending, text)
+    }
+
     pub(crate) fn request_terminal_scroll_to_bottom(&mut self) {
         self.terminal_scroll_handle.scroll_to_bottom();
         self.terminal_follow_output_until =
             Some(Instant::now() + TERMINAL_OUTPUT_FOLLOW_LOCK_DURATION);
-    }
-
-    pub(crate) fn take_terminal_text_input_fallback(&mut self, text: &str) -> Option<Vec<u8>> {
-        let pending = self.pending_terminal_text_input_fallback.take()?;
-        terminal_keys::text_matches_terminal_input_fallback(text, &pending).then_some(pending)
     }
 
     fn send_terminal_action_input(
@@ -42,6 +77,7 @@ impl ArborWindow {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.suppress_terminal_text_input_for_control_byte(0x01);
         if let Err(error) = self.send_terminal_action_input(b"\x01", cx) {
             self.notice = Some(format!("failed to write to terminal: {error}"));
             cx.notify();
@@ -54,6 +90,7 @@ impl ArborWindow {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.suppress_terminal_text_input_for_control_byte(0x05);
         if let Err(error) = self.send_terminal_action_input(b"\x05", cx) {
             self.notice = Some(format!("failed to write to terminal: {error}"));
             cx.notify();
@@ -66,6 +103,7 @@ impl ArborWindow {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.suppress_terminal_text_input_for_control_byte(0x0b);
         if let Err(error) = self.send_terminal_action_input(b"\x0b", cx) {
             self.notice = Some(format!("failed to write to terminal: {error}"));
             cx.notify();
@@ -78,6 +116,7 @@ impl ArborWindow {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.suppress_terminal_text_input_for_control_byte(0x1a);
         if let Err(error) = self.send_terminal_action_input(b"\x1a", cx) {
             self.notice = Some(format!("failed to write to terminal: {error}"));
             cx.notify();
@@ -556,19 +595,26 @@ impl ArborWindow {
         self.clear_terminal_selection_for_session(active_terminal_id);
 
         let terminal_modes = self.terminal_modes_for_session(active_terminal_id);
+        let control_fallback =
+            terminal_keys::terminal_text_input_fallback_control_byte(&event.keystroke);
 
         let Some(input) =
             terminal_keys::terminal_bytes_from_keystroke(&event.keystroke, terminal_modes)
         else {
-            self.pending_terminal_text_input_fallback =
-                terminal_keys::terminal_text_input_fallback_bytes(&event.keystroke);
+            self.set_terminal_text_input_followup(
+                control_fallback.map(TerminalTextInputFollowup::ConvertControlByte),
+            );
             // No bytes for this key — let the event propagate to the IME /
             // InputHandler so composed characters arrive via
             // `replace_text_in_range`.
             return;
         };
 
-        self.pending_terminal_text_input_fallback = None;
+        self.set_terminal_text_input_followup(
+            control_fallback
+                .filter(|control_byte| input.as_slice() == [*control_byte])
+                .map(TerminalTextInputFollowup::SuppressControlByte),
+        );
         self.track_terminal_command_input(active_terminal_id, &event.keystroke);
         let write_failed =
             if let Err(error) = self.write_input_to_terminal(active_terminal_id, &input) {
@@ -601,6 +647,39 @@ impl ArborWindow {
 #[allow(clippy::expect_used)]
 mod tests {
     use {super::*, crate::daemon_runtime::session_with_styled_line, std::sync::Arc};
+
+    #[test]
+    fn convert_followup_returns_control_byte_for_matching_caret_text() {
+        assert_eq!(
+            resolve_terminal_text_input_followup(
+                TerminalTextInputFollowup::ConvertControlByte(0x01),
+                "^A",
+            ),
+            Some(TerminalTextInputFollowupResult::Convert(0x01))
+        );
+    }
+
+    #[test]
+    fn suppress_followup_drops_matching_control_text() {
+        assert_eq!(
+            resolve_terminal_text_input_followup(
+                TerminalTextInputFollowup::SuppressControlByte(0x1a),
+                "^Z",
+            ),
+            Some(TerminalTextInputFollowupResult::Suppress)
+        );
+    }
+
+    #[test]
+    fn mismatched_text_does_not_match_pending_followup() {
+        assert_eq!(
+            resolve_terminal_text_input_followup(
+                TerminalTextInputFollowup::SuppressControlByte(0x01),
+                "a",
+            ),
+            None
+        );
+    }
 
     #[test]
     fn terminal_input_buffers_only_while_session_is_initializing() {

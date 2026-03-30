@@ -814,7 +814,7 @@ fn read_gh_hosts_token(host: &str) -> Option<String> {
 
 /// Runs `gh auth token` to retrieve the token from the system keyring.
 fn read_gh_auth_token() -> Option<String> {
-    let output = std::process::Command::new("gh")
+    let output = crate::create_command("gh")
         .args(["auth", "token"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())

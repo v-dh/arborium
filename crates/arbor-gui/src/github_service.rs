@@ -751,8 +751,9 @@ pub fn default_github_service() -> Arc<dyn GitHubService> {
 
 /// Reads the GitHub access token from the `gh` CLI's stored credentials.
 ///
-/// Checks `GH_TOKEN` environment variable first, then reads the
-/// `~/.config/gh/hosts.yml` config file for an `oauth_token` entry.
+/// Checks (in order): `GH_TOKEN` env var, `~/.config/gh/hosts.yml`
+/// `oauth_token` field, and finally `gh auth token` (for keyring-backed
+/// installs on macOS).
 pub fn github_access_token_from_gh_cli() -> Option<String> {
     // GH_TOKEN is the primary env var used by the `gh` CLI itself.
     if let Ok(val) = std::env::var("GH_TOKEN") {
@@ -762,7 +763,13 @@ pub fn github_access_token_from_gh_cli() -> Option<String> {
         }
     }
 
-    read_gh_hosts_token("github.com")
+    if let Some(token) = read_gh_hosts_token("github.com") {
+        return Some(token);
+    }
+
+    // On macOS, `gh` stores tokens in the system keyring by default.
+    // Fall back to asking `gh auth token` to retrieve it.
+    read_gh_auth_token()
 }
 
 /// Reads the `oauth_token` for the given host from the `gh` CLI config file
@@ -803,6 +810,26 @@ fn read_gh_hosts_token(host: &str) -> Option<String> {
     }
 
     None
+}
+
+/// Runs `gh auth token` to retrieve the token from the system keyring.
+fn read_gh_auth_token() -> Option<String> {
+    let output = std::process::Command::new("gh")
+        .args(["auth", "token"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let token = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token)
+    }
 }
 
 pub(crate) fn resolve_pull_request_for_review(

@@ -1,4 +1,4 @@
-use super::*;
+use {super::*, crate::github_service::github_access_token_from_gh_cli};
 
 impl ArborWindow {
     pub(crate) fn open_commit_modal(&mut self, cx: &mut Context<Self>) {
@@ -805,11 +805,21 @@ pub(crate) fn run_git_push_for_worktree(worktree_path: &Path) -> Result<String, 
         .find_remote("origin")
         .map_err(|error| GitError::Operation(format!("failed to find remote 'origin': {error}")))?;
 
+    let github_token = github_access_token_from_gh_cli();
+
     let mut callbacks = git2::RemoteCallbacks::new();
-    callbacks.credentials(|_url, username_from_url, allowed_types| {
+    callbacks.credentials(move |_url, username_from_url, allowed_types| {
         if allowed_types.contains(git2::CredentialType::SSH_KEY) {
             let username = username_from_url.unwrap_or("git");
             git2::Cred::ssh_key_from_agent(username)
+        } else if allowed_types.contains(git2::CredentialType::USER_PASS_PLAINTEXT) {
+            if let Some(ref token) = github_token {
+                git2::Cred::userpass_plaintext("x-access-token", token)
+            } else {
+                Err(git2::Error::from_str(
+                    "HTTPS push requires a GitHub token (set GH_TOKEN or run `gh auth login`)",
+                ))
+            }
         } else if allowed_types.contains(git2::CredentialType::DEFAULT) {
             git2::Cred::default()
         } else {

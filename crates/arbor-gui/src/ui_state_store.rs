@@ -34,6 +34,12 @@ pub struct UiState {
     /// Selected left-pane subtab per repository group.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub repository_sidebar_tabs: HashMap<String, RepositorySidebarTab>,
+    /// Custom sidebar repository groups (ordered).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub custom_repo_groups: Vec<PersistedCustomRepoGroup>,
+    /// Collapsed custom group IDs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collapsed_custom_group_ids: Vec<String>,
     pub selected_sidebar_selection: Option<PersistedSidebarSelection>,
     pub right_pane_tab: Option<PersistedRightPaneTab>,
     pub logs_tab_open: Option<bool>,
@@ -66,6 +72,13 @@ pub enum PersistedRightPaneTab {
     FileTree,
     Procfile,
     Notes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedCustomRepoGroup {
+    pub id: String,
+    pub label: String,
+    pub repo_group_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -173,8 +186,8 @@ fn home_dir() -> PathBuf {
 mod tests {
     use {
         super::{
-            CachedPullRequestState, JsonUiStateStore, PersistedRightPaneTab,
-            PersistedSidebarSelection, UiState, UiStateStore,
+            CachedPullRequestState, JsonUiStateStore, PersistedCustomRepoGroup,
+            PersistedRightPaneTab, PersistedSidebarSelection, UiState, UiStateStore,
         },
         crate::{
             RepositorySidebarTab,
@@ -309,6 +322,44 @@ mod tests {
         assert_eq!(loaded.right_pane_tab, state.right_pane_tab);
         assert_eq!(loaded.logs_tab_open, state.logs_tab_open);
         assert_eq!(loaded.logs_tab_active, state.logs_tab_active);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn json_ui_state_store_round_trips_custom_repo_groups() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        let path = env::temp_dir().join(format!("arbor-ui-state-groups-{unique}.json"));
+        let store = JsonUiStateStore::new(path.clone());
+
+        let state = UiState {
+            custom_repo_groups: vec![
+                PersistedCustomRepoGroup {
+                    id: "group-1".to_owned(),
+                    label: "Work".to_owned(),
+                    repo_group_keys: vec!["repo-a".to_owned(), "repo-b".to_owned()],
+                },
+                PersistedCustomRepoGroup {
+                    id: "group-2".to_owned(),
+                    label: "Personal".to_owned(),
+                    repo_group_keys: vec!["repo-c".to_owned()],
+                },
+            ],
+            collapsed_custom_group_ids: vec!["group-2".to_owned()],
+            ..UiState::default()
+        };
+
+        store.save(&state).expect("save ui state");
+        let loaded = store.load().expect("load ui state");
+
+        assert_eq!(loaded.custom_repo_groups, state.custom_repo_groups);
+        assert_eq!(
+            loaded.collapsed_custom_group_ids,
+            state.collapsed_custom_group_ids
+        );
 
         let _ = fs::remove_file(path);
     }

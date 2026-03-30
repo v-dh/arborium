@@ -553,6 +553,12 @@ impl ArborWindow {
             return;
         }
 
+        if self.renaming_group_id.is_some() {
+            // Inline group rename is active — let keys propagate to the global
+            // handler instead of feeding them to the terminal.
+            return;
+        }
+
         if self.new_tab_menu_position.is_some() {
             if event.keystroke.key.as_str() == "escape" {
                 self.new_tab_menu_position = None;

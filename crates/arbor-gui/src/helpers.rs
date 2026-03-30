@@ -519,6 +519,22 @@ pub(crate) fn text_edit_action_for_event(
 // Syntax highlighting
 // ---------------------------------------------------------------------------
 
+/// Map extensions not in syntect's default bundle to a compatible built-in grammar.
+fn resolve_syntax_extension(ext: &str) -> &str {
+    match ext {
+        "ts" | "tsx" | "mts" | "cts" | "jsx" | "mjs" | "cjs" => "js",
+        "toml" | "lock" => "yaml",
+        "dockerfile" | "containerfile" => "sh",
+        "zsh" | "fish" => "sh",
+        "svelte" | "vue" => "html",
+        "scss" | "less" | "sass" => "css",
+        "kt" | "kts" => "java",
+        "swift" => "go",
+        "zig" => "rust",
+        other => other,
+    }
+}
+
 pub(crate) fn highlight_lines_with_syntect(
     raw_lines: &[String],
     ext: &str,
@@ -527,7 +543,11 @@ pub(crate) fn highlight_lines_with_syntect(
     let syntax_set = SyntaxSet::load_defaults_newlines();
     let theme_set = ThemeSet::load_defaults();
     let theme = &theme_set.themes["base16-ocean.dark"];
-    if let Some(syntax) = syntax_set.find_syntax_by_extension(ext) {
+    let resolved_ext = resolve_syntax_extension(ext);
+    if let Some(syntax) = syntax_set
+        .find_syntax_by_extension(resolved_ext)
+        .or_else(|| syntax_set.find_syntax_by_extension(ext))
+    {
         let mut highlighter = HighlightLines::new(syntax, theme);
         raw_lines
             .iter()
@@ -1176,6 +1196,24 @@ pub(crate) fn collapsed_repository_indices_from_group_keys(
             collapsed_group_keys
                 .contains(repository.group_key.as_str())
                 .then_some(index)
+        })
+        .collect()
+}
+
+/// Returns the canonical indices of repositories not assigned to any custom group.
+pub(crate) fn ungrouped_repository_indices(
+    repositories: &[RepositorySummary],
+    custom_repo_groups: &[CustomRepoGroup],
+) -> Vec<usize> {
+    let grouped_keys: HashSet<&str> = custom_repo_groups
+        .iter()
+        .flat_map(|g| g.repo_group_keys.iter().map(String::as_str))
+        .collect();
+    repositories
+        .iter()
+        .enumerate()
+        .filter_map(|(index, repo)| {
+            (!grouped_keys.contains(repo.group_key.as_str())).then_some(index)
         })
         .collect()
 }

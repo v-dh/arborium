@@ -11,6 +11,36 @@ impl ArborWindow {
             return;
         }
 
+        // ── Inline group rename ──
+        if self.renaming_group_id.is_some() {
+            match event.keystroke.key.as_str() {
+                "escape" => {
+                    self.renaming_group_id = None;
+                    self.renaming_group_text.clear();
+                    self.renaming_group_cursor = 0;
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                },
+                "enter" | "return" => {
+                    self.commit_group_rename(cx);
+                    cx.stop_propagation();
+                    return;
+                },
+                _ => {},
+            }
+            if let Some(action) = text_edit_action_for_event(event, cx) {
+                apply_text_edit_action(
+                    &mut self.renaming_group_text,
+                    &mut self.renaming_group_cursor,
+                    &action,
+                );
+                cx.notify();
+                cx.stop_propagation();
+            }
+            return;
+        }
+
         if self.welcome_clone_url_active {
             match event.keystroke.key.as_str() {
                 "escape" => {
@@ -302,8 +332,21 @@ impl ArborWindow {
                     cx.stop_propagation();
                     return;
                 },
-                "enter" | "return" => {
+                "enter" | "return" if event.keystroke.modifiers.platform => {
                     self.submit_commit_modal(cx);
+                    cx.stop_propagation();
+                    return;
+                },
+                "enter" | "return" => {
+                    if let Some(modal) = self.commit_modal.as_mut() {
+                        apply_text_edit_action(
+                            &mut modal.message,
+                            &mut modal.message_cursor,
+                            &TextEditAction::Insert("\n".to_owned()),
+                        );
+                        modal.error = None;
+                    }
+                    cx.notify();
                     cx.stop_propagation();
                     return;
                 },

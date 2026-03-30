@@ -6,7 +6,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [[bin]]
-name = "Arbor"
+name = "Arborium"
 path = "src/main.rs"
 
 [features]

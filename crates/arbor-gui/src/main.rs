@@ -173,7 +173,7 @@ fn main() {
         Registry::default().with(in_memory_layer).init();
     }
 
-    tracing::info!("Arbor starting");
+    tracing::info!("Arborium starting");
     if let Some(path) = terminal_debug_log_path {
         tracing::info!(path = %path.display(), "terminal debug logs enabled");
     }

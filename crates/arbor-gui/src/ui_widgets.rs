@@ -516,6 +516,82 @@ pub(crate) fn visible_input_segments(
     (before, after)
 }
 
+pub(crate) fn multiline_input_display(
+    theme: ThemePalette,
+    value: &str,
+    placeholder: &str,
+    text_color: u32,
+    cursor: usize,
+) -> AnyElement {
+    if value.is_empty() {
+        return div()
+            .relative()
+            .child(
+                div()
+                    .text_color(rgb(text_color))
+                    .opacity(0.5)
+                    .child(placeholder.to_owned()),
+            )
+            .child(input_caret(theme).absolute().left(px(0.)).top(px(2.)))
+            .into_any_element();
+    }
+
+    let chars: Vec<char> = value.chars().collect();
+    let cursor = cursor.min(chars.len());
+    let before: String = chars[..cursor].iter().collect();
+    let after: String = chars[cursor..].iter().collect();
+
+    // Split into lines, rendering the caret at the cursor position.
+    // We build a column of lines; the line containing the cursor gets the
+    // caret inserted inline between `before` and `after`.
+    let before_lines: Vec<&str> = before.split('\n').collect();
+    let after_lines: Vec<&str> = after.split('\n').collect();
+
+    let mut container = div().flex().flex_col();
+
+    // Lines entirely before the cursor line
+    for line in &before_lines[..before_lines.len() - 1] {
+        container = container.child(div().text_color(rgb(text_color)).child(if line.is_empty() {
+            "\u{00A0}".to_owned() // non-breaking space to preserve empty lines
+        } else {
+            line.to_string()
+        }));
+    }
+
+    // The cursor line: last segment of `before` + caret + first segment of `after`
+    let cursor_line_before = before_lines.last().copied().unwrap_or("");
+    let cursor_line_after = after_lines.first().copied().unwrap_or("");
+    container = container.child(
+        div()
+            .flex()
+            .items_center()
+            .child(
+                div()
+                    .flex_none()
+                    .text_color(rgb(text_color))
+                    .child(cursor_line_before.to_owned()),
+            )
+            .child(input_caret(theme).flex_none())
+            .child(
+                div()
+                    .flex_none()
+                    .text_color(rgb(text_color))
+                    .child(cursor_line_after.to_owned()),
+            ),
+    );
+
+    // Lines entirely after the cursor line
+    for line in &after_lines[1..] {
+        container = container.child(div().text_color(rgb(text_color)).child(if line.is_empty() {
+            "\u{00A0}".to_owned()
+        } else {
+            line.to_string()
+        }));
+    }
+
+    container.into_any_element()
+}
+
 pub(crate) fn input_caret(theme: ThemePalette) -> Div {
     div().w(px(1.)).h(px(14.)).bg(rgb(theme.accent)).mt(px(1.))
 }

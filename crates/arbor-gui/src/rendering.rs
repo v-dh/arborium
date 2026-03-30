@@ -84,7 +84,11 @@ impl EntityInputHandler for ArborWindow {
             return;
         }
         if let Some(ref mut modal) = self.commit_modal {
-            modal.message.push_str(text);
+            apply_text_edit_action(
+                &mut modal.message,
+                &mut modal.message_cursor,
+                &TextEditAction::Insert(text.to_owned()),
+            );
             modal.error = None;
             cx.notify();
             return;
@@ -329,6 +333,7 @@ impl Render for ArborWindow {
             .child(self.render_github_auth_modal(cx))
             .child(self.render_new_tab_menu(cx))
             .child(self.render_repository_context_menu(cx))
+            .child(self.render_group_context_menu(cx))
             .child(self.render_worktree_context_menu(cx))
             .child(self.render_worktree_hover_popover(cx))
             .child(self.render_outpost_context_menu(cx))

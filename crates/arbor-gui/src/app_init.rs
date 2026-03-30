@@ -154,6 +154,20 @@ impl ArborWindow {
                     &repositories,
                     &startup_collapsed_repository_groups,
                 );
+                let custom_repo_groups: Vec<CustomRepoGroup> = startup_ui_state
+                    .custom_repo_groups
+                    .iter()
+                    .map(|pg| CustomRepoGroup {
+                        id: pg.id.clone(),
+                        label: pg.label.clone(),
+                        repo_group_keys: pg.repo_group_keys.clone(),
+                    })
+                    .collect();
+                let collapsed_custom_groups: HashSet<String> = startup_ui_state
+                    .collapsed_custom_group_ids
+                    .iter()
+                    .cloned()
+                    .collect();
                 let startup_issue_lists =
                     issue_cache_store::issue_lists_from_cache(&repositories, &startup_issue_cache);
                 let (terminal_poll_tx, terminal_poll_rx) = std::sync::mpsc::channel();
@@ -329,6 +343,12 @@ impl ArborWindow {
                     selected_file_tree_entry: None,
                     left_pane_visible: true,
                     collapsed_repositories,
+                    custom_repo_groups,
+                    collapsed_custom_groups,
+                    group_context_menu: None,
+                    renaming_group_id: None,
+                    renaming_group_text: String::new(),
+                    renaming_group_cursor: 0,
                     agent_chat_sessions: Vec::new(),
                     active_agent_chat_by_worktree: HashMap::new(),
                     next_agent_chat_id: 1,
@@ -624,6 +644,20 @@ impl ArborWindow {
             &repositories,
             &startup_collapsed_repository_groups,
         );
+        let custom_repo_groups: Vec<CustomRepoGroup> = startup_ui_state
+            .custom_repo_groups
+            .iter()
+            .map(|pg| CustomRepoGroup {
+                id: pg.id.clone(),
+                label: pg.label.clone(),
+                repo_group_keys: pg.repo_group_keys.clone(),
+            })
+            .collect();
+        let collapsed_custom_groups: HashSet<String> = startup_ui_state
+            .collapsed_custom_group_ids
+            .iter()
+            .cloned()
+            .collect();
         let startup_issue_lists =
             issue_cache_store::issue_lists_from_cache(&repositories, &startup_issue_cache);
         let (terminal_poll_tx, terminal_poll_rx) = std::sync::mpsc::channel();
@@ -757,6 +791,12 @@ impl ArborWindow {
             ide_launchers: Vec::new(),
             left_pane_visible: startup_ui_state.left_pane_visible.unwrap_or(true),
             collapsed_repositories,
+            custom_repo_groups,
+            collapsed_custom_groups,
+            group_context_menu: None,
+            renaming_group_id: None,
+            renaming_group_text: String::new(),
+            renaming_group_cursor: 0,
             agent_chat_sessions: Vec::new(),
             active_agent_chat_by_worktree: HashMap::new(),
             next_agent_chat_id: 1,
@@ -901,7 +941,7 @@ impl ArborWindow {
     }
 
     pub(crate) fn selected_agent_preset_or_default(&self) -> AgentPresetKind {
-        self.active_preset_tab.unwrap_or(AgentPresetKind::Codex)
+        self.active_preset_tab.unwrap_or(AgentPresetKind::Claude)
     }
 
     pub(crate) fn branch_prefix_github_login(&self) -> Option<String> {

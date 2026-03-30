@@ -165,6 +165,10 @@ impl ArborWindow {
         }
         let theme = self.theme();
         let repositories = self.repositories.clone();
+        let ungrouped_indices =
+            ungrouped_repository_indices(&repositories, &self.custom_repo_groups);
+        let custom_groups = self.custom_repo_groups.clone();
+        let has_custom_groups = !custom_groups.is_empty();
         div()
             .id("left-pane")
             .w(px(self.left_pane_width))
@@ -183,322 +187,97 @@ impl ArborWindow {
                     .flex()
                     .flex_col()
                     .gap_2()
-                    .children(repositories.into_iter().enumerate().map(
-                        |(repository_index, repository)| {
-                            let is_collapsed =
-                                self.collapsed_repositories.contains(&repository_index);
-                            let repository_avatar_url = repository.avatar_url.clone();
-                            let repository_github_url = repository
-                                .github_repo_slug
-                                .as_ref()
-                                .map(|repo_slug| github_repo_url(repo_slug));
-                            let repo_worktrees: Vec<(usize, WorktreeSummary)> = self
-                                .worktrees
-                                .iter()
-                                .enumerate()
-                                .filter(|(_, worktree)| {
-                                    worktree.group_key == repository.group_key
-                                })
-                                .map(|(index, worktree)| (index, worktree.clone()))
-                                .collect();
-                            let repo_agent_dot_color = if is_collapsed {
-                                if repo_worktrees
-                                    .iter()
-                                    .any(|(_, wt)| wt.agent_state == Some(AgentState::Working))
-                                {
-                                    Some(0xe5c07b_u32)
-                                } else if repo_worktrees
-                                    .iter()
-                                    .any(|(_, wt)| wt.agent_state == Some(AgentState::Waiting))
-                                {
-                                    Some(0x61afef_u32)
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            };
-                            let repo_outposts: Vec<(usize, OutpostSummary)> = self
-                                .outposts
-                                .iter()
-                                .cloned()
-                                .enumerate()
-                                .filter(|(_, outpost)| outpost.repo_root == repository.root)
-                                .collect();
-                            let repository_sidebar_tab =
-                                self.repository_sidebar_tab_for_group(&repository.group_key);
-                            let repository_issue_target =
-                                self.issue_target_for_repository(&repository);
-                            let repository_group_key = repository.group_key.clone();
-                                    let chevron_repository_issue_target =
-                                        repository_issue_target.clone();
+                    .children({
+                        let mut group_elements: Vec<AnyElement> = Vec::new();
 
-                            div()
-                                .id(("repository-group", repository_index))
-                                .flex()
-                                .flex_col()
-                                .gap_1()
-                                .child(
-                                    div()
-                                        .id(("repository-row", repository_index))
-                                        .flex()
-                                        .items_center()
-                                        .gap_1()
-                                        .h(px(32.))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.select_repository(repository_index, cx);
-                                        }))
-                                        .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                            cx.stop_propagation();
-                                            this.repository_context_menu = Some(RepositoryContextMenu {
-                                                repository_index,
-                                                position: event.position,
-                                            });
-                                            cx.notify();
-                                        }))
-                                        // GitHub icon or avatar outside the cell
-                                        .child(
-                                            match (
-                                                repository_avatar_url.clone(),
-                                                repository_github_url.clone(),
-                                            ) {
-                                                (Some(url), Some(github_url)) => div()
-                                                    .id((
-                                                        "repository-github-link",
-                                                        repository_index,
-                                                    ))
-                                                    .flex_none()
-                                                    .size(px(20.))
-                                                    .rounded_sm()
-                                                    .overflow_hidden()
-                                                    .cursor_pointer()
-                                                    .hover(|this| this.opacity(0.9))
-                                                    .on_click(cx.listener(
-                                                        move |this, _, _, cx| {
-                                                            this.open_external_url(
-                                                                &github_url,
-                                                                cx,
-                                                            );
-                                                            cx.stop_propagation();
-                                                        },
-                                                    ))
-                                                    .child(
-                                                        img(url)
-                                                            .size_full()
-                                                            .rounded_sm()
-                                                            .with_fallback(move || {
-                                                                div()
-                                                                    .size_full()
-                                                                    .font_family(FONT_MONO)
-                                                                    .text_size(px(12.))
-                                                                    .text_color(rgb(
-                                                                        theme.text_muted,
-                                                                    ))
-                                                                    .flex()
-                                                                    .items_center()
-                                                                    .justify_center()
-                                                                    .child("\u{f09b}")
-                                                                    .into_any_element()
-                                                            }),
-                                                    )
-                                                    .into_any_element(),
-                                                (Some(url), None) => div()
-                                                    .flex_none()
-                                                    .size(px(20.))
-                                                    .rounded_sm()
-                                                    .overflow_hidden()
-                                                    .child(
-                                                        img(url)
-                                                            .size_full()
-                                                            .rounded_sm()
-                                                            .with_fallback(move || {
-                                                                div()
-                                                                    .size_full()
-                                                                    .font_family(FONT_MONO)
-                                                                    .text_size(px(12.))
-                                                                    .text_color(rgb(
-                                                                        theme.text_muted,
-                                                                    ))
-                                                                    .flex()
-                                                                    .items_center()
-                                                                    .justify_center()
-                                                                    .child("\u{f09b}")
-                                                                    .into_any_element()
-                                                            }),
-                                                    )
-                                                    .into_any_element(),
-                                                (None, Some(github_url)) => div()
-                                                    .id((
-                                                        "repository-github-link",
-                                                        repository_index,
-                                                    ))
-                                                    .flex_none()
-                                                    .font_family(FONT_MONO)
-                                                    .text_size(px(12.))
-                                                    .text_color(rgb(theme.text_muted))
-                                                    .cursor_pointer()
-                                                    .hover(|this| this.opacity(0.9))
-                                                    .on_click(cx.listener(
-                                                        move |this, _, _, cx| {
-                                                            this.open_external_url(
-                                                                &github_url,
-                                                                cx,
-                                                            );
-                                                            cx.stop_propagation();
-                                                        },
-                                                    ))
-                                                    .child("\u{f09b}")
-                                                    .into_any_element(),
-                                                (None, None) => div()
-                                                    .flex_none()
-                                                    .font_family(FONT_MONO)
-                                                    .text_size(px(12.))
-                                                    .text_color(rgb(theme.text_muted))
-                                                    .child("\u{f09b}")
-                                                    .into_any_element(),
-                                            },
-                                        )
-                                        // Cell with chevron, name, count, etc.
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .min_w_0()
-                                                .flex()
-                                                .items_center()
-                                                .justify_between()
-                                                .child(
-                                                    div()
-                                                        .min_w_0()
-                                                        .flex_1()
-                                                        .flex()
-                                                        .items_center()
-                                                        .gap_1()
-                                                        // Chevron toggle
-                                                        .child(
-                                                            div()
-                                                                .id(("repo-chevron", repository_index))
-                                                                .cursor_pointer()
-                                                                .hover(|this| this.text_color(rgb(theme.text_primary)))
-                                                                .text_size(px(16.))
-                                                                .text_color(rgb(theme.text_muted))
-                                                                .w(px(14.))
-                                                                .flex()
-                                                                .items_center()
-                                                                .justify_center()
-                                                                .child(if is_collapsed {
-                                                                    "\u{25B8}"
-                                                                } else {
-                                                                    "\u{25BE}"
-                                                                })
-                                                                .on_click(cx.listener(
-                                                                    move |this, _, _, cx| {
-                                                                        let was_collapsed = this
-                                                                            .collapsed_repositories
-                                                                            .contains(&repository_index);
-                                                                        if was_collapsed {
-                                                                            this.collapsed_repositories
-                                                                                .remove(&repository_index);
-                                                                        } else {
-                                                                            this.collapsed_repositories
-                                                                                .insert(repository_index);
-                                                                        }
-                                                                        if was_collapsed {
-                                                                            this.ensure_issues_loaded_for_target(
-                                                                                chevron_repository_issue_target
-                                                                                    .clone(),
-                                                                                cx,
-                                                                            );
-                                                                        }
-                                                                        this.sync_collapsed_repositories_store(cx);
-                                                                        cx.stop_propagation();
-                                                                        cx.notify();
-                                                                    },
-                                                                )),
-                                                        )
-                                                        // Repository name
-                                                .child(
-                                                    div()
-                                                        .min_w_0()
-                                                        .overflow_hidden()
-                                                        .whitespace_nowrap()
-                                                        .text_ellipsis()
-                                                        .text_sm()
-                                                        .font_weight(FontWeight::MEDIUM)
-                                                        .text_color(rgb(theme.text_primary))
-                                                        .child(repository.label.clone()),
-                                                ),
-                                        )
-                                        .when_some(repo_agent_dot_color, |this, color| {
-                                            this.child(
-                                                div()
-                                                    .flex_none()
-                                                    .size(px(6.))
-                                                    .rounded_full()
-                                                    .bg(rgb(color)),
-                                            )
-                                        })
-                                        .child(
-                                            repository_add_worktree_button(
-                                                &theme,
-                                                ("repository-add-worktree", repository_index),
-                                            )
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    if this.active_repository_index
-                                                        != Some(repository_index)
-                                                    {
-                                                        this.select_repository(repository_index, cx);
-                                                    }
-                                                    this.open_create_modal(
-                                                        repository_index,
-                                                        CreateModalTab::LocalWorktree,
-                                                        cx,
-                                                    );
-                                                    cx.stop_propagation();
-                                                })),
-                                        ),
-                                        )
+                        // ── Custom groups ──
+                        for group in &custom_groups {
+                            let group_collapsed = self.collapsed_custom_groups.contains(&group.id);
+                            // Resolve repo indices for this group.
+                            let group_repo_indices: Vec<usize> = group
+                                .repo_group_keys
+                                .iter()
+                                .filter_map(|gk| repositories.iter().position(|r| r.group_key == *gk))
+                                .collect();
+
+                            // Drop zone before group.
+                            group_elements.push(
+                                self.render_repo_drop_zone(Some(group.id.clone()), 0, cx)
+                                    .into_any_element(),
+                            );
+
+                            // Group header.
+                            group_elements.push(
+                                self.render_custom_group_header(
+                                    group.id.clone(),
+                                    group.label.clone(),
+                                    group_repo_indices.len(),
+                                    cx,
                                 )
-                                .when(!is_collapsed, |this| {
-                                    let selection_epoch = self.worktree_selection_epoch;
-                                    let compact_sidebar = self.compact_sidebar;
-                                    this.child(self.render_repository_sidebar_subtabs(
-                                        repository_index,
-                                        repository_group_key.clone(),
-                                        repository_sidebar_tab,
-                                        repository_issue_target.clone(),
-                                        repo_worktrees
-                                            .iter()
-                                            .filter(|(_, worktree)| !worktree.is_primary_checkout)
-                                            .count(),
+                                .into_any_element(),
+                            );
+
+                            if !group_collapsed {
+                                for (slot, &repository_index) in group_repo_indices.iter().enumerate() {
+                                    let Some(repository) = repositories.get(repository_index).cloned() else {
+                                        continue;
+                                    };
+                                    // Drop zone between repos in group.
+                                    group_elements.push(
+                                        self.render_repo_drop_zone(
+                                            Some(group.id.clone()),
+                                            slot,
+                                            cx,
+                                        )
+                                        .into_any_element(),
+                                    );
+                                    group_elements.push(
+                                        self.render_repository_entry(repository_index, repository, cx)
+                                            .into_any_element(),
+                                    );
+                                }
+                                // Trailing drop zone.
+                                group_elements.push(
+                                    self.render_repo_drop_zone(
+                                        Some(group.id.clone()),
+                                        group_repo_indices.len(),
                                         cx,
-                                    ))
-                                    .when(
-                                        repository_sidebar_tab == RepositorySidebarTab::Worktrees,
-                                        |this| {
-                                            this.child(self.render_repository_worktree_sidebar(
-                                                repository_index,
-                                                &repository,
-                                                &repo_worktrees,
-                                                &repo_outposts,
-                                                selection_epoch,
-                                                compact_sidebar,
-                                                cx,
-                                            ))
-                                        },
                                     )
-                                    .when(
-                                        repository_sidebar_tab == RepositorySidebarTab::Issues,
-                                        |this| {
-                                            this.child(self.render_repository_issue_sidebar(
-                                                repository_index,
-                                                repository_issue_target.clone(),
-                                                cx,
-                                            ))
-                                        },
-                                    )
-                                })
-                        },
-                    ))
+                                    .into_any_element(),
+                                );
+                            }
+                        }
+
+                        // ── Ungrouped repos ──
+                        if has_custom_groups && !ungrouped_indices.is_empty() {
+                            // Drop zone for ungrouped section.
+                            group_elements.push(
+                                self.render_repo_drop_zone(None, 0, cx).into_any_element(),
+                            );
+                        }
+                        for (slot, &repository_index) in ungrouped_indices.iter().enumerate() {
+                            let Some(repository) = repositories.get(repository_index).cloned() else {
+                                continue;
+                            };
+                            if has_custom_groups {
+                                group_elements.push(
+                                    self.render_repo_drop_zone(None, slot, cx).into_any_element(),
+                                );
+                            }
+                            group_elements.push(
+                                self.render_repository_entry(repository_index, repository, cx)
+                                    .into_any_element(),
+                            );
+                        }
+                        if has_custom_groups && !ungrouped_indices.is_empty() {
+                            group_elements.push(
+                                self.render_repo_drop_zone(None, ungrouped_indices.len(), cx)
+                                    .into_any_element(),
+                            );
+                        }
+
+                        group_elements
+                    })
                     // ── Remote repos from expanded LAN daemons ───────────
                     .children({
                         // Build remote repo group elements imperatively so we can use cx.listener()
@@ -2360,10 +2139,6 @@ impl ArborWindow {
                 cx.stop_propagation();
                 cx.notify();
             }))
-            .on_mouse_move(cx.listener(|this, _, _, cx| {
-                this.repository_context_menu = None;
-                cx.notify();
-            }))
             // Absolutely-positioned menu at cursor position
             .child(
                 div()
@@ -2385,6 +2160,146 @@ impl ArborWindow {
                     .on_mouse_down(MouseButton::Right, |_, _, cx| {
                         cx.stop_propagation();
                     })
+                    // "New Group..." item
+                    .child({
+                        let repo_group_key = self
+                            .repositories
+                            .get(index)
+                            .map(|r| r.group_key.clone())
+                            .unwrap_or_default();
+                        let repo_label = self
+                            .repositories
+                            .get(index)
+                            .map(|r| r.label.clone())
+                            .unwrap_or_default();
+                        div()
+                            .id("repository-context-new-group")
+                            .h(px(30.))
+                            .mx(px(4.))
+                            .px(px(8.))
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .hover(|this| this.bg(rgb(0x2a2d3a)))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.repository_context_menu = None;
+                                this.create_group_with_repo(
+                                    repo_label.clone(),
+                                    &repo_group_key,
+                                    cx,
+                                );
+                            }))
+                            .child(
+                                div()
+                                    .font_family(FONT_MONO)
+                                    .text_size(px(16.))
+                                    .text_color(rgb(theme.text_muted))
+                                    .child("\u{f07b}"), // folder icon
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .text_color(rgb(theme.text_primary))
+                                    .child("New Group..."),
+                            )
+                    })
+                    // "Move to [group]" items
+                    .children({
+                        let repo_group_key = self
+                            .repositories
+                            .get(index)
+                            .map(|r| r.group_key.clone())
+                            .unwrap_or_default();
+                        self.custom_repo_groups
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, g)| !g.repo_group_keys.contains(&repo_group_key))
+                            .map(|(gi, g)| {
+                                let target_id = g.id.clone();
+                                let label = g.label.clone();
+                                let key = repo_group_key.clone();
+                                div()
+                                    .id(("repository-context-move-to", gi))
+                                    .h(px(30.))
+                                    .mx(px(4.))
+                                    .px(px(8.))
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .hover(|this| this.bg(rgb(0x2a2d3a)))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.repository_context_menu = None;
+                                        this.move_repo_to_group(&key, &target_id, cx);
+                                    }))
+                                    .child(
+                                        div()
+                                            .font_family(FONT_MONO)
+                                            .text_size(px(16.))
+                                            .text_color(rgb(theme.text_muted))
+                                            .child("\u{f07b}"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(13.))
+                                            .text_color(rgb(theme.text_primary))
+                                            .child(format!("Move to {label}")),
+                                    )
+                                    .into_any_element()
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    // "Ungroup" item (only if repo is in a group)
+                    .when(
+                        self.repositories.get(index).is_some_and(|r| {
+                            self.custom_repo_groups
+                                .iter()
+                                .any(|g| g.repo_group_keys.contains(&r.group_key))
+                        }),
+                        |this| {
+                            let repo_group_key = self
+                                .repositories
+                                .get(index)
+                                .map(|r| r.group_key.clone())
+                                .unwrap_or_default();
+                            this.child(
+                                div()
+                                    .id("repository-context-ungroup")
+                                    .h(px(30.))
+                                    .mx(px(4.))
+                                    .px(px(8.))
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .hover(|this| this.bg(rgb(0x2a2d3a)))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.repository_context_menu = None;
+                                        this.ungroup_repo(&repo_group_key, cx);
+                                    }))
+                                    .child(
+                                        div()
+                                            .font_family(FONT_MONO)
+                                            .text_size(px(16.))
+                                            .text_color(rgb(theme.text_muted))
+                                            .child("\u{f08d}"), // unpin icon
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(13.))
+                                            .text_color(rgb(theme.text_primary))
+                                            .child("Ungroup"),
+                                    ),
+                            )
+                        },
+                    )
+                    // Separator
+                    .child(div().h(px(1.)).mx(px(8.)).my(px(4.)).bg(rgb(theme.border)))
+                    // Remove
                     .child(
                         div()
                             .id("repository-context-remove")
@@ -2460,10 +2375,6 @@ impl ArborWindow {
                     cx.notify();
                 }),
             )
-            .on_mouse_move(cx.listener(|this, _, _, cx| {
-                this.worktree_context_menu = None;
-                cx.notify();
-            }))
             .child(
                 div()
                     .absolute()
@@ -3159,6 +3070,762 @@ where
                 .bg(rgb(theme.panel_active_bg))
         })
         .child("+")
+}
+
+impl ArborWindow {
+    /// Render a single repository entry (header + expanded content) for the sidebar.
+    pub(crate) fn render_repository_entry(
+        &mut self,
+        repository_index: usize,
+        repository: RepositorySummary,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let theme = self.theme();
+        let is_collapsed = self.collapsed_repositories.contains(&repository_index);
+        let repository_avatar_url = repository.avatar_url.clone();
+        let repository_github_url = repository
+            .github_repo_slug
+            .as_ref()
+            .map(|repo_slug| github_repo_url(repo_slug));
+        let repo_worktrees: Vec<(usize, WorktreeSummary)> = self
+            .worktrees
+            .iter()
+            .enumerate()
+            .filter(|(_, worktree)| worktree.group_key == repository.group_key)
+            .map(|(index, worktree)| (index, worktree.clone()))
+            .collect();
+        let repo_agent_dot_color = if is_collapsed {
+            if repo_worktrees
+                .iter()
+                .any(|(_, wt)| wt.agent_state == Some(AgentState::Working))
+            {
+                Some(0xe5c07b_u32)
+            } else if repo_worktrees
+                .iter()
+                .any(|(_, wt)| wt.agent_state == Some(AgentState::Waiting))
+            {
+                Some(0x61afef_u32)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let repo_outposts: Vec<(usize, OutpostSummary)> = self
+            .outposts
+            .iter()
+            .cloned()
+            .enumerate()
+            .filter(|(_, outpost)| outpost.repo_root == repository.root)
+            .collect();
+        let repository_sidebar_tab = self.repository_sidebar_tab_for_group(&repository.group_key);
+        let repository_issue_target = self.issue_target_for_repository(&repository);
+        let repository_group_key = repository.group_key.clone();
+        let chevron_repository_issue_target = repository_issue_target.clone();
+
+        div()
+            .id(("repository-group", repository_index))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .id(("repository-row", repository_index))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .h(px(32.))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.select_repository(repository_index, cx);
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.repository_context_menu = Some(RepositoryContextMenu {
+                                repository_index,
+                                position: event.position,
+                            });
+                            cx.notify();
+                        }),
+                    )
+                    .on_drag(
+                        DraggedRepository {
+                            group_key: repository_group_key.clone(),
+                            label: repository.label.clone(),
+                            icon_color: theme.text_muted,
+                            bg_color: theme.panel_active_bg,
+                            border_color: theme.accent,
+                            text_color: theme.text_primary,
+                        },
+                        |dragged, _, _, cx| {
+                            cx.stop_propagation();
+                            cx.new(|_| dragged.clone())
+                        },
+                    )
+                    .can_drop(|value, _, _| value.downcast_ref::<DraggedRepository>().is_some())
+                    .drag_over::<DraggedRepository>({
+                        let accent = theme.accent;
+                        move |style, _, _, _| style.border_color(rgb(accent)).border_t_2()
+                    })
+                    .on_drop({
+                        let drop_group_key = repository_group_key.clone();
+                        cx.listener(move |this, dragged: &DraggedRepository, _, cx| {
+                            // Find which custom group this target repo belongs to.
+                            let target_group = this
+                                .custom_repo_groups
+                                .iter()
+                                .find(|g| g.repo_group_keys.contains(&drop_group_key));
+                            let target_group_id = target_group.map(|g| g.id.clone());
+                            // Find position of target repo within its group.
+                            let insert_pos = target_group
+                                .and_then(|g| {
+                                    g.repo_group_keys
+                                        .iter()
+                                        .position(|k| k == &drop_group_key)
+                                })
+                                .unwrap_or(0);
+                            this.handle_repo_drop(
+                                &dragged.group_key,
+                                target_group_id.as_deref(),
+                                insert_pos,
+                                cx,
+                            );
+                        })
+                    })
+                    // GitHub icon or avatar
+                    .child(
+                        match (repository_avatar_url, repository_github_url.clone()) {
+                            (Some(url), Some(github_url)) => div()
+                                .id(("repository-github-link", repository_index))
+                                .flex_none()
+                                .size(px(20.))
+                                .rounded_sm()
+                                .overflow_hidden()
+                                .cursor_pointer()
+                                .hover(|this| this.opacity(0.9))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.open_external_url(&github_url, cx);
+                                    cx.stop_propagation();
+                                }))
+                                .child(
+                                    img(url).size_full().rounded_sm().with_fallback(move || {
+                                        div()
+                                            .size_full()
+                                            .font_family(FONT_MONO)
+                                            .text_size(px(12.))
+                                            .text_color(rgb(theme.text_muted))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .child("\u{f09b}")
+                                            .into_any_element()
+                                    }),
+                                )
+                                .into_any_element(),
+                            (Some(url), None) => div()
+                                .flex_none()
+                                .size(px(20.))
+                                .rounded_sm()
+                                .overflow_hidden()
+                                .child(
+                                    img(url).size_full().rounded_sm().with_fallback(move || {
+                                        div()
+                                            .size_full()
+                                            .font_family(FONT_MONO)
+                                            .text_size(px(12.))
+                                            .text_color(rgb(theme.text_muted))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .child("\u{f09b}")
+                                            .into_any_element()
+                                    }),
+                                )
+                                .into_any_element(),
+                            (None, Some(github_url)) => div()
+                                .id(("repository-github-link", repository_index))
+                                .flex_none()
+                                .font_family(FONT_MONO)
+                                .text_size(px(12.))
+                                .text_color(rgb(theme.text_muted))
+                                .cursor_pointer()
+                                .hover(|this| this.opacity(0.9))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.open_external_url(&github_url, cx);
+                                    cx.stop_propagation();
+                                }))
+                                .child("\u{f09b}")
+                                .into_any_element(),
+                            (None, None) => div()
+                                .flex_none()
+                                .font_family(FONT_MONO)
+                                .text_size(px(12.))
+                                .text_color(rgb(theme.text_muted))
+                                .child("\u{f09b}")
+                                .into_any_element(),
+                        },
+                    )
+                    // Cell with chevron, name, count, etc.
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    // Chevron toggle
+                                    .child(
+                                        div()
+                                            .id(("repo-chevron", repository_index))
+                                            .cursor_pointer()
+                                            .hover(|this| {
+                                                this.text_color(rgb(theme.text_primary))
+                                            })
+                                            .text_size(px(16.))
+                                            .text_color(rgb(theme.text_muted))
+                                            .w(px(14.))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .child(if is_collapsed {
+                                                "\u{25B8}"
+                                            } else {
+                                                "\u{25BE}"
+                                            })
+                                            .on_click(cx.listener(
+                                                move |this, _, _, cx| {
+                                                    let was_collapsed = this
+                                                        .collapsed_repositories
+                                                        .contains(&repository_index);
+                                                    if was_collapsed {
+                                                        this.collapsed_repositories
+                                                            .remove(&repository_index);
+                                                    } else {
+                                                        this.collapsed_repositories
+                                                            .insert(repository_index);
+                                                    }
+                                                    if was_collapsed {
+                                                        this.ensure_issues_loaded_for_target(
+                                                            chevron_repository_issue_target.clone(),
+                                                            cx,
+                                                        );
+                                                    }
+                                                    this.sync_collapsed_repositories_store(cx);
+                                                    cx.stop_propagation();
+                                                    cx.notify();
+                                                },
+                                            )),
+                                    )
+                                    // Repository name
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_ellipsis()
+                                            .text_sm()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(rgb(theme.text_primary))
+                                            .child(repository.label.clone()),
+                                    ),
+                            )
+                            .when_some(repo_agent_dot_color, |this, color| {
+                                this.child(
+                                    div()
+                                        .flex_none()
+                                        .size(px(6.))
+                                        .rounded_full()
+                                        .bg(rgb(color)),
+                                )
+                            })
+                            .child(
+                                repository_add_worktree_button(
+                                    &theme,
+                                    ("repository-add-worktree", repository_index),
+                                )
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if this.active_repository_index != Some(repository_index) {
+                                        this.select_repository(repository_index, cx);
+                                    }
+                                    this.open_create_modal(
+                                        repository_index,
+                                        CreateModalTab::LocalWorktree,
+                                        cx,
+                                    );
+                                    cx.stop_propagation();
+                                })),
+                            ),
+                    ),
+            )
+            .when(!is_collapsed, |this| {
+                let selection_epoch = self.worktree_selection_epoch;
+                let compact_sidebar = self.compact_sidebar;
+                this.child(
+                    self.render_repository_sidebar_subtabs(
+                        repository_index,
+                        repository_group_key.clone(),
+                        repository_sidebar_tab,
+                        repository_issue_target.clone(),
+                        repo_worktrees
+                            .iter()
+                            .filter(|(_, worktree)| !worktree.is_primary_checkout)
+                            .count(),
+                        cx,
+                    ),
+                )
+                .when(
+                    repository_sidebar_tab == RepositorySidebarTab::Worktrees,
+                    |this| {
+                        this.child(self.render_repository_worktree_sidebar(
+                            repository_index,
+                            &repository,
+                            &repo_worktrees,
+                            &repo_outposts,
+                            selection_epoch,
+                            compact_sidebar,
+                            cx,
+                        ))
+                    },
+                )
+                .when(
+                    repository_sidebar_tab == RepositorySidebarTab::Issues,
+                    |this| {
+                        this.child(self.render_repository_issue_sidebar(
+                            repository_index,
+                            repository_issue_target.clone(),
+                            cx,
+                        ))
+                    },
+                )
+            })
+    }
+
+    /// Render a drop zone between repositories that accepts `DraggedRepository`.
+    pub(crate) fn render_repo_drop_zone(
+        &self,
+        target_group_id: Option<String>,
+        insert_before: usize,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let theme = self.theme();
+        let drop_group_id = target_group_id.clone();
+        let can_drop_group_id = target_group_id;
+        div()
+            .h(px(8.))
+            .mx(px(2.))
+            .rounded_sm()
+            .can_drop(move |value, _, _| {
+                let _ = &can_drop_group_id;
+                value.downcast_ref::<DraggedRepository>().is_some()
+            })
+            .drag_over::<DraggedRepository>({
+                let accent = theme.accent;
+                move |style, _, _, _| style.bg(rgb(accent)).h(px(4.)).my(px(2.))
+            })
+            .on_drop(
+                cx.listener(move |this, dragged: &DraggedRepository, _, cx| {
+                    this.handle_repo_drop(
+                        &dragged.group_key,
+                        drop_group_id.as_deref(),
+                        insert_before,
+                        cx,
+                    );
+                }),
+            )
+    }
+
+    /// Handle dropping a repository into a custom group (or ungrouped).
+    pub(crate) fn handle_repo_drop(
+        &mut self,
+        dragged_group_key: &str,
+        target_group_id: Option<&str>,
+        insert_position: usize,
+        cx: &mut Context<Self>,
+    ) {
+        // Remove from current group (if any).
+        for group in &mut self.custom_repo_groups {
+            group.repo_group_keys.retain(|k| k != dragged_group_key);
+        }
+        self.custom_repo_groups
+            .retain(|g| !g.repo_group_keys.is_empty());
+
+        // Insert into target group at the requested position.
+        if let Some(target_id) = target_group_id
+            && let Some(group) = self
+                .custom_repo_groups
+                .iter_mut()
+                .find(|g| g.id == target_id)
+        {
+            let pos = insert_position.min(group.repo_group_keys.len());
+            group
+                .repo_group_keys
+                .insert(pos, dragged_group_key.to_owned());
+        }
+        // If target_group_id is None the repo becomes ungrouped (no action needed).
+
+        self.sync_custom_repo_groups_store(cx);
+        cx.notify();
+    }
+
+    /// Render a collapsible group header row.
+    pub(crate) fn render_custom_group_header(
+        &mut self,
+        group_id: String,
+        group_label: String,
+        repo_count: usize,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let theme = self.theme();
+        let is_collapsed = self.collapsed_custom_groups.contains(&group_id);
+        let is_renaming = self.renaming_group_id.as_deref() == Some(group_id.as_str());
+        let toggle_group_id = group_id.clone();
+        let menu_group_id = group_id.clone();
+
+        div()
+            .id(ElementId::Name(format!("group-header-{group_id}").into()))
+            .flex()
+            .items_center()
+            .gap_1()
+            .h(px(28.))
+            .cursor_pointer()
+            .can_drop(|value, _, _| value.downcast_ref::<DraggedRepository>().is_some())
+            .drag_over::<DraggedRepository>({
+                let accent = theme.accent;
+                move |style, _, _, _| style.bg(rgb(accent)).rounded_sm()
+            })
+            .on_drop({
+                let drop_group_id = group_id.clone();
+                cx.listener(move |this, dragged: &DraggedRepository, _, cx| {
+                    // Drop on header = append to end of group.
+                    let count = this
+                        .custom_repo_groups
+                        .iter()
+                        .find(|g| g.id == drop_group_id)
+                        .map(|g| g.repo_group_keys.len())
+                        .unwrap_or(0);
+                    this.handle_repo_drop(
+                        &dragged.group_key,
+                        Some(&drop_group_id),
+                        count,
+                        cx,
+                    );
+                })
+            })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                // Don't toggle collapse while renaming.
+                if this.renaming_group_id.is_some() {
+                    return;
+                }
+                if this.collapsed_custom_groups.contains(&toggle_group_id) {
+                    this.collapsed_custom_groups.remove(&toggle_group_id);
+                } else {
+                    this.collapsed_custom_groups.insert(toggle_group_id.clone());
+                }
+                this.sync_custom_repo_groups_store(cx);
+                cx.notify();
+            }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.group_context_menu = Some(GroupContextMenu {
+                        group_id: menu_group_id.clone(),
+                        position: event.position,
+                    });
+                    cx.notify();
+                }),
+            )
+            // Chevron
+            .child(
+                div()
+                    .text_size(px(14.))
+                    .text_color(rgb(theme.accent))
+                    .w(px(14.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(if is_collapsed { "\u{25B8}" } else { "\u{25BE}" }),
+            )
+            // Label or inline rename input
+            .child(if is_renaming {
+                let text = self.renaming_group_text.clone();
+                let mut cursor = self.renaming_group_cursor.min(text.len());
+                // Snap to a valid char boundary to avoid panicking on multi-byte chars.
+                while cursor > 0 && !text.is_char_boundary(cursor) {
+                    cursor -= 1;
+                }
+                let before = &text[..cursor];
+                let after = &text[cursor..];
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .px_1()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(rgb(theme.accent))
+                    .bg(rgb(theme.panel_bg))
+                    .text_xs()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(rgb(theme.text_primary))
+                    .flex()
+                    .items_center()
+                    .child(before.to_owned())
+                    .child(
+                        div()
+                            .w(px(1.))
+                            .h(px(12.))
+                            .bg(rgb(theme.accent))
+                            .flex_none(),
+                    )
+                    .child(after.to_owned())
+                    .into_any_element()
+            } else {
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_xs()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(rgb(theme.accent))
+                    .child(group_label)
+                    .into_any_element()
+            })
+            // Count badge
+            .child(
+                div()
+                    .flex_none()
+                    .text_xs()
+                    .text_color(rgb(theme.accent))
+                    .opacity(0.6)
+                    .child(format!("{repo_count}")),
+            )
+    }
+
+    /// Render the context menu for a custom group header.
+    pub(crate) fn render_group_context_menu(&mut self, cx: &mut Context<Self>) -> Div {
+        let Some(menu) = self.group_context_menu.as_ref() else {
+            return div();
+        };
+
+        let theme = self.theme();
+        let group_id = menu.group_id.clone();
+        let position = menu.position;
+        let rename_group_id = group_id.clone();
+        let delete_group_id = group_id;
+
+        div()
+            .absolute()
+            .inset_0()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.group_context_menu = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, _, _, cx| {
+                    this.group_context_menu = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(position.x)
+                    .top(position.y)
+                    .w(px(180.))
+                    .py(px(4.))
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(rgb(theme.border))
+                    .bg(rgb(theme.chrome_bg))
+                    .on_mouse_move(|_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    .on_mouse_down(MouseButton::Right, |_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    // Rename
+                    .child(
+                        div()
+                            .id("group-context-rename")
+                            .h(px(30.))
+                            .mx(px(4.))
+                            .px(px(8.))
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .hover(|this| this.bg(rgb(0x2a2d3a)))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let label = this
+                                    .custom_repo_groups
+                                    .iter()
+                                    .find(|g| g.id == rename_group_id)
+                                    .map(|g| g.label.clone())
+                                    .unwrap_or_default();
+                                this.renaming_group_id = Some(rename_group_id.clone());
+                                this.renaming_group_text = label;
+                                this.renaming_group_cursor = this.renaming_group_text.len();
+                                this.group_context_menu = None;
+                                cx.notify();
+                            }))
+                            .child(
+                                div()
+                                    .font_family(FONT_MONO)
+                                    .text_size(px(16.))
+                                    .text_color(rgb(theme.text_muted))
+                                    .child("\u{f044}"), // edit icon
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .text_color(rgb(theme.text_primary))
+                                    .child("Rename"),
+                            ),
+                    )
+                    // Delete group (repos become ungrouped)
+                    .child(
+                        div()
+                            .id("group-context-delete")
+                            .h(px(30.))
+                            .mx(px(4.))
+                            .px(px(8.))
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .hover(|this| this.bg(rgb(0x3a2030)))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.custom_repo_groups
+                                    .retain(|g| g.id != delete_group_id);
+                                this.group_context_menu = None;
+                                this.sync_custom_repo_groups_store(cx);
+                                cx.notify();
+                            }))
+                            .child(
+                                div()
+                                    .font_family(FONT_MONO)
+                                    .text_size(px(16.))
+                                    .text_color(rgb(0xeb6f92))
+                                    .child("\u{f1f8}"), // trash icon
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .text_color(rgb(0xeb6f92))
+                                    .child("Delete Group"),
+                            ),
+                    ),
+            )
+    }
+
+    /// Create a new custom group and move the given repository into it.
+    pub(crate) fn create_group_with_repo(
+        &mut self,
+        label: String,
+        repo_group_key: &str,
+        cx: &mut Context<Self>,
+    ) {
+        // Remove from any existing group.
+        for group in &mut self.custom_repo_groups {
+            group.repo_group_keys.retain(|k| k != repo_group_key);
+        }
+        self.custom_repo_groups
+            .retain(|g| !g.repo_group_keys.is_empty());
+
+        let id = format!(
+            "group-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        );
+        self.custom_repo_groups.push(CustomRepoGroup {
+            id,
+            label,
+            repo_group_keys: vec![repo_group_key.to_owned()],
+        });
+        self.sync_custom_repo_groups_store(cx);
+        cx.notify();
+    }
+
+    /// Move a repository into an existing custom group.
+    pub(crate) fn move_repo_to_group(
+        &mut self,
+        repo_group_key: &str,
+        target_group_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        // Remove from any existing group.
+        for group in &mut self.custom_repo_groups {
+            group.repo_group_keys.retain(|k| k != repo_group_key);
+        }
+
+        // Add to target group.
+        if let Some(group) = self
+            .custom_repo_groups
+            .iter_mut()
+            .find(|g| g.id == target_group_id)
+        {
+            group.repo_group_keys.push(repo_group_key.to_owned());
+        }
+
+        self.custom_repo_groups
+            .retain(|g| !g.repo_group_keys.is_empty());
+        self.sync_custom_repo_groups_store(cx);
+        cx.notify();
+    }
+
+    /// Commit the current inline group rename.
+    pub(crate) fn commit_group_rename(&mut self, cx: &mut Context<Self>) {
+        if let Some(group_id) = self.renaming_group_id.take() {
+            let new_label = self.renaming_group_text.trim().to_owned();
+            if !new_label.is_empty() {
+                if let Some(group) = self
+                    .custom_repo_groups
+                    .iter_mut()
+                    .find(|g| g.id == group_id)
+                {
+                    group.label = new_label;
+                }
+                self.sync_custom_repo_groups_store(cx);
+            }
+        }
+        self.renaming_group_text.clear();
+        self.renaming_group_cursor = 0;
+        cx.notify();
+    }
+
+    /// Remove a repository from its custom group (make it ungrouped).
+    pub(crate) fn ungroup_repo(&mut self, repo_group_key: &str, cx: &mut Context<Self>) {
+        for group in &mut self.custom_repo_groups {
+            group.repo_group_keys.retain(|k| k != repo_group_key);
+        }
+        self.custom_repo_groups
+            .retain(|g| !g.repo_group_keys.is_empty());
+        self.sync_custom_repo_groups_store(cx);
+        cx.notify();
+    }
 }
 
 #[cfg(test)]

@@ -14,7 +14,7 @@ pub(crate) const APP_VERSION: &str = match option_env!("ARBOR_VERSION") {
     Some(v) => v,
     None => env!("CARGO_PKG_VERSION"),
 };
-pub(crate) const APP_NAME: &str = "Arbor";
+pub(crate) const APP_NAME: &str = "Arborium";
 // Provided by the build environment. The repo's `just` GUI/build recipes set
 // this automatically so the title can include the branch without a build script.
 pub(crate) const APP_BUILD_BRANCH: Option<&str> = match option_env!("ARBOR_BUILD_BRANCH") {
@@ -296,15 +296,15 @@ mod tests {
 
     #[test]
     fn app_window_title_omits_empty_parts() {
-        assert_eq!(format_app_window_title(None, None), "Arbor");
-        assert_eq!(format_app_window_title(Some(""), Some("")), "Arbor");
+        assert_eq!(format_app_window_title(None, None), "Arborium");
+        assert_eq!(format_app_window_title(Some(""), Some("")), "Arborium");
     }
 
     #[test]
     fn app_window_title_includes_compile_time_branch() {
         assert_eq!(
             format_app_window_title(Some("feature/demo"), None),
-            "Arbor [feature/demo]"
+            "Arborium [feature/demo]"
         );
     }
 
@@ -312,7 +312,7 @@ mod tests {
     fn app_window_title_keeps_daemon_label() {
         assert_eq!(
             format_app_window_title(Some("feature/demo"), Some("local daemon")),
-            "Arbor [feature/demo] — local daemon"
+            "Arborium [feature/demo] — local daemon"
         );
     }
 }

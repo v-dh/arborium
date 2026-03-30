@@ -474,13 +474,17 @@ impl ArborWindow {
                             .child("Commit Changes"),
                     )
                     .child(
-                        div().text_xs().text_color(rgb(theme.text_muted)).child(
-                            "Review or generate the commit message before creating the commit.",
-                        ),
+                        div()
+                            .text_xs()
+                            .text_color(rgb(theme.text_muted))
+                            .child("Edit the commit message below. Press \u{2318}Enter to commit."),
                     )
                     .child(
                         div()
+                            .id("commit-message-editor")
                             .min_h(px(110.))
+                            .max_h(px(260.))
+                            .overflow_y_scroll()
                             .rounded_sm()
                             .border_1()
                             .border_color(rgb(theme.accent))
@@ -490,13 +494,12 @@ impl ArborWindow {
                             .font_family(FONT_MONO)
                             .text_sm()
                             .text_color(rgb(theme.text_primary))
-                            .child(active_input_display(
+                            .child(multiline_input_display(
                                 theme,
                                 &modal.message,
                                 "commit message",
                                 theme.text_primary,
                                 modal.message_cursor,
-                                240,
                             )),
                     )
                     .child(div().when_some(modal.error.clone(), |this, error| {
@@ -522,6 +525,20 @@ impl ArborWindow {
                                 .text_xs()
                                 .text_color(rgb(theme.text_muted))
                                 .child("This worktree already has a pull request."),
+                        )
+                    })
+                    .when(modal.generating, |this| {
+                        this.child(
+                            div()
+                                .rounded_sm()
+                                .border_1()
+                                .border_color(rgb(theme.accent))
+                                .bg(rgb(theme.panel_bg))
+                                .px_2()
+                                .py_1()
+                                .text_xs()
+                                .text_color(rgb(theme.text_muted))
+                                .child("Generating commit message with AI\u{2026}"),
                         )
                     })
                     .child(
@@ -563,18 +580,22 @@ impl ArborWindow {
                                             "commit-default",
                                             "Use Default",
                                             ActionButtonStyle::Secondary,
-                                            true,
+                                            !modal.generating,
                                         )
-                                        .on_click(
-                                            cx.listener(move |this, _, _, cx| {
-                                                if let Some(modal) = this.commit_modal.as_mut() {
-                                                    modal.message = default_message.clone();
-                                                    modal.message_cursor =
-                                                        char_count(&default_message);
-                                                    modal.error = None;
-                                                }
-                                                cx.notify();
-                                            }),
+                                        .when(
+                                            !modal.generating,
+                                            |this| {
+                                                this.on_click(cx.listener(move |this, _, _, cx| {
+                                                    if let Some(modal) = this.commit_modal.as_mut()
+                                                    {
+                                                        modal.message = default_message.clone();
+                                                        modal.message_cursor =
+                                                            char_count(&default_message);
+                                                        modal.error = None;
+                                                    }
+                                                    cx.notify();
+                                                }))
+                                            },
                                         ),
                                     ),
                             )
@@ -588,12 +609,15 @@ impl ArborWindow {
                                             "commit-cancel",
                                             "Cancel",
                                             ActionButtonStyle::Secondary,
-                                            true,
+                                            !modal.generating,
                                         )
-                                        .on_click(
-                                            cx.listener(|this, _, _, cx| {
-                                                this.close_commit_modal(cx);
-                                            }),
+                                        .when(
+                                            !modal.generating,
+                                            |this| {
+                                                this.on_click(cx.listener(|this, _, _, cx| {
+                                                    this.close_commit_modal(cx);
+                                                }))
+                                            },
                                         ),
                                     )
                                     .child(

@@ -211,6 +211,8 @@ impl ArborWindow {
             preferred_checkout_kind: Some(self.preferred_checkout_kind),
             collapsed_repository_group_keys: self.collapsed_repository_group_keys_snapshot(),
             sidebar_order: self.sidebar_order.clone(),
+            custom_repo_groups: self.custom_repo_groups_snapshot(),
+            collapsed_custom_group_ids: self.collapsed_custom_group_ids_snapshot(),
             repository_sidebar_tabs: self.repository_sidebar_tabs_snapshot(),
             selected_sidebar_selection: self.sidebar_selection_snapshot_for_persistence(),
             right_pane_tab: Some(persisted_right_pane_tab(self.right_pane_tab)),
@@ -245,6 +247,32 @@ impl ArborWindow {
         group_keys.sort();
         group_keys.dedup();
         group_keys
+    }
+
+    pub(crate) fn custom_repo_groups_snapshot(
+        &self,
+    ) -> Vec<ui_state_store::PersistedCustomRepoGroup> {
+        self.custom_repo_groups
+            .iter()
+            .map(|g| ui_state_store::PersistedCustomRepoGroup {
+                id: g.id.clone(),
+                label: g.label.clone(),
+                repo_group_keys: g.repo_group_keys.clone(),
+            })
+            .collect()
+    }
+
+    pub(crate) fn collapsed_custom_group_ids_snapshot(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.collapsed_custom_groups.iter().cloned().collect();
+        ids.sort();
+        ids
+    }
+
+    pub(crate) fn sync_custom_repo_groups_store(&mut self, cx: &mut Context<Self>) {
+        let mut next_state = self.queued_ui_state_base();
+        next_state.custom_repo_groups = self.custom_repo_groups_snapshot();
+        next_state.collapsed_custom_group_ids = self.collapsed_custom_group_ids_snapshot();
+        self.queue_ui_state_save(next_state, cx);
     }
 
     pub(crate) fn sidebar_selection_snapshot(

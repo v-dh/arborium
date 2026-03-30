@@ -1223,6 +1223,20 @@ impl ArborWindow {
             })
             .or_else(|| (!self.repositories.is_empty()).then_some(0));
 
+        // Prune stale group_keys from custom repo groups.
+        let valid_keys: HashSet<&str> = self
+            .repositories
+            .iter()
+            .map(|r| r.group_key.as_str())
+            .collect();
+        for group in &mut self.custom_repo_groups {
+            group
+                .repo_group_keys
+                .retain(|k| valid_keys.contains(k.as_str()));
+        }
+        self.custom_repo_groups
+            .retain(|g| !g.repo_group_keys.is_empty());
+
         if let Some(repository) = self.selected_repository().cloned() {
             self.repo_root = repository.root.clone();
             self.github_repo_slug = repository.github_repo_slug.clone();

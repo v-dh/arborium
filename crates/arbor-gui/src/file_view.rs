@@ -373,54 +373,83 @@ pub(crate) fn render_file_view_session(
                                                 .overflow_hidden()
                                                 .flex();
 
-                                            if show_cursor {
-                                                // When editing, show raw text with cursor
+                                            if show_cursor && is_cursor_line {
+                                                // Cursor line in edit mode: render highlighted
+                                                // spans but split at cursor position.
                                                 let raw = raw_lines_clone
                                                     .get(index)
                                                     .cloned()
                                                     .unwrap_or_default();
-                                                if is_cursor_line {
-                                                    let byte_pos =
-                                                        char_to_byte_offset(&raw, cursor.col);
-                                                    let before = &raw[..byte_pos];
-                                                    let after = &raw[byte_pos..];
-                                                    let cursor_char =
-                                                        after.chars().next().unwrap_or(' ');
-                                                    let after_cursor = if after.is_empty() {
-                                                        String::new()
-                                                    } else {
-                                                        after.chars().skip(1).collect()
-                                                    };
-                                                    content_div = content_div
-                                                        .child(
-                                                            div()
-                                                                .text_color(rgb(theme.text_primary))
-                                                                .child(before.to_owned()),
-                                                        )
-                                                        .child(
-                                                            div()
-                                                                .bg(rgb(theme.accent))
-                                                                .text_color(rgb(theme.terminal_bg))
-                                                                .child(cursor_char.to_string()),
-                                                        )
-                                                        .child(
-                                                            div()
-                                                                .text_color(rgb(theme.text_primary))
-                                                                .child(after_cursor),
-                                                        );
-                                                } else {
+                                                let cursor_byte =
+                                                    char_to_byte_offset(&raw, cursor.col);
+                                                let spans = highlighted.get(index);
+                                                let mut offset = 0_usize;
+                                                let mut cursor_emitted = false;
+                                                if let Some(spans) = spans {
+                                                    for span in spans {
+                                                        let span_start = offset;
+                                                        let span_end = offset + span.text.len();
+                                                        if !cursor_emitted
+                                                            && cursor_byte >= span_start
+                                                            && cursor_byte < span_end
+                                                        {
+                                                            // Cursor is inside this span.
+                                                            let local = cursor_byte - span_start;
+                                                            let before = &span.text[..local];
+                                                            let after = &span.text[local..];
+                                                            let cursor_char =
+                                                                after.chars().next().unwrap_or(' ');
+                                                            let after_cursor: String =
+                                                                if after.is_empty() {
+                                                                    String::new()
+                                                                } else {
+                                                                    after.chars().skip(1).collect()
+                                                                };
+                                                            if !before.is_empty() {
+                                                                content_div = content_div.child(
+                                                                    div()
+                                                                        .text_color(rgb(span.color))
+                                                                        .child(before.to_owned()),
+                                                                );
+                                                            }
+                                                            content_div = content_div.child(
+                                                                div()
+                                                                    .bg(rgb(theme.accent))
+                                                                    .text_color(rgb(
+                                                                        theme.terminal_bg
+                                                                    ))
+                                                                    .child(cursor_char.to_string()),
+                                                            );
+                                                            if !after_cursor.is_empty() {
+                                                                content_div = content_div.child(
+                                                                    div()
+                                                                        .text_color(rgb(span.color))
+                                                                        .child(after_cursor),
+                                                                );
+                                                            }
+                                                            cursor_emitted = true;
+                                                        } else {
+                                                            content_div = content_div.child(
+                                                                div()
+                                                                    .text_color(rgb(span.color))
+                                                                    .child(span.text.clone()),
+                                                            );
+                                                        }
+                                                        offset = span_end;
+                                                    }
+                                                }
+                                                if !cursor_emitted {
+                                                    // Cursor is past all spans (end of line).
                                                     content_div = content_div.child(
                                                         div()
-                                                            .text_color(rgb(theme.text_primary))
-                                                            .child(if raw.is_empty() {
-                                                                " ".to_owned()
-                                                            } else {
-                                                                raw
-                                                            }),
+                                                            .bg(rgb(theme.accent))
+                                                            .text_color(rgb(theme.terminal_bg))
+                                                            .child(" ".to_owned()),
                                                     );
                                                 }
                                             } else {
-                                                // Not editing: show highlighted spans
+                                                // Non-cursor lines (editing or not): show
+                                                // highlighted spans.
                                                 if let Some(spans) = highlighted.get(index) {
                                                     for span in spans {
                                                         content_div = content_div.child(
@@ -429,6 +458,13 @@ pub(crate) fn render_file_view_session(
                                                                 .child(span.text.clone()),
                                                         );
                                                     }
+                                                    if spans.is_empty() && show_cursor {
+                                                        content_div = content_div
+                                                            .child(div().child(" ".to_owned()));
+                                                    }
+                                                } else if show_cursor {
+                                                    content_div = content_div
+                                                        .child(div().child(" ".to_owned()));
                                                 }
                                             }
 

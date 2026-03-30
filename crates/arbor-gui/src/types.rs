@@ -66,6 +66,70 @@ impl Render for DraggedSidebarItem {
     }
 }
 
+/// A user-defined repository group in the sidebar.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CustomRepoGroup {
+    /// Stable unique ID (generated on creation).
+    pub(crate) id: String,
+    /// User-visible label.
+    pub(crate) label: String,
+    /// Ordered list of repo group_keys in this group.
+    pub(crate) repo_group_keys: Vec<String>,
+}
+
+/// Payload carried while dragging a repository row between/within custom groups.
+#[derive(Debug, Clone)]
+pub(crate) struct DraggedRepository {
+    pub(crate) group_key: String,
+    pub(crate) label: String,
+    pub(crate) icon_color: u32,
+    pub(crate) bg_color: u32,
+    pub(crate) border_color: u32,
+    pub(crate) text_color: u32,
+}
+
+impl Render for DraggedRepository {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .w(px(220.))
+            .font_family(FONT_MONO)
+            .rounded_sm()
+            .border_1()
+            .border_color(rgb(self.border_color))
+            .bg(rgb(self.bg_color))
+            .px_2()
+            .py_1()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.))
+            .opacity(0.9)
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(18.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(14.))
+                    .text_color(rgb(self.icon_color))
+                    .child("\u{f09b}"),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(self.text_color))
+                    .child(self.label.clone()),
+            )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub(crate) enum RepositorySidebarTab {
     #[default]
@@ -2649,6 +2713,11 @@ pub(crate) struct RepositoryContextMenu {
     pub(crate) position: gpui::Point<Pixels>,
 }
 
+pub(crate) struct GroupContextMenu {
+    pub(crate) group_id: String,
+    pub(crate) position: gpui::Point<Pixels>,
+}
+
 pub(crate) struct WorktreeContextMenu {
     pub(crate) worktree_index: usize,
     pub(crate) position: gpui::Point<Pixels>,
@@ -2867,6 +2936,14 @@ pub(crate) struct ArborWindow {
     pub(crate) selected_file_tree_entry: Option<PathBuf>,
     pub(crate) left_pane_visible: bool,
     pub(crate) collapsed_repositories: HashSet<usize>,
+    /// User-defined custom groups for organizing repositories in the sidebar.
+    pub(crate) custom_repo_groups: Vec<CustomRepoGroup>,
+    /// Set of collapsed custom group IDs.
+    pub(crate) collapsed_custom_groups: HashSet<String>,
+    pub(crate) group_context_menu: Option<GroupContextMenu>,
+    pub(crate) renaming_group_id: Option<String>,
+    pub(crate) renaming_group_text: String,
+    pub(crate) renaming_group_cursor: usize,
     pub(crate) agent_chat_sessions: Vec<NativeAgentChatSession>,
     pub(crate) active_agent_chat_by_worktree: HashMap<PathBuf, u64>,
     #[cfg_attr(not(feature = "agent-chat"), allow(dead_code))]
